@@ -1,0 +1,43 @@
+/* 首页样式（原 web.py INDEX_EXTRA_CSS 平移，Task 7 追加搜索/排序/分页样式） */
+.video-table { width:100%; border-collapse:collapse; background:white; border-radius:12px; overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,0.04); }
+.video-table th, .video-table td { text-align:left; padding:12px 16px; border-bottom:1px solid #f0f0f0; font-size:15px; }
+.video-table th { color:#999; font-weight:500; white-space:nowrap; }  /* 表头保证单行 */
+.video-table a { color:#00a1d6; text-decoration:none; }
+
+/* 首页：搜索框 / 可排序列头 / 分页条（spec 6） */
+.idx-controls { margin-bottom:16px; }
+.video-table th[data-sort] { cursor:pointer; user-select:none; }
+.video-table th[data-sort]:hover { color:#00a1d6; }
+.video-table th[data-sort]::after { content:' ⇅'; font-size:12px; }
+.idx-pager { display:flex; gap:12px; align-items:center; justify-content:center; padding:18px; }
+.idx-pager span { font-size:14px; color:#999; }
+
+/* 跨视频重叠用户面板 */
+.xv-panel { margin-top:24px; background:white; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); padding:20px 24px; }
+.xv-panel h2 { font-size:18px; margin-bottom:6px; color:#333; }
+.xv-note { font-size:13px; color:#999; margin-bottom:14px; }
+.xv-table { box-shadow:none; border:1px solid #f0f0f0; }
+.xv-videos a { margin-right:10px; font-size:13px; white-space:nowrap; }
+/* 与 report.css 同款分页按钮（首页不加载 report.css，此处复制） */
+.pager-btn { padding:6px 14px; border:2px solid #e0e0e0; border-radius:18px; background:white; cursor:pointer; font-size:14px; }
+.pager-btn:hover:not(:disabled) { border-color:#00a1d6; color:#00a1d6; }
+.pager-btn:disabled { opacity:0.4; cursor:default; }
+/* 与 report.css 同款搜索框（首页不加载 report.css，此处复制） */
+.search-input { padding:8px 14px; border:2px solid #e0e0e0; border-radius:25px; font-size:14px; width:220px; outline:none; }
+.search-input:focus { border-color:#00a1d6; }
+
+/* 跨视频面板：视频条目可展开明细（弹幕/评论样本） */
+.xv-detail { margin:4px 0; }
+.xv-detail summary { cursor:pointer; list-style:none; }
+.xv-detail summary::before { content:'▸ '; color:#bbb; }
+.xv-detail[open] summary::before { content:'▾ '; }
+.xv-counts { font-size:12px; color:#999; margin-left:8px; }
+.xv-sec { font-size:12px; color:#999; margin:8px 0 2px; }
+.xv-list { margin:0 0 6px; padding-left:20px; font-size:13px; color:#555; line-height:1.7; }
+.xv-list li { word-break:break-all; }
+/* 与 report.css 同款小样式（首页不加载 report.css，此处复制） */
+.dm-time { color:#999; font-size:12px; }
+.ov-none { color:#bbb; }
+.problem-chip { display:inline-block; color:#fff; font-size:12px; border-radius:4px;
+    padding:1px 8px; margin-left:6px; vertical-align:1px; }
+

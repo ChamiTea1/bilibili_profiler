@@ -1,0 +1,12 @@
+# 需要 Python >= 3.12（PEP 701 嵌套 f-string）
+certifi==2026.5.20
+charset-normalizer==3.4.7
+idna==3.17
+lxml==6.1.1
+openai==2.38.0
+pillow==12.2.0
+qrcode==8.2
+requests==2.34.2
+urllib3==2.7.0
+pycryptodome==3.23.0
+flask==3.1.3

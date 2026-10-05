@@ -1,0 +1,247 @@
+/* 报告页样式（原 web.py VIDEO_EXTRA_CSS + DM_CSS 平移；基础样式 REPORT_CSS 仍由 report.py 内联） */
+.tab-bar { display:flex; gap:4px; margin-bottom:24px; border-bottom:2px solid #e0e0e0; flex-wrap:wrap; }
+.tab-btn { padding:10px 24px; border:none; background:none; cursor:pointer; font-size:16px; color:#666; border-bottom:3px solid transparent; margin-bottom:-2px; }
+.tab-btn.active { color:#00a1d6; border-bottom-color:#00a1d6; font-weight:600; }
+.tab-pane { display:none; }
+.tab-pane.active { display:block; }
+.search-input { padding:8px 14px; border:2px solid #e0e0e0; border-radius:25px; font-size:14px; width:220px; outline:none; }
+.search-input:focus { border-color:#00a1d6; }
+.empty-note { color:#999; text-align:center; padding:40px; }
+.dm-panel { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:15px; margin-bottom:20px; }
+.top10-list { font-size:14px; color:#555; line-height:2; }
+.top10-list a { color:#00a1d6; cursor:pointer; text-decoration:none; }
+.flash-highlight { box-shadow:0 0 0 3px #fb7299 !important; transition:box-shadow .3s; }
+
+/* 弹幕浏览器样式（原 web.py DM_CSS 平移） */
+.dm-controls { display:flex; gap:10px; margin-bottom:15px; flex-wrap:wrap; align-items:center; }
+.dm-controls select { padding:7px 10px; border:2px solid #e0e0e0; border-radius:8px; font-size:14px; background:white; }
+.dm-table-wrap { background:white; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); padding:15px; overflow-x:auto; }
+.dm-table { width:100%; border-collapse:collapse; font-size:14px; }
+.dm-table th, .dm-table td { text-align:left; padding:8px 10px; border-bottom:1px solid #f0f0f0; vertical-align:top; }
+.dm-table th { color:#999; font-weight:500; white-space:nowrap; }
+.dm-table a { color:#00a1d6; text-decoration:none; cursor:pointer; }
+.dm-pager { display:flex; gap:15px; align-items:center; justify-content:center; padding:15px; }
+.dm-pager button { padding:6px 18px; border:2px solid #e0e0e0; border-radius:20px; background:white; cursor:pointer; }
+.dm-pager button:disabled { opacity:0.4; cursor:default; }
+
+/* 打印样式（spec 1）：展开全部标签页与用户卡片、隐藏交互控件，替代原"完整报告"汇总查看场景 */
+@media print {
+    .tab-bar, .filter-bar, .user-pager, .dm-controls, .dm-pager, .dm-error-bar, .fail-detail, .wc-popup,
+    .ov-actions, .hot-toggle { display:none !important; }
+    .tab-pane { display:block !important; page-break-before:always; }
+    #tab-overview { page-break-before:avoid; }
+    .user-card { display:block !important; break-inside:avoid; box-shadow:none; transform:none; }
+    .hot-subs.collapsed { max-height:none !important; overflow:visible !important; }
+    .hot-subs.collapsed::after { display:none; }
+    body { background:white; }
+}
+
+/* 用户画像页：排序/计数/空态/分页（spec 2） */
+.sort-select { padding:7px 10px; border:2px solid #e0e0e0; border-radius:8px; font-size:14px; background:white; }
+.result-count { font-size:13px; color:#999; align-self:center; margin-left:auto; }
+.empty-filter { color:#999; text-align:center; padding:40px; background:white; border-radius:12px; margin-top:10px; }
+.user-pager { display:flex; gap:8px; align-items:center; justify-content:center; padding:20px; flex-wrap:wrap; }
+.pager-btn { padding:6px 14px; border:2px solid #e0e0e0; border-radius:18px; background:white; cursor:pointer; font-size:14px; }
+.pager-btn:hover:not(:disabled) { border-color:#00a1d6; color:#00a1d6; }
+.pager-btn.active { background:#00a1d6; color:white; border-color:#00a1d6; }
+.pager-btn:disabled { opacity:0.4; cursor:default; }
+
+/* 弹幕浏览器：加载 spinner 与错误条（spec 3） */
+.dm-spinner { text-align:center; color:#999; padding:24px; font-size:14px; }
+.dm-spinner::before { content:''; display:inline-block; width:14px; height:14px; margin-right:8px; vertical-align:-2px;
+    border:2px solid #e0e0e0; border-top-color:#00a1d6; border-radius:50%; animation:dm-spin .8s linear infinite; }
+@keyframes dm-spin { to { transform:rotate(360deg); } }
+.dm-pager input[type="number"] { width:70px; padding:6px 10px; border:2px solid #e0e0e0; border-radius:20px; font-size:14px; }
+.dm-error-bar { display:flex; gap:12px; align-items:center; justify-content:center; color:#d32f2f; padding:15px;
+    background:#ffebee; border-radius:8px; margin-top:10px; }
+.dm-retry-btn { padding:4px 16px; border:2px solid #d32f2f; border-radius:16px; background:white; color:#d32f2f; cursor:pointer; font-size:13px; }
+.dm-retry-btn:hover { background:#d32f2f; color:white; }
+
+/* job 失败明细条（spec 4） */
+.fail-detail { background:#fff8e1; border:1px solid #ffe082; border-radius:10px; padding:14px 18px; margin-bottom:15px; font-size:14px; }
+.fail-detail ul { margin:8px 0 12px 20px; color:#666; }
+.fail-detail code { background:#f0f0f0; padding:1px 6px; border-radius:4px; font-size:12px; }
+.fail-detail .filter-btn { margin-right:10px; }
+
+/* 分析按钮禁用态：job 轮询期间防止并发发起（对齐 .pager-btn:disabled 既有口径） */
+.filter-btn:disabled { opacity:0.4; cursor:default; }
+
+/* 下载区历史折叠 + 404 卡片（spec 6） */
+.dl-history { display:inline-block; margin-left:10px; }
+.dl-history summary { cursor:pointer; color:#fff; opacity:0.85; font-size:14px; display:inline; }
+.dl-history[open] { display:block; margin:10px 0 0; background:rgba(255,255,255,0.15); border-radius:10px; padding:10px 14px; }
+.dl-history[open] summary { margin-bottom:8px; }
+.dl-history .filter-btn { margin:4px 6px 0 0; }
+.nf-card { background:white; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); padding:40px; text-align:center; }
+.nf-card code { background:#f0f0f0; padding:2px 8px; border-radius:6px; }
+.nf-card .filter-btn { display:inline-block; margin-top:16px; text-decoration:none; color:#00a1d6; }
+
+/* 概览页弹幕覆盖率说明条（spec 7） */
+.coverage-note { background:#e3f2fd; border-left:4px solid #00a1d6; border-radius:8px;
+    padding:12px 16px; font-size:13px; color:#555; margin-bottom:20px; line-height:1.8; }
+
+/* 删除按钮警示色（spec 9） */
+.btn-danger { border-color:#f44336 !important; color:#f44336 !important; }
+.btn-danger:hover:not(:disabled) { background:#f44336 !important; color:white !important; }
+
+/* 其他视频足迹（跨视频足迹：该用户在其他已分析视频中的弹幕与评论） */
+.other-videos { display:flex; flex-direction:column; gap:8px; }
+.ov-item { border:1px solid #eee; border-left:3px solid #00a1d6; border-radius:8px; padding:8px 12px; background:#fafbfc; }
+.ov-head { display:flex; align-items:baseline; flex-wrap:wrap; gap:8px; }
+.ov-link { font-size:14px; color:#00a1d6; text-decoration:none; font-weight:500; }
+.ov-link:hover { text-decoration:underline; }
+.ov-note { font-size:12px; color:#999; }
+.ov-sub { font-size:12px; color:#888; margin:6px 0 0; }
+.ov-list { margin:3px 0 0 18px; padding:0; font-size:13px; color:#555; }
+.ov-list li { margin:2px 0; word-break:break-all; }
+.ov-list .ov-none { color:#aaa; list-style:none; margin-left:-18px; }
+.ov-more { font-size:12px; color:#999; margin-top:4px; }
+
+/* 高回复评论页（潜在争执热点：回复数达阈值的评论单独成页） */
+.hot-note { background:#fff3e0; border-left:4px solid #ff9800; border-radius:8px;
+    padding:12px 16px; font-size:13px; color:#6d4c00; margin-bottom:14px; line-height:1.8; }
+.hot-stats { font-size:13px; color:#999; margin-bottom:14px; }
+.hot-list { display:flex; flex-direction:column; gap:14px; }
+.hot-item { background:white; border:1px solid #eee; border-left:3px solid #ff9800; border-radius:10px;
+    padding:14px 16px; box-shadow:0 2px 8px rgba(0,0,0,0.04); }
+.hot-head { display:flex; align-items:baseline; flex-wrap:wrap; gap:10px; margin-bottom:8px; }
+.hot-author { font-size:15px; font-weight:600; color:#00a1d6; text-decoration:none; }
+.hot-author:hover { text-decoration:underline; }
+.hot-badge { font-size:13px; font-weight:600; background:#ff9800; color:white;
+    padding:2px 10px; border-radius:12px; }
+.hot-content { font-size:14px; color:#333; line-height:1.7; margin-bottom:10px; word-break:break-all; }
+.hot-subs { background:#fafafa; border-radius:8px; padding:8px 12px; }
+.hot-sub-label { font-size:12px; color:#888; margin-bottom:4px; }
+.hot-sub-author { color:#00a1d6; }
+.hot-origin { font-size:12px; color:#fb7299; text-decoration:none; margin-left:auto; }
+.hot-origin:hover { text-decoration:underline; }
+
+/* 用户互动时间线页（/user/<uid>：近期在哪些视频上有互动，按最近互动倒序） */
+.tl-stats { font-size:14px; color:#666; background:white; border-radius:10px;
+    padding:12px 16px; margin-bottom:14px; box-shadow:0 2px 8px rgba(0,0,0,0.04); }
+.tl-list { display:flex; flex-direction:column; gap:12px; }
+.tl-item { background:white; border:1px solid #eee; border-left:3px solid #00a1d6; border-radius:10px;
+    padding:14px 16px; box-shadow:0 2px 8px rgba(0,0,0,0.04); }
+.tl-head { display:flex; align-items:baseline; flex-wrap:wrap; gap:10px; margin-bottom:6px; }
+.tl-video { font-size:15px; font-weight:600; color:#00a1d6; text-decoration:none; }
+.tl-video:hover { text-decoration:underline; }
+.tl-last { font-size:12px; color:#999; }
+.tl-sub { font-size:12px; color:#888; margin:6px 0 0; }
+.tl-time { font-size:12px; color:#aaa; }
+.tl-more { font-size:13px; color:#999; text-align:center; padding:8px; }
+
+/* 概览页操作条（返回首页/重新生成/删除/导出下载，自报告头部迁入） */
+.ov-actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
+.ov-actions a.filter-btn { text-decoration:none; }
+.ov-dl { display:inline-flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.ov-dl .filter-btn { text-decoration:none; }
+#reportJobStatus { font-size:13px; color:#f57c00; }
+
+/* 弹幕密度时间轴独占整行（宽幅直方图）；图表高度不写死，随容器宽高比自适应；
+   与下方 charts-grid 图表卡之间补间隔（density 卡独立于网格之外，自身带下边距） */
+.chart-wide { grid-column:1 / -1; margin-bottom:20px; }
+
+/* 解析质量区块（概览页：用户身份可信度） */
+.rq-block { background:white; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.04); padding:14px 16px; }
+.rq-block > h3 { font-size:15px; color:#555; margin-bottom:6px; }
+.rq-summary { font-size:13px; color:#666; margin-bottom:10px; }
+.rq-charts { margin-bottom:0 !important; }
+.rq-danger { color:#d32f2f; }
+.rq-ok { color:#388e3c; }
+
+/* 高回复评论：完整回复树（嵌套缩进）+ 默认折叠/展开 */
+.hot-subs.collapsed { max-height:220px; overflow:hidden; position:relative; }
+.hot-subs.collapsed::after { content:''; position:absolute; left:0; right:0; bottom:0; height:48px;
+    background:linear-gradient(transparent, #fafafa); }
+.hot-toggle { margin-top:8px; padding:4px 16px; border:1px solid #e0e0e0; border-radius:16px;
+    background:white; color:#00a1d6; cursor:pointer; font-size:13px; }
+.hot-toggle:hover { border-color:#00a1d6; }
+.hot-tree, .hot-tree ul { list-style:none; margin:4px 0 0; padding-left:18px;
+    border-left:2px solid #e8f4fb; }
+.hot-tree { padding-left:4px; border-left:none; }
+.hot-reply { font-size:13px; color:#555; line-height:1.7; padding:3px 0; word-break:break-all; }
+
+/* 问题评论标注 chip（颜色由服务端按类别注入） */
+.problem-chip { display:inline-block; color:#fff; font-size:12px; border-radius:4px;
+    padding:1px 8px; margin-left:6px; vertical-align:1px; }
+
+/* 评论区身份标注：UP主 / 楼主 */
+.role-badge { display:inline-block; font-size:11px; border-radius:4px; padding:1px 6px;
+    margin-left:6px; vertical-align:1px; font-weight:600; }
+.role-up { background:#fb7299; color:#fff; }
+.role-op { background:#00a1d6; color:#fff; }
+
+/* 弹幕颜色 Top12 色块（弹幕浏览器统计面板） */
+.dm-color-chips { display:flex; flex-wrap:wrap; gap:8px; }
+.dm-color-chip { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:#666;
+    background:#f5f5f5; border-radius:8px; padding:4px 10px; }
+.dm-color-chip i { width:14px; height:14px; border-radius:4px; border:1px solid rgba(0,0,0,0.1); }
+.dm-table .dm-dot { display:inline-block; width:9px; height:9px; border-radius:50%;
+    margin-right:6px; vertical-align:1px; border:1px solid rgba(0,0,0,0.12); }
+
+/* ===== TODO 改进项：P0-b 争执焦点 / P1-b 问题评论榜 / P2-a 误报标记 / P1-a 密度跳转提示 ===== */
+
+/* 图表标题内的小字提示（如密度轴「点击柱条跳转」） */
+.chart-hint { font-size:12px; font-weight:400; color:#999; }
+
+/* 弹幕密度时间轴的分P选择器（多分P视频：弹幕时间为各P内部时间，须分P看） */
+.density-pager { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 12px; }
+.density-pager .pager-btn { max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* 分P时间轴的数据边界说明（历史快照仅 P1 等） */
+.density-note { font-size:12px; color:#888; background:#f7f9fb; border-left:3px solid #b0bec5;
+    border-radius:6px; padding:8px 12px; margin-top:10px; line-height:1.7; }
+
+/* 争执焦点（P0-b）：左右两列，列表式条目带代表原文 */
+.af-board .af-cols { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:20px; position:relative; }
+/* 争执焦点独立成页：条目行距加宽 */
+#tab-attack .af-item { padding:14px 0; }
+.af-col h4 { margin:0 0 10px; font-size:15px; color:#555; }
+.af-item { padding:10px 0; border-bottom:1px solid #f0f0f0; }
+.af-item:last-child { border-bottom:none; }
+.af-line { display:flex; align-items:baseline; flex-wrap:wrap; gap:8px; }
+.af-line > a { font-weight:600; color:#00a1d6; text-decoration:none; }
+.af-line > a:hover { text-decoration:underline; }
+.af-targets { color:#888; font-size:12px; }
+.af-quote { font-size:13px; color:#666; background:#fafafa; border-left:3px solid #eee;
+    padding:4px 10px; margin:6px 0 0; border-radius:0 6px 6px 0; word-break:break-all; }
+.af-quote-atk { border-left-color:#e53935; background:#fdf3f3; color:#555; }
+/* 争执焦点：关系图画布（可拖动/缩放视口，内容挂在一个变换 <g> 上） */
+.af-graph { margin:6px 0 14px; border:1px solid #f0e0e0; border-radius:10px; background:#fffdf8;
+    height:72vh; min-height:540px; overflow:hidden; cursor:grab; position:relative; }
+.af-graph:active { cursor:grabbing; }
+.af-graph-hint { position:absolute; right:12px; bottom:10px; font-size:12px; color:#bbb;
+    pointer-events:none; user-select:none; }
+.af-node { cursor:pointer; }
+.af-node-a { fill:#e53935; fill-opacity:.75; }
+.af-node-v { fill:#1e88e5; fill-opacity:.75; }
+.af-node text.af-lab { font-size:14px; fill:#555; paint-order:stroke; stroke:#fffdf8; stroke-width:3.5px; }
+.af-node text.af-lab-v { font-size:13px; }
+.af-edge { fill:none; stroke:#e53935; stroke-opacity:0.3; transition:stroke-opacity .15s; }
+.af-edge.af-edge-hot { stroke-opacity:0.95; }
+.af-flash { outline:2px solid #e53935; border-radius:8px; }
+.af-dot { display:inline-block; width:10px; height:10px; border-radius:50%; flex:none; }
+
+/* 问题评论榜（P1-b）：条目列表 + 楼中楼父评引用 */
+.pcb-list { list-style:none; padding:0; margin:0; }
+.pcb-item { padding:10px 4px; border-bottom:1px solid #f0f0f0; font-size:14px;
+    color:#444; line-height:1.8; word-break:break-all; }
+.pcb-item:last-child { border-bottom:none; }
+.pcb-item .hot-author { font-size:14px; }
+.pcb-parent { font-size:13px; color:#888; background:#fafafa; border-left:3px solid #e0e0e0;
+    padding:4px 10px; margin:6px 0 2px; border-radius:0 6px 6px 0; word-break:break-all; }
+
+/* 误报标记（P2-a）：小按钮 + 已标记 chip 划线 */
+.fp-btn { font-size:11px; color:#999; background:#f5f5f5; border:1px solid #e0e0e0;
+    border-radius:4px; padding:1px 7px; margin-left:6px; cursor:pointer; vertical-align:1px; }
+.fp-btn:hover { color:#e64545; border-color:#e64545; }
+.fp-btn-marked { color:#e64545; border-color:#e64545; background:#fff5f5; }
+.fp-btn-marked:hover { color:#00a1d6; border-color:#00a1d6; }
+.fp-chip-marked { opacity:0.55; text-decoration:line-through; }
+.fp-block { margin-top:14px; font-size:13px; color:#888; }
+.fp-block summary { cursor:pointer; }
+.fp-list { list-style:none; padding:6px 0 0; }
+.fp-list li { padding:4px 0; border-bottom:1px dashed #f0f0f0; color:#999; }
+
+/* 弹幕浏览器：「刷屏」列不换行（fix）；卡片内小节标题 */
+.dm-table th:last-child, .dm-table td:last-child { white-space:nowrap; }
+.dm-sub-h { font-size:13px; color:#888; margin:14px 0 8px; font-weight:500; }

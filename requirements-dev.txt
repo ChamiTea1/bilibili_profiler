@@ -1,0 +1,3 @@
+# 开发/CI 专用依赖（运行本工具本身不需要）
+#   pip install -r requirements-dev.txt
+pyflakes>=3.2        # 静态检查：抓未定义名/语法类回归（python -m pyflakes src web.py ...）

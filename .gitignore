@@ -1,0 +1,49 @@
+# 虚拟环境
+.venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 配置文件（含 API Key）
+src/config.py
+
+# 敏感数据
+data/cookie.json
+data/qrcode.png
+
+# 数据库
+data/profiler.db
+
+# CRC32 彩虹表
+data/crc_table.bin
+data/crc_table.bin.partial
+data/crc_tmp_*.bin
+
+# 报告输出
+data/reports/
+data/web.log
+data/web_*.pid
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# LLM 分析中间数据（含用户画像）
+data/analysis_input.json
+data/analysis_prompt.txt
+
+# 小号池（账号凭证）
+data/cookies/
+
+# 内置 mihomo 核心（二进制 + 运行时配置含订阅凭证）
+vendor/mihomo*
+data/mihomo*
+data/*.log
+data/profiler.db-wal
+data/profiler.db-shm
+
+# 内部开发文档（不对外公开）
+docs/
+videos_until_0822.txt
