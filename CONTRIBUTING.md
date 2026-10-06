@@ -18,7 +18,7 @@ cp config.example.py src/config.py                 # 仓库不含真实配置，
 ## 三层验证（改动后按"从便宜到贵"跑）
 
 ```bash
-# 1) 离线回归：43 项，秒级，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库）
+# 1) 离线回归：88 项，秒级，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库）
 python tests/run_all.py            # 主回归 + 评论路径 + 弹幕/评论判定聚合 + 配置模板一致性
 python tests/run_all.py --lint     # 附带 pyflakes 静态检查
 python tests/offline/regress_core.py   # 也可单独跑某一个

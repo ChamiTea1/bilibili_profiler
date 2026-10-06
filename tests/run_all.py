@@ -49,6 +49,7 @@ SCRIPTS = [
     "tests/offline/regress_density_multip.py",  # 弹幕密度时间轴分P口径 9 项
     "tests/offline/regress_multipart_pages.py", # 多分P 历史采集与样本标注 14 项
     "tests/offline/regress_repeat_events.py",   # 群体复读事件检测口径 17 项
+    "tests/offline/regress_port_config.py",     # 端口配置（--port/环境变量/回退）5 项
 ]
 SUMMARY_RE = re.compile(r"(\d+) 项通过,\s*(\d+) 项失败")
 

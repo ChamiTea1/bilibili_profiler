@@ -5,6 +5,7 @@ B站弹幕发送者用户画像分析系统 — 入口脚本
 用法:
     python run.py BVxxxxxxxx [--force]
     python run.py BVxxxxxxxx --skip-collect   # 阶段5只读库内已采数据（不发采集请求）
+    python run.py BVxxxxxxxx --port 9000      # 报告服务端口（默认 8001，跨平台）
     python run.py --batch videos.txt   # 批量模式：逐行读取BV号（忽略空行与 # 注释行）
     --force: 强制重新分析
 """

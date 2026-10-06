@@ -6,8 +6,15 @@
 （复用 report.py 渲染函数），弹幕浏览器走 JSON API（/api/video/<bvid>/danmaku）。
 
 用法:
-    python web.py                      # 监听 127.0.0.1:8000
-    PROFILER_PORT=9000 python web.py   # 环境变量覆盖端口
+    python web.py                      # 监听 127.0.0.1:8001
+    python web.py --port 9000          # 指定端口（跨平台，推荐）
+    python web.py --stop --port 9000   # 停止该端口的后台实例
+
+端口来源优先级：--port > PROFILER_PORT 环境变量 > 8001。
+注意：`PROFILER_PORT=9000 python web.py` 是 **bash 语法**，Windows 的 cmd/PowerShell
+不支持这种前置换值写法。Windows 下请用 --port，或按各自 shell 语法先设置再启动：
+    cmd:        set PROFILER_PORT=9000   然后  python web.py
+    PowerShell: $env:PROFILER_PORT="9000"; python web.py
 """
 import sys
 import os
@@ -68,7 +75,28 @@ from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summa
 
 app = Flask(__name__)
 PAGE_SIZE = 100  # 弹幕 API 默认/回退每页条数（可选 50/100/200，spec 3）
-_PORT = int(os.environ.get("PROFILER_PORT", "8000"))   # 监听端口（PROFILER_PORT 可覆盖）
+def _resolve_port(cli_port: int | None = None, env: dict | None = None) -> int:
+    """解析监听端口：`--port` > `PROFILER_PORT` 环境变量 > 8001。
+
+    Windows 的 cmd/PowerShell 不支持 `PROFILER_PORT=9000 python web.py` 这类 bash
+    前置换值写法，故提供跨平台的 `--port`；环境变量保留兼容。
+    非法/越界值一律告警并回退 8001（端口配错不该让服务起不来）。"""
+    src = env if env is not None else os.environ
+    raw = cli_port if cli_port is not None else src.get("PROFILER_PORT")
+    try:
+        port = int(raw) if raw not in (None, "") else 8001
+    except (TypeError, ValueError):
+        print(f"[Web] 警告: 端口 {raw!r} 不是合法整数，回退 8001")
+        return 8001
+    if not 1 <= port <= 65535:
+        print(f"[Web] 警告: 端口 {port} 超出 1-65535，回退 8001")
+        return 8001
+    return port
+
+
+# 监听端口（模块级默认：环境变量；__main__ 里会被 --port 覆盖）。
+# _loopback_guard 的 Origin 白名单与 pidfile 路径都读这个全局，必须同源
+_PORT = _resolve_port()
 # 评论树递归深度上限 / job 表淘汰上限 / 单次分析目标上限已迁移至
 # config.REPLY_TREE_MAX_DEPTH / config.WEB_JOB_MAX_KEPT / config.ANALYZE_MAX_TARGETS
 
@@ -2863,10 +2891,15 @@ def _stop_server(port: int):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="B站弹幕用户画像 Web 报告服务")
+    parser.add_argument("--port", type=int, default=None, metavar="PORT",
+                        help="监听端口（默认 8001；优先于 PROFILER_PORT 环境变量，跨平台）")
     parser.add_argument("--stop", action="store_true",
-                        help="停止本端口（PROFILER_PORT）后台运行的 web 服务并释放端口")
+                        help="停止本端口后台运行的 web 服务并释放端口（配合 --port 指定端口）")
     args = parser.parse_args()
-    port = _PORT   # 与 _loopback_guard 同源（PROFILER_PORT 环境变量，模块级已解析）
+    # --port 优先；同时刷新模块级 _PORT，保证 _loopback_guard 的 Origin 白名单、
+    # pidfile 路径与 --stop 都指向同一端口
+    port = _resolve_port(args.port)
+    _PORT = port
     if args.stop:
         _stop_server(port)
         sys.exit(0)
@@ -2880,7 +2913,8 @@ if __name__ == "__main__":
         try:
             s.bind(("127.0.0.1", port))
         except OSError:
-            print(f"[Web] 端口 {port} 已被占用，请先 python web.py --stop 或用 PROFILER_PORT 换端口")
+            print(f"[Web] 端口 {port} 已被占用，请先 python web.py --stop --port {port}"
+                  f"（同端口），或 python web.py --port <其它端口> 换端口")
             sys.exit(1)
 
     _write_pid(port)
@@ -2902,6 +2936,7 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGTERM, _on_term)
     print(f"[Web] 交互式报告服务已启动: http://127.0.0.1:{port}")
-    print(f"[Web] 停止服务: python web.py --stop")
+    print(f"[Web] 停止服务: python web.py --stop"
+          + (f" --port {port}" if port != 8001 else ""))
     # threaded=True：弹幕大查询/词云采集不阻塞其它请求（job 轮询、页面加载）
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)

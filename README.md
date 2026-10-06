@@ -17,22 +17,34 @@ cd bilibili_profiler
 python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# 生成配置：仓库不含真实配置，只有模板
-cp config.example.py src/config.py # 把 config.example.py 复制到 ./src 目录并更名为config.py
-# config.py 配置说明在下面的内容有写
+cp config.example.py src/config.py     # macOS / Linux / Git Bash
+copy config.example.py src\config.py   # Windows cmd / PowerShell
 
-# 在 src/config.py 配置 LLM_API_KEY，或 使用环境变量 export LLM_API_KEY=...
-#   不填也能跑：问题弹幕/问题评论判定与 AI 深掘会自动跳过，采集、破解、画像、报告全部可用
+# 然后打开 src/config.py，**只需要改两处**（在文件里搜「替换这里」即可定位）：
+#   ①【替换这里①】LLM_API_KEY  大模型 API Key
+#      改法：把现有的一对空引号 "" 中间填上你的 Key —— 引号保留，只填内容 → "sk-你的key"
+#      不填也能跑：问题弹幕/问题评论判定与 AI 深掘会自动跳过，采集、破解、画像、报告全部可用
+#   ②【替换这里②】SUB_URLS     机场订阅链接
+#      改法：同样只往那对 "" 中间贴链接，引号保留；多个订阅用英文逗号分隔
+#      不填也能跑：不走代理、直连，其余功能完全照常（只是少了换 IP 抗风控的能力）
+# 两处都写了逐步填写说明（含 Windows 的 set / $env: 环境变量写法），其余常量不用动。
+# 改完可自检（只打印条数与是否已填，不打印链接/Key）：
+#   python -c "import sys;sys.path.insert(0,'src');import config;print('订阅条数',len(config.SUB_URLS),'| LLM Key 已填',bool(config.LLM_API_KEY))"
 
 # 分析一个视频（首次运行会打印二维码，用 B站APP 扫码确认）
 python run.py BV1vu4y1b7Y9
 ```
 
-跑完会自动启动本地报告服务并打开浏览器：**http://127.0.0.1:8000**
+跑完会自动启动本地报告服务并打开浏览器：**http://127.0.0.1:8001**
 
 `python web.py` 可以自己启动报告服务；
 
-换端口用 `PROFILER_PORT=9000 python web.py`。
+换端口用 `python web.py --port 9000`（跨平台，推荐）。
+
+> Windows 注意：`PROFILER_PORT=9000 python web.py` 是 **bash 前置换值语法**，cmd/PowerShell 不支持。
+> Windows 下请用 `--port`，或分开两条命令：cmd 用 `set PROFILER_PORT=9000`、
+> PowerShell 用 `$env:PROFILER_PORT="9000"`，再执行 `python web.py`。
+> 分析时同理：`python run.py <BV号> --port 9000` 会让自动启动的报告页也用该端口。
 
 
 
@@ -52,7 +64,7 @@ python run.py BV1vu4y1b7Y9
   3. 社交关系网络（关注列表、粉丝、互关）
   4. 行为模式分析（活跃时段、活跃周期、消费行为）
 - **扫码登录**：B站APP扫码，Cookie自动保存复用（支持自动刷新）
-- **交互式Web报告**：`python web.py` 启动本地服务（127.0.0.1:8000），首页视频列表（搜索/排序/分页）+ 八标签页报告（概览/用户画像/弹幕浏览器/问题弹幕榜/争执焦点/问题评论榜/高回复评论/低置信度，标签页与筛选状态写入URL可分享，@media print 打印样式）；首页与报告页支持一键删除报告/重新生成；run.py/quick_test.py 分析完毕自动启动并打开（WEB_AUTOSTART 可关）
+- **交互式Web报告**：`python web.py` 启动本地服务（127.0.0.1:8001），首页视频列表（搜索/排序/分页）+ 八标签页报告（概览/用户画像/弹幕浏览器/问题弹幕榜/争执焦点/问题评论榜/高回复评论/低置信度，标签页与筛选状态写入URL可分享，@media print 打印样式）；首页与报告页支持一键删除报告/重新生成；run.py/quick_test.py 分析完毕自动启动并打开（WEB_AUTOSTART 可关）
 - **手动弹幕分析**：Web 弹幕浏览器勾选发送者 → 后台强制分析（UID解析+采集+画像+LLM深掘），进度轮询，失败明细透出可重试，完成自动刷新并恢复现场（标签页/筛选/滚动位置）
 - **跨视频足迹**：用户卡片「其他视频足迹」区块展示该用户在其他已分析视频中的出现情况，及他在那些视频里发过的弹幕与评论样本（评论随分析持久化到 comments 表）
 - **跨视频重叠用户面板**：首页列出在 ≥2 个已分析视频中都出现过的发送者（点视频条目可展开该用户在其中的弹幕/评论明细样本），用于找跨视频带节奏/水军账号。注意覆盖口径：面板数据源是 senders 表，收录的是**通过兴趣分阈值（中/高刷屏、问题弹幕命中）被解析的用户 + 问题评论直引作者**，不要求画像采集成功（名字缺失时显示 UID）；从未命中阈值的发送者不会被解析，也就不在面板范围内——低强度但跨视频持续出现的潜水账号覆盖不到，这是兴趣分漏斗的固有取舍（弹幕匿名，必须逐视频破解才知道是谁）
@@ -113,7 +125,7 @@ python login.py alt3
 
 ## 报告页怎么用
 
-打开 http://127.0.0.1:8000；
+打开 http://127.0.0.1:8001；
 **只监听本机回环**，默认不能从其他机器访问；确实需要远程请自行加反向代理，并注意页面含敏感画像数据。
 
 **首页**：已分析视频列表（搜索 / 点列头排序 / 分页）；下方「跨视频重叠用户」面板列出在 ≥2 个视频里都出现过的发送者，点开视频条目可看 TA 在每个视频里的弹幕与评论样本。
@@ -149,7 +161,7 @@ python login.py alt3
 
 ## 输出
 
-- **Web 报告**：`python web.py` 后访问 http://127.0.0.1:8000；后台运行时用 `python web.py --stop` 停止并释放端口
+- **Web 报告**：`python web.py` 后访问 http://127.0.0.1:8001；后台运行时用 `python web.py --stop` 停止并释放端口（换过端口要带上：`python web.py --stop --port 9000`）
 - **数据导出**：`data/reports/report_{BV号}_{时间}.csv` / `.json`（与分析运行同时间戳）
 - **数据库**：`data/profiler.db`（支持中断恢复）
 - **Cookie**：`data/cookie.json`（主号登录态）+ `data/cookies/*.json`（可选小号池，自动管理）
@@ -169,14 +181,14 @@ python login.py alt3
 | `HISTORY_MULTIPAGE_ENABLED` / `HISTORY_MULTIPAGE_MAX_PAGES` | 分P视频是否/最多采前几个分P 的历史弹幕 | `True` / `4` |
 | `ANALYZE_USERS_FLOOR` / `_RATIO` / `MAX_ANALYZE_USERS_HARD_CAP` | 定员上限：保底 / 按发送者比例 / 封顶 | `300` / `0.05` / `1000` |
 | `LLM_DEEP_TOP_K` | AI 深掘人数（兴趣分 top K） | `20` |
-| `PROFILER_PORT`（环境变量） | Web 服务端口 | `8000` |
+| `--port`（命令行） / `PROFILER_PORT`（环境变量） | Web 服务端口（**命令行优先**；Windows 上建议用 `--port`） | `8001` |
 
 > ⚠️ 调低 `REQUEST_DELAY` 会显著提高触发 B站风控的概率，不建议；其余取值影响的是耗时与覆盖度，可按需调整。
 
 ## 技术架构
 
 ```
-web.py                 # 交互式 Web 报告服务（Flask，127.0.0.1:8000；路由 + 数据装配，CSS/JS 在 static/）
+web.py                 # 交互式 Web 报告服务（Flask，127.0.0.1:8001；路由 + 数据装配，CSS/JS 在 static/）
 static/                # Web 报告静态资源（report.css/report.js/index.css/index.js + 本地化 Chart.js / wordcloud2）
 tests/                 # 离线回归（tests/run_all.py + tests/offline/*）：秒级、不联网、不用 Cookie、不烧 LLM 额度
 .github/               # Issue/PR 模板 + CI（离线回归与静态检查，Ubuntu/Windows × Python 3.12）
@@ -243,7 +255,7 @@ src/
 Cookie 里带 `_refresh_token` 时会自动续期；若没有它（或刷新失败）就重新跑 `python login.py` 扫码。小号同理：`python login.py alt1`。
 
 **报告页打不开 / 提示端口被占用？**
-换端口：`PROFILER_PORT=9000 python web.py`；停掉占用端口的旧实例：`python web.py --stop`（它按 pidfile 校验确实是本项目的 web.py 才动手，不会误杀别的进程）。
+换端口：`python web.py --port 9000`（Windows 的 cmd/PowerShell 不支持 `PROFILER_PORT=9000 python web.py` 这种 bash 写法，请用 `--port`；环境变量仍可用，写法见「快速开始」）；停掉占用端口的旧实例：`python web.py --stop --port 9000`（不带 `--port` 则针对 8001；它按 pidfile 校验确实是本项目的 web.py 才动手，不会误杀别的进程）。
 
 **为什么这么慢 / 一直在冷却？**
 B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风险接口 2–4 秒），热门视频必然是小时级。可以：① `--max-users 50` 限制分析人数；② 配小号池（`python login.py alt1`）与 IP 池（`SUB_URLS`）提升吞吐；③ 中途 Ctrl+C，重跑会从检查点续采、不重复已采数据。
@@ -311,7 +323,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ### 7. 工程现状
 
 - 项目**没有单元测试框架**，端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（43 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
+- 现有离线检查手段：**`python tests/run_all.py`**（88 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
 
 ## 免责声明
 
@@ -396,6 +408,7 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_repeat_events.py` | 17 | 群体复读事件必须按**视频内时间**检测（跨月发送但同一画面要命中）、分P 不得合并、双轴各自达标、写法变体合并（含纯标点与英文不误并）、阈值边界与区块渲染 |
 | `tests/offline/regress_density_multip.py` | 9 | 多分P 密度轴按各分P 内部时间分别建桶、默认选弹幕最多的P、单分P 口径不变、缺元信息降级 |
 | `tests/offline/regress_multipart_pages.py` | 14 | 历史弹幕按分P 采集与检查点隔离（分P 1 键名不变）、画像样本「P{n} mm:ss」与排序、旧画像渲染期回填、弹幕浏览器首次出现按 (分P, 时间) |
+| `tests/offline/regress_port_config.py` | 5 | 端口解析优先级（`--port` > `PROFILER_PORT` > 8001）、非法/越界回退、两个入口的 `--help` 都暴露 `--port`（Windows 换端口可用性） |
 
 `tests/run_all.py` 会自动挑选带依赖的解释器（当前解释器 → 仓库 `.venv`），从任意目录运行均可，失败时退出码非 0，可直接接 CI。
 
