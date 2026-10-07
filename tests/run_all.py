@@ -39,7 +39,7 @@ def pick_python() -> str:
 
 PY = pick_python()
 SCRIPTS = [
-    "tests/offline/regress_core.py",            # 主回归 14 项
+    "tests/offline/regress_core.py",            # 主回归 20 项
     "tests/offline/regress_comment_path.py",    # 评论采集路径 10 项
     "tests/offline/regress_judge_danmaku.py",   # 问题弹幕判定聚合 4 项
     "tests/offline/regress_judge_comment.py",   # 问题评论判定聚合 3 项
@@ -103,6 +103,11 @@ def run_lint() -> bool:
         print("  未安装 pyflakes，跳过（pip install pyflakes）")
         return True
     out = (proc.stdout or "") + (proc.stderr or "")
+    # 没装 pyflakes 时 `python -m pyflakes` 会以非 0 退出并打印 "No module named pyflakes"，
+    # 这不是代码问题——若当作失败项，离线回归全过也会让退出码变成 1（误报，且会卡住 pre-commit/CI）。
+    if "No module named pyflakes" in out:
+        print("  未安装 pyflakes，跳过（pip install pyflakes）")
+        return True
     serious = [l for l in out.splitlines()
                if l.strip() and "imported but unused" not in l and "f-string is missing" not in l]
     if serious:

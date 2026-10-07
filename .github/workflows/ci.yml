@@ -1,0 +1,43 @@
+name: CI
+
+# 离线回归 + 静态检查：不联网、不用 Cookie、不消耗 LLM 额度，秒级完成。
+# 依赖只有 requirements.txt（全版本锁定）+ pyflakes。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regress:
+    name: 离线回归 (${{ matrix.os }} / Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12"]
+    env:
+      # 用例会打印 ✔/✘ 与中文，Windows runner 默认控制台编码可能非 UTF-8
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyflakes
+
+      # 全新克隆没有 src/config.py（已 gitignore），run_all.py 会自动从模板生成
+      - name: 跑离线回归与静态检查
+        run: python tests/run_all.py --lint

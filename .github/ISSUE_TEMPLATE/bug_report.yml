@@ -1,0 +1,69 @@
+name: 问题报告
+description: 报告一个可复现的缺陷（崩溃、数据错误、页面异常等）
+labels: ["bug"]
+body:
+  - type: markdown
+    value: |
+      提交前请先确认：
+      - 已阅读 [README 快速开始](../../README.md#快速开始)；
+      - 已跑过 `python tests/run_all.py`（离线回归，秒级、不联网）；
+      - **不要**在 Issue 里贴 Cookie、API Key、`data/cookie.json` 内容或 `data/profiler.db`。
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 代码版本（commit 或 tag）与 Python 版本
+      placeholder: "main @ <commit 前 7 位> / Python 3.12"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: entry
+    attributes:
+      label: 入口
+      options:
+        - run.py（完整流水线）
+        - quick_test.py
+        - web.py（Web 报告）
+        - login.py（登录）
+        - 其它/不确定
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象
+      description: 实际发生了什么？期望发生什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 能稳定复现的最小步骤（涉及具体视频请给 BV 号）
+      placeholder: |
+        1. python run.py BV1xx411c7mD
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: 终端输出 / 服务端日志（**务必先脱敏**：Cookie、Key、token 一律删掉）
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境
+      description: 操作系统、Python 版本、是否配置了小号池 / IP 池（SUB_URLS）/ LLM
+      placeholder: "Windows 11 / Python 3.12 / 无小号池 / 已配 LLM"
+    validations:
+      required: false

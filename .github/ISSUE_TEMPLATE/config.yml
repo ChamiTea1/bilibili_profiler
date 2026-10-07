@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 安全漏洞
+    url: https://github.com/ChamiTea1/bilibili_profiler/security/advisories/new
+    about: 安全漏洞请走 Security Advisory 私下报告，不要在公开 Issue 中披露细节。
+  - name: 使用问题 / 配置咨询
+    url: https://github.com/ChamiTea1/bilibili_profiler/discussions
+    about: 登录、端口、配置填写等使用问题先在 Discussions 里提问。

@@ -3,6 +3,7 @@
 输入视频BV号，深度分析发送弹幕的用户都是什么样的人。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/ChamiTea1/bilibili_profiler/actions/workflows/ci.yml/badge.svg)](https://github.com/ChamiTea1/bilibili_profiler/actions/workflows/ci.yml)
 
 这是一个开源的 B站弹幕数据分析工具，采用 MIT 许可证。**使用前请务必阅读文末[免责声明](#免责声明)。**
 
@@ -419,6 +420,8 @@ python run.py <BV号>                     # 完整流水线
 1. 确保代码风格与现有项目一致（中文注释、中文输出）。
 2. 不要提交 `src/config.py`、`data/` 目录或任何含密钥/凭证的文件。
 3. 新增 API 调用必须走 `BiliAPIClient`，遵守限速与降级约定。
+4. 改动行为请顺带在 `tests/offline/` 补定点用例——PR 上的 CI 会自动跑
+   `python tests/run_all.py --lint`（Ubuntu/Windows × Python 3.12），不通过会标红。
 
 ## 许可证
 
