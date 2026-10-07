@@ -62,7 +62,7 @@ from storage import (load_senders, load_global_uid_map, save_global_uid,
                      load_llm_cache, save_llm_cache)
 from main import run_analysis
 from uid_resolver import resolve_sender, METHOD_CRC32_CRACK
-from combo_pool import build_pool
+from combo_pool import build_pool, pool_owner
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from up_analyzer import fetch_up_wordcloud
@@ -405,6 +405,18 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
     update(finished=True, current="")
     _invalidate_page_cache(bvid)   # 该视频画像已变化，报告页缓存失效
     print(f"[Job {job_id}] 完成: 成功 {len(JOBS[job_id]['results'])}/{len(mid_hashes)}")
+
+
+def _run_analysis_job_bound(job_id: str, bvid: str, mid_hashes: list[str]):
+    """线程入口：绑定池使用方=job_id 后再跑分析 job。
+
+    组合池是模块级单例（多个不同 bvid 的 job 并发共享）。账号轮换/长冷却/代理降级
+    是 IP 层面的全局状态，共享正确；但「整圈风控」进度必须按 job 隔离，否则
+    A job 的风控账本会被并发的 B job 一次成功清零（A 反复长冷却却永不放弃），
+    或被 B 的风控累加而提前放弃。绑定后池内按 owner 记账（见 combo_pool.pool_owner）。
+    """
+    with pool_owner(job_id):
+        _run_analysis_job(job_id, bvid, mid_hashes)
 
 
 # ========== 数据加载辅助 ==========
@@ -2399,7 +2411,7 @@ def api_analyze(bvid: str):
     job_id, reject = _try_register_job("analyze", bvid, total=len(mid_hashes))
     if job_id is None:
         return jsonify({"error": reject}), 409
-    threading.Thread(target=_run_analysis_job,
+    threading.Thread(target=_run_analysis_job_bound,
                      args=(job_id, bvid, mid_hashes), daemon=True).start()
     return jsonify({"job_id": job_id})
 

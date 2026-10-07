@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""主回归：本轮修复的定点验证（历史弹幕续采、线程池收尾、post 重试、限速预算等 14 项）
+"""主回归：本轮修复的定点验证（历史弹幕续采、线程池收尾、post 重试、限速预算等 20 项）
 
 离线回归脚本：使用隔离临时库 + 假 HTTP/假 OpenAI，**不联网、不用 Cookie、不消耗 LLM 额度**。
 从仓库任意目录均可运行：  python tests/offline/regress_core.py
@@ -62,6 +62,30 @@ except KeyboardInterrupt: pass
 dh.fetch_history_danmaku(1, FC(fail={"2026-08-05"}), PUB, bvid="BVB")
 kv, fds, fls = st("BVB")
 check("失败日挂账且不写 done", fls == {"2026-08-05"} and kv.get("done") is None, "(failed=%s done=%s)" % (sorted(fls), kv.get("done")))
+
+print("=== 1b. 月份索引失败（code!=0，非异常路径）不得误标完成 ===")
+import io, contextlib
+class FCBadMonth(FC):
+    """2026-08 的月份索引返回 code!=0 —— _fetch_month_dates 返回 None（不抛异常）。
+
+    修复前该 None 被当成"本月无弹幕"的空列表：window_complete 保持 True，
+    于是 0 条弹幕也照写 done=1，该月数据永久静默丢失且不再重试。"""
+    def get(s, u, params=None, **k):
+        m = (params or {}).get("month", "")
+        if m == "2026-08":
+            return {"code": -101, "message": "账号未登录"}
+        return {"code": 0, "data": [d for d in DATES if d.startswith(m)]}
+with contextlib.redirect_stdout(io.StringIO()):
+    dh.fetch_history_danmaku(1, FCBadMonth(), PUB, bvid="BVD")
+kv, fds, _ = st("BVD")
+check("月份索引失败不写 done（保留续采入口）", kv.get("done") is None and len(fds) == 0,
+      "(已采 %d 天, done=%s)" % (len(fds), kv.get("done")))
+# 重跑（索引恢复正常）必须能补齐该月日期并正常标完成 —— 证明续采入口真的留住了
+with contextlib.redirect_stdout(io.StringIO()):
+    dh.fetch_history_danmaku(1, FC(), PUB, bvid="BVD")
+kv2, fds2, _ = st("BVD")
+check("重跑补齐失败月份后才写 done", len(fds2) == 20 and kv2.get("done") == "1",
+      "(已采 %d 天, done=%s)" % (len(fds2), kv2.get("done")))
 
 print("=== 2. P0-2 线程池异常路径收尾 ===")
 import concurrent.futures.thread as _t
@@ -130,6 +154,20 @@ html = report.generate_user_card({"uid": 1, "name": "n", "follower": None, "foll
                                   "all_followings_raw": [{"sign": "s"}], "all_following_names": [""],
                                   "following_summary": {"up_details": [{"name": "", "word_freq": []}]}})
 check("画像卡片渲染容错（None/缺键）", "user-card" in html)
+import spam_detector as sd
+_cap = sd.SPAM_PAIRWISE_UNIQUE_CAP
+A, B, C = "a" * 10, "b" * 10, "c" * 10      # 三组两两相似度均为 0（便于精确比对）
+contents = [A] * 100 + [B] * 100 + [C] * 100
+sd.SPAM_PAIRWISE_UNIQUE_CAP = 1000          # 关闭抽样 → 全量精确值
+f = sd.analyze_content_repeat(contents); avg_full = f[1] / f[2]
+sd.SPAM_PAIRWISE_UNIQUE_CAP = 2             # 强制极小抽样：放大口径不一致的偏差
+s = sd.analyze_content_repeat(contents); avg_samp = s[1] / s[2]
+sd.SPAM_PAIRWISE_UNIQUE_CAP = _cap
+# 旧实现把抽样的跨内容对与**全量**的相同内容对（sim=1）直接相加，分母少算未抽到的
+# 跨内容对 → 均值被系统性推向 1，规则3（变种刷屏）因此误命中。
+check("抽样不虚增相似度（跨内容对须还原到全量口径）",
+      abs(avg_samp - avg_full) < 0.02, "(全量 %.3f vs 抽样 %.3f)" % (avg_full, avg_samp))
+
 import web_autostart
 os.environ["PROFILER_PORT"] = "abc"
 buf2 = io.StringIO()
@@ -154,6 +192,68 @@ t0 = time.monotonic()
 verdicts, failed, total = cd._judge_batches([{"content": "hi"}], 1, {"title": "t", "bvid": "BV1"}, lambda b, s, v: "p", "测试")
 el = time.monotonic() - t0
 check("超预算即熔断（不再长时间重试）", failed == 1 and el < 20, "(耗时 %.1fs, failed=%d)" % (el, failed))
+
+print("=== 6. P1-3 组合池风控账本按使用方隔离（多 job 并发共享单例池）===")
+# 场景：web.py 的组合池是模块级单例，两个不同 bvid 的 job 并发共用。
+# A job 刚撞了一次风控（2 账号中的 1 个已标记），此时 B job 成功一次——
+# B 的成功能量只能清 B 自己的账本；若清了 A 的，A 的「整圈风控」进度就被
+# 并发的 B 反复抹掉（永远凑不满 MAX_RISK_ROUNDS → 反复长冷却却不放弃）。
+import combo_pool as cp
+
+class _PoolClient:
+    """池成员替身：只需可被置 raise_on_risk（无 IP 池时 set_proxy 不会被调）"""
+    def __init__(s, name): s.name = name; s.raise_on_risk = False
+    def set_proxy(s, url): pass
+
+_pool = cp.ComboPool([("号1", _PoolClient("号1")), ("号2", _PoolClient("号2"))],
+                     clash=None, proxy_url=None)
+ev_in, ev_go = threading.Event(), threading.Event()
+_calls = []
+def _a_fn(c):
+    _calls.append(1)
+    if len(_calls) == 1:
+        raise cp.RiskControlError("-412 风控")
+    ev_in.set()               # A 已挂在第二次调用上，此时 A.marks == [True, False]
+    ev_go.wait(10)
+    return "ok"
+
+def _a_body():
+    with cp.pool_owner("jobA"):
+        _pool.run(_a_fn, desc="A")
+
+def _a_marks():
+    """取 A 的账本快照；退化成共享账本（修复前实现）时回落到 None 账本，便于干净断言"""
+    led = _pool._ledgers.get("jobA") or _pool._ledgers.get(None)
+    return list(led.marks) if led else []
+
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    th = threading.Thread(target=_a_body, daemon=True)
+    th.start()
+    reached = ev_in.wait(10)
+    marks_before = _a_marks()
+    if reached:
+        with cp.pool_owner("jobB"):
+            _pool.run(lambda c: "ok", desc="B")     # B 全程成功
+    marks_after = _a_marks()
+    ev_go.set()
+    th.join(10)
+_led_b = _pool._ledgers.get("jobB")
+rounds_b = _led_b.rounds if _led_b else 0
+check("并发 job 风控账本隔离（B 成功不清空 A 的整圈进度）",
+      reached and marks_before == [True, False] and marks_after == marks_before
+      and rounds_b == 0,
+      "(A %s → B 成功后 %s)" % (marks_before, marks_after))
+
+print("=== 7. 规则3 语义：完全相同属「大量重复」，不得再算「变种刷屏」===")
+_ts = [1700000000 + 10 * i for i in range(10)]
+_same = sd.analyze_spam(["哈哈哈"] * 10, _ts)
+check("完全相同的弹幕不判变种刷屏", "变种刷屏" not in _same["reason"],
+      "(理由: %s)" % _same["reason"])
+_base = "这是一条足够长的测试弹幕内容"
+_var = sd.analyze_spam([_base + str(i) for i in range(10)], _ts)
+check("真正的变体仍判变种刷屏", "变种刷屏" in _var["reason"],
+      "(理由: %s)" % _var["reason"])
 
 print("")
 print("==== 结果: %d 项通过, %d 项失败 ====" % (ok, fail))

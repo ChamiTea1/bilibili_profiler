@@ -15,6 +15,9 @@ ComboPool 鸭子类型模拟 BiliAPIClient（get/post/get_raw/get_cookies_dict/u
 import random
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Optional
 
 from config import (CLASH_API_URL, CLASH_ENABLED, CLASH_GROUP, CLASH_PROXY_URL,
                     CLASH_SECRET, MAX_RISK_ROUNDS, NAV_URL, RISK_COOLDOWN, SUB_URLS,
@@ -25,16 +28,59 @@ _PROXY_FAIL_STRIP_THRESHOLD = 3   # 代理连续连接失败多少次后判定 I
 # 摘代理恢复重探间隔与单账号冷却基准已迁移至
 # config.PROXY_RETRY_AFTER / config.SINGLE_ACCOUNT_RISK_COOLDOWN
 
+_MAX_LEDGERS = 32   # 每 owner 风控账本上限：超限时淘汰最旧的（None=共享账本与当前 owner 保留）
+
+# 当前「使用方」标识：由调用方（如 web.py 的后台 job）用 pool_owner() 上下文绑定。
+# 风控账本（整圈判定/连续圈数）按 owner 隔离，账号轮换、冷却、代理状态仍全局共享。
+_POOL_OWNER: ContextVar[Optional[str]] = ContextVar("profiler_pool_owner", default=None)
+
+
+@contextmanager
+def pool_owner(name: str):
+    """绑定当前线程/协程的池使用方（如 job_id），供风控账本按使用方隔离。
+
+    未绑定时使用共享账本（None），行为与单使用方场景一致（CLI 主流程即如此）。
+    """
+    token = _POOL_OWNER.set(name)
+    try:
+        yield
+    finally:
+        _POOL_OWNER.reset(token)
+
+
+class _Ledger:
+    """单个使用方的风控账本：本圈各账号是否已触发风控 + 已连续整圈风控圈数。
+
+    必须与「账号轮换 _idx」「长冷却 _cooldown_until」区分：后者是账号/IP 层面的
+    全局事实（IP 池为单点，切节点与冷却对所有使用方同时生效），共享才正确；
+    而账本回答的是「本使用方是否已被风控逼完整一圈」，属使用方私有进度，
+    若共享则会被并发的其它使用方互相清零/累加而失真。
+    """
+    __slots__ = ("marks", "rounds")
+
+    def __init__(self, n_accounts: int):
+        self.marks = [False] * n_accounts
+        self.rounds = 0
+
+    def reset(self, n_accounts: int):
+        self.marks = [False] * n_accounts
+        self.rounds = 0
+
 
 class ComboPool:
     """账号×IP 组合池。
 
-    线程模型：池状态迁移（_idx/风控标记/圈计数/代理故障计数/冷却截止时刻）由
+    线程模型：池状态迁移（_idx/风控账本/代理故障计数/冷却截止时刻）由
     self._lock 保护；fn(client) 的实际请求执行不放在锁内——请求本身不序列化，
     成员 client 自身已带 RLock（BiliAPIClient 限速锁）。整圈风控的长冷却只记录
     冷却截止时刻（锁内读写 _cooldown_until），实际等待移出锁外统一执行，
     避免冷却期其他线程在同一把锁上串行阻塞并继续撞风控。
-    web.py 多后台 job 各建一池、共享主号 client 的场景下，池内状态不会竞态。
+
+    多使用方并发（web.py 同时跑多个不同 bvid 的后台 job，共享同一单例池）：
+    账号轮换/冷却/代理降级是 IP 层面的全局状态，共享是预期行为；风控账本则按
+    pool_owner() 绑定的使用方隔离，避免 A job 的风控进度被 B job 的一次成功清零
+    （会导致 A 永远凑不满 MAX_RISK_ROUNDS、反复长冷却而不放弃）或被 B 的风控
+    累加而提前放弃。
     """
 
     def __init__(self, accounts: list, clash=None, proxy_url: str | None = None):
@@ -44,8 +90,8 @@ class ComboPool:
         self._clash = clash                 # ClashCtl 或 None（无 IP 池）
         self._proxy_url = proxy_url
         self._idx = 0
-        self._risk_marks = [False] * len(self._accounts)
-        self._rounds = 0
+        # 风控账本按使用方隔离：None = 未绑定使用方时的共享账本
+        self._ledgers: dict[Optional[str], _Ledger] = {None: _Ledger(len(self._accounts))}
         self._proxy_fail_streak = 0
         self._cooldown_until = 0.0          # 全局冷却截止时刻（时间戳），0 表示无冷却
         self._proxy_backup = None           # 摘代理降级时备份 (proxy_url, clash) 供恢复
@@ -152,8 +198,26 @@ class ComboPool:
         finally:
             self._restore_lock.release()
 
+    def _ledger(self, owner) -> _Ledger:
+        """取当前使用方的风控账本（调用方须持 self._lock）。
+
+        账本按 owner 隔离：并发使用方各自记各自的「整圈风控」进度，互不清零/累加。
+        超限淘汰最旧的账本（保留 None 共享账本与当前 owner），避免长期运行累积。
+        """
+        led = self._ledgers.get(owner)
+        if led is None:
+            led = self._ledgers[owner] = _Ledger(len(self._accounts))
+            if len(self._ledgers) > _MAX_LEDGERS:
+                for k in list(self._ledgers):
+                    if k is not None and k != owner:
+                        self._ledgers.pop(k, None)
+                        if len(self._ledgers) <= _MAX_LEDGERS:
+                            break
+        return led
+
     def run(self, fn, desc: str = ""):
         """执行 fn(client)；风控→rotate 重试；整圈风控→长冷却；冷却 MAX_RISK_ROUNDS 圈仍败→抛"""
+        owner = _POOL_OWNER.get()
         while True:
             self._wait_cooldown()       # 锁外统一等待：未到冷却截止时刻先等
             self._maybe_restore_proxy() # 摘代理降级到期则尝试恢复代理
@@ -171,25 +235,25 @@ class ComboPool:
                 continue
             except RiskControlError as e:
                 with self._lock:
-                    self._risk_marks[idx] = True    # 风控标记打在快照账号上
+                    led = self._ledger(owner)
+                    led.marks[idx] = True       # 风控标记打在快照账号上
                     print(f"[Pool] 账号[{name}] 触发风控（{str(e)[:60]}）")
-                    if all(self._risk_marks):
-                        self._rounds += 1
-                        if self._rounds >= MAX_RISK_ROUNDS:
+                    if all(led.marks):
+                        led.rounds += 1
+                        if led.rounds >= MAX_RISK_ROUNDS:
                             raise RiskControlError(
-                                f"{desc} 连续 {self._rounds} 圈全账号风控，放弃本单元") from e
+                                f"{desc} 连续 {led.rounds} 圈全账号风控，放弃本单元") from e
                         wait = self._cooldown_seconds() + random.uniform(0, 60)
                         print(f"[Pool] 全部账号均触发风控，长冷却 {wait:.0f} 秒"
-                              f"（最后手段，第 {self._rounds}/{MAX_RISK_ROUNDS} 圈）...")
+                              f"（最后手段，第 {led.rounds}/{MAX_RISK_ROUNDS} 圈）...")
                         # 锁内只记录冷却截止时刻，实际等待移出锁外（见 _wait_cooldown）
                         self._cooldown_until = time.time() + wait
-                        self._risk_marks = [False] * len(self._accounts)
+                        led.marks = [False] * len(self._accounts)
                     self.rotate(f"风控({desc})")
                 continue
             # 业务成功：清零风控圈与代理故障计数（一次霉运不污染后续单元）
             with self._lock:
-                self._rounds = 0
-                self._risk_marks = [False] * len(self._accounts)
+                self._ledger(owner).reset(len(self._accounts))
                 self._proxy_fail_streak = 0
             return result
 
@@ -244,8 +308,7 @@ class ComboPool:
             p._clash = self._clash
             p._proxy_url = self._proxy_url
             p._idx = 0
-            p._risk_marks = [False]
-            p._rounds = 0
+            p._ledgers = {None: _Ledger(1)}     # 子池单账号，账本独立（不并入主池使用方账本）
             p._proxy_fail_streak = 0
             p._cooldown_until = 0.0
             p._proxy_backup = None

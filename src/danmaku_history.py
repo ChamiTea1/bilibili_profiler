@@ -336,8 +336,17 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
             if bvid:
                 _save_date_set(bvid, "failed_dates", failed_dates, page)
             continue
-        if not dates:
+        if dates is None:
+            # 索引返回失败（code != 0，非异常路径）：该月按失败处理，保留续采入口。
+            # ⚠️ 不能与"本月无弹幕"的空列表同等处理——那样 window_complete 仍为 True，
+            # 该月日期从未进入待采清单，最后却在 :433 照写 done=1，之后滚动补采
+            # 只回拨最近几天，该月弹幕就此永久静默丢失且不再重试。
+            window_complete = False
+            if bvid:
+                _save_date_set(bvid, "failed_dates", failed_dates, page)
             continue
+        if not dates:
+            continue   # 该月确实无弹幕（空列表），属合法空月
         for date in sorted(dates, reverse=True):
             if fetched_days + len(work_dates) >= HISTORY_MAX_DAYS:
                 truncated = True

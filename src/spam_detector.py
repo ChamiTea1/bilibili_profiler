@@ -30,7 +30,7 @@ def content_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
-def analyze_content_repeat(contents: list[str], pairwise: bool = True) -> Tuple[float, float, int]:
+def analyze_content_repeat(contents: list[str], pairwise: bool = True) -> Tuple[float, float, float]:
     """
     分析内容重复率
 
@@ -56,26 +56,49 @@ def analyze_content_repeat(contents: list[str], pairwise: bool = True) -> Tuple[
         return repeat_rate, 0.0, 0
 
     # 唯一内容数超限：固定种子抽样（确定性，重跑结果一致），防 O(u²) 爆炸
-    if len(unique) > SPAM_PAIRWISE_UNIQUE_CAP:
+    sampled = len(unique) > SPAM_PAIRWISE_UNIQUE_CAP
+    if sampled:
+        u_all = len(unique)
         unique = random.Random(0).sample(unique, SPAM_PAIRWISE_UNIQUE_CAP)
 
     # 先按内容去重，只对唯一内容两两比较，再用出现次数加权展开为全量两两相似度。
     # 与原 O(n²) 全量比较数学等价（相同内容相似度恒为 1，唯一对 (a,b) 贡献
     # count[a]*count[b] 个相同 sim），复杂度降为 O(u²)，u = 唯一内容数；
     # 且边算边累加 sum/count，不再物化 n(n-1)/2 个元素的列表。
+    #
+    # ① 相同内容对：sim 恒为 1，按出现次数加权；O(u) 全量精确累加，不受抽样影响。
     sim_sum = 0.0
     sim_count = 0
     for c in counts.values():
         k = c * (c - 1) // 2
         sim_sum += float(k)
         sim_count += k
+
+    # ② 跨内容对：真正的 O(u²) 部分，超限后只在抽样子集上计算
+    cross_sum = 0.0
+    cross_w = 0
     for i in range(len(unique)):
         ci = counts[unique[i]]
         for j in range(i + 1, len(unique)):
-            sim = content_similarity(unique[i], unique[j])
             k = ci * counts[unique[j]]
-            sim_sum += sim * k
-            sim_count += k
+            cross_sum += content_similarity(unique[i], unique[j]) * k
+            cross_w += k
+
+    if sampled:
+        # ⚠️ 抽样后必须把②还原到全量口径，才能与①（全量）相加。
+        # 原实现直接把抽样得到的 cross 量与全量的相同内容对相加：保留了全部
+        # sim=1 的质量、却只保留 C(s,2)/C(u,2) 的跨内容对质量，均值被系统性
+        # 推向 1（弹幕越多偏差越大），规则3（SPAM_VARIANT_SIMILARITY）因此误判
+        # 「变种刷屏」并叠加组合加分。
+        # 还原：抽样覆盖 C(s,2)/C(u,2) 的对，按该比例放大相似度之和；
+        # 对权重直接用 O(u) 精确值 (n² - Σc²)/2，无需估算。
+        s = len(unique)
+        cross_sum *= (u_all * (u_all - 1)) / (s * (s - 1))
+        total_n = sum(counts.values())
+        cross_w = (total_n * total_n - sum(c * c for c in counts.values())) / 2
+
+    sim_sum += cross_sum
+    sim_count += cross_w
 
     return repeat_rate, sim_sum, sim_count
 
@@ -202,7 +225,11 @@ def analyze_spam(danmaku_contents: list[str], timestamps: list[int]) -> dict:
         reasons.append(f"疑似机器人(评分{bot_score:.2f})")
 
     # 规则3：内容高度相似但不完全相同（变种刷屏）
-    if avg_similarity >= SPAM_VARIANT_SIMILARITY and count >= SPAM_VARIANT_MIN_COUNT:
+    # unique_count >= 2 是本规则的语义前提：内容完全相同时 avg_similarity 恒为 1.0，
+    # 会连本规则一起命中——但那属于规则1「大量重复」的范畴，理由写成「变种刷屏」
+    # 名不副实，还会多叠一次 SPAM_COMBO_BONUS 把分数抬高，挤占真正的变种刷屏者。
+    if (avg_similarity >= SPAM_VARIANT_SIMILARITY and count >= SPAM_VARIANT_MIN_COUNT
+            and unique_count >= 2):
         rule_scores.append(0.7)
         reasons.append(f"变种刷屏(相似度{avg_similarity:.0%})")
 

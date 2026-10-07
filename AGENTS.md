@@ -28,8 +28,10 @@ python run.py --batch videos.txt          # 批量分析（逐行读取BV号，�
 python login.py        # 扫码登录主号（全自动轮询：终端字符码+图片，APP确认后自动落库，无需按键）
 python login.py alt1   # 扫码登录小号 alt1（存 data/cookies/alt1.json，run.py 阶段5自动发现轮转分摊采集）
 python quick_test.py [BV号] [--top N]  # 快速分析：只分析刷屏得分最高的前 N 个发送者
-python web.py       # 交互式 Web 报告（127.0.0.1:8001，PROFILER_PORT 可覆盖端口）
-python web.py --stop  # 停止后台运行的 web 服务并释放端口（pidfile: data/web_{端口}.pid，防 PID 复用误杀）
+python web.py       # 交互式 Web 报告（默认 127.0.0.1:8001）
+python web.py --port 9000            # 换端口（跨平台推荐写法；优先级 --port > PROFILER_PORT > 8001）
+python web.py --stop [--port 9000]   # 停止后台 web 服务并释放端口（换过端口要带同样的 --port）
+                                     # pidfile: data/web_{端口}.pid，防 PID 复用误杀
 ```
 
 注意：`run.py`/`quick_test.py` 分析完毕会自动启动 web.py 并打开报告页（`config.py` 中 `WEB_AUTOSTART=False` 关闭；批量模式不自动启动）。
@@ -50,7 +52,7 @@ src/
 ├── api_client.py        # BiliAPIClient：HTTP 封装（线程安全限速（区间内随机：基础0.8–1.6s/高风险2–4s）、自适应降速（触发风控×1.5、成功缓慢回落）、重试退避、-412及重签无效的-352/-403风控全局冷却（仅 WBI 端点走重签）、Cookie、WBI签名（密钥获取失败 60s 负缓存）、bili_ticket/buvid3（失败 300s 后可重试）；post() 与 get() 同风控语义；get(immediate=True) 为交互式单次请求免限速通道——仅报告页悬停词云用，风控冷却仍生效）
 ├── clash_ctl.py         # Clash/mihomo 控制器封装（列节点/切节点换出口 IP，跨地区跳跃轮换，失败静默降级；死节点名单：健康检查历史判死 + 代理故障即时上报 mark_dead，TTL 复活，全灭回退不过滤）
 ├── proxy_core.py        # 内置 mihomo 核心生命周期（SUB_URLS 多订阅→127.0.0.1 随机端口代理+控制器，零安装；自动下载锁定版本且经官方 SHA256 校验不匹配拒绝执行、github.com 直连优先；PDEATHSIG 防孤儿驻留，stop 时清理含凭证 config.yaml）
-├── combo_pool.py        # 账号×IP 组合池（鸭子类型模拟 BiliAPIClient；风控换"新号+新IP"重试，冷却按截止时刻锁外等待（单账号池冷却缩至 SINGLE_ACCOUNT_RISK_COOLDOWN=120s），IP 池故障摘代理降级直连、每 PROXY_RETRY_AFTER=600s 重探恢复；注意内置核心为单 mixed-port 单 select 组，IP 维度全局单点：所有账号共享同一出口 IP）
+├── combo_pool.py        # 账号×IP 组合池（鸭子类型模拟 BiliAPIClient；风控换"新号+新IP"重试，冷却按截止时刻锁外等待（单账号池冷却缩至 SINGLE_ACCOUNT_RISK_COOLDOWN=120s），IP 池故障摘代理降级直连、每 PROXY_RETRY_AFTER=600s 重探恢复；注意内置核心为单 mixed-port 单 select 组，IP 维度全局单点：所有账号共享同一出口 IP；风控「整圈」账本按使用方（`pool_owner()`，web job 即 job_id）隔离，账号轮换与长冷却仍是全局状态）
 ├── auth.py              # 扫码登录、Cookie 保存/加载/校验/自动刷新、小号池发现（data/cookies/*.json → load_extra_clients，失效自动尝试刷新）
 ├── danmaku.py           # 实时弹幕 XML 解析，按 mid_hash 聚合发送者
 ├── danmaku_history.py   # 历史弹幕采集（逐日弹幕池快照，protobuf wire 手写解析+0x0A 特征校验防错误页误判；失败日记账 failed_dates 优先补采、截断写 truncated、done=1 后重跑滚动补采最近 3 天；每日快照为独立请求无游标链，组合池多号分片时按账号并发采多天，落库/检查点推进在主线程串行；多分P 视频按分P 各采一份（page 参数落库标记 + 检查点键 :pN 隔离，分P 1 沿用原键名故既有报告不重采））
@@ -83,7 +85,7 @@ src/
 项目**没有单元测试框架**（无 pytest/unittest 目录）。改动后按"从便宜到贵"三层验证：
 
 ```bash
-# 1) 离线回归（88 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
+# 1) 离线回归（94 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
 python tests/run_all.py            # 主回归 + 评论路径 + 弹幕/评论判定聚合 + 多分P 口径（密度轴/历史采集/样本标注）
 python tests/run_all.py --lint     # 附带 pyflakes（需 pip install pyflakes）
 

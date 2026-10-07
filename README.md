@@ -323,7 +323,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ### 7. 工程现状
 
 - 项目**没有单元测试框架**，端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（88 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
+- 现有离线检查手段：**`python tests/run_all.py`**（94 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
 
 ## 免责声明
 
@@ -380,7 +380,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 项目没有单元测试框架，验证分三层，从便宜到贵：
 
 ```bash
-# 1) 离线回归：43 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
+# 1) 离线回归：94 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
 python tests/run_all.py            # 跑全部离线回归并汇总
 python tests/run_all.py --lint     # 附带 pyflakes 静态检查（需先 pip install pyflakes）
 python tests/offline/regress_core.py   # 也可单独跑某一个脚本
@@ -398,7 +398,7 @@ python run.py <BV号>                     # 完整流水线
 
 | 脚本 | 项数 | 覆盖 |
 |---|---|---|
-| `tests/offline/regress_core.py` | 14 | 历史弹幕断点续采（中断后必须补齐、失败日挂账、不误写 done）、线程池收尾、`post()` 重试请求体、限速预算熔断、画像渲染容错等 |
+| `tests/offline/regress_core.py` | 20 | 历史弹幕断点续采（中断后必须补齐、失败日挂账、不误写 done）、**月份索引失败不得误标完成**、线程池收尾、`post()` 重试请求体、**刷屏相似度抽样须还原全量口径**、**组合池风控账本按 job 隔离**、限速预算熔断、画像渲染容错等 |
 | `tests/offline/regress_comment_path.py` | 10 | wbi/legacy 翻页与降级、请求异常保留已采、真重复页检测、缺 rpid 脏行、刷新计数 |
 | `tests/offline/regress_judge_danmaku.py` | 4 | 问题弹幕判定必须被采纳并归到正确发送者（防"解析了却没采纳"） |
 | `tests/offline/regress_judge_comment.py` | 3 | 问题评论判定必须回映到正确 rpid |
