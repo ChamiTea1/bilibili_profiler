@@ -88,7 +88,7 @@ def init_db():
             )
         ''')
 
-        # 用户深度数据表
+        # 全局用户采集数据表；profile_json 仅留作旧库兼容，不再保存新视频画像
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 uid INTEGER PRIMARY KEY,
@@ -97,6 +97,17 @@ def init_db():
                 data_json TEXT,
                 profile_json TEXT,
                 collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # 视频专属画像表：同一用户在不同视频里的弹幕、评论、刷屏与问题内容不可共用
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS video_profiles (
+                bvid TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                profile_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (bvid, uid)
             )
         ''')
 
@@ -109,6 +120,24 @@ def init_db():
                 first_seen TEXT NOT NULL,
                 last_seen TEXT NOT NULL,
                 hit_count INTEGER NOT NULL DEFAULT 1
+            )
+        ''')
+
+        # 同一 mid_hash 被可信来源确认对应多个 UID 时隔离为冲突，禁止后写覆盖
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS global_uid_conflicts (
+                mid_hash TEXT PRIMARY KEY,
+                candidates_json TEXT NOT NULL,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                hit_count INTEGER NOT NULL DEFAULT 1
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             )
         ''')
 
@@ -232,6 +261,12 @@ def init_db():
             )
         ''')
 
+        migrated = cursor.execute(
+            "SELECT 1 FROM schema_meta WHERE key = 'video_profiles_migrated_v1'").fetchone()
+        if not migrated:
+            _migrate_legacy_video_profiles(cursor)
+            cursor.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('video_profiles_migrated_v1', '1')")
         conn.commit()
 
         # 清理旧版本的 progress 表（断点续采已改为纯 senders/users 缓存机制）
@@ -353,31 +388,97 @@ def load_senders(bvid: str) -> list[dict]:
 
 # ========== 用户数据 ==========
 
-def save_user_data(uid: int, name: str, level: int, user_data: dict, profile: dict):
-    """保存用户深度数据和画像"""
+def _migrate_legacy_video_profiles(cursor):
+    """把可唯一归属的视频画像从旧 users.profile_json 迁入 video_profiles。
+
+    旧版画像未记录 bvid。若一个 UID 出现在多个视频中，只能通过画像内弹幕数量和
+    内容与 senders 行精确匹配；无法唯一匹配时不猜测，等待该视频下次分析重建。
+    """
+    rows = cursor.execute('''
+        SELECT uid, profile_json, collected_at FROM users
+        WHERE profile_json IS NOT NULL AND TRIM(profile_json) NOT IN ('', '{}', 'null')
+    ''').fetchall()
+    for row in rows:
+        try:
+            profile = json.loads(row["profile_json"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(profile, dict):
+            continue
+
+        senders = cursor.execute('''
+            SELECT bvid, danmaku_count, contents_json FROM senders
+            WHERE uid = ? AND bvid IS NOT NULL
+        ''', (row["uid"],)).fetchall()
+        if not senders:
+            continue
+
+        dm = profile.get("danmaku")
+        if not isinstance(dm, dict):
+            continue
+        contents = dm.get("contents")
+        count = dm.get("count")
+        # count=0 的评论专属画像没有弹幕证据，旧数据也可能来自已删除视频，不能按
+        # 当前唯一 sender 反推归属。只迁移有精确弹幕内容匹配且唯一的视频。
+        if not isinstance(contents, list) or count in (None, 0):
+            continue
+        matched_bvids = set()
+        for sender in senders:
+            try:
+                sender_contents = json.loads(sender["contents_json"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            if sender["danmaku_count"] == count and sender_contents == contents:
+                matched_bvids.add(sender["bvid"])
+        if len(matched_bvids) != 1:
+            continue
+        bvid = next(iter(matched_bvids))
+
+        cursor.execute('''
+            INSERT OR IGNORE INTO video_profiles (bvid, uid, profile_json, updated_at)
+            VALUES (?, ?, ?, ?)
+        ''', (bvid, row["uid"], row["profile_json"],
+              str(row["collected_at"] or datetime.now().isoformat())))
+
+
+def save_user_data(uid: int, name: str, level: int, user_data: dict,
+                   profile: dict | None = None):
+    """保存全局用户采集数据。
+
+    profile 参数仅为兼容旧调用保留；视频画像必须通过 save_video_profile 按 bvid 保存，
+    避免同一 UID 在不同视频间互相覆盖。
+    """
     with closing(get_db()) as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO users (uid, name, level, data_json, profile_json, collected_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (uid, name, level,
-              json.dumps(user_data, ensure_ascii=False),
-              json.dumps(profile, ensure_ascii=False),
+            INSERT INTO users (uid, name, level, data_json, profile_json, collected_at)
+            VALUES (?, ?, ?, ?, '{}', ?)
+            ON CONFLICT(uid) DO UPDATE SET
+                name=excluded.name,
+                level=excluded.level,
+                data_json=excluded.data_json,
+                collected_at=excluded.collected_at
+        ''', (uid, name, level, json.dumps(user_data, ensure_ascii=False),
               datetime.now().isoformat()))
         conn.commit()
 
 
-def update_user_profile(uid: int, profile: dict):
-    """只更新 users.profile_json（阶段7 LLM 深掘结果注入后回写用；
-    不重写 data_json/collected_at——深掘在阶段6落库之后运行）"""
+def save_video_profile(bvid: str, uid: int, profile: dict):
+    """按视频与 UID 保存画像，并更新时间供 Web 报告缓存指纹使用。"""
     with closing(get_db()) as conn:
-        conn.execute("UPDATE users SET profile_json = ? WHERE uid = ?",
-                     (json.dumps(profile, ensure_ascii=False), uid))
+        conn.execute('''
+            INSERT INTO video_profiles (bvid, uid, profile_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(bvid, uid) DO UPDATE SET
+                profile_json=excluded.profile_json,
+                updated_at=excluded.updated_at
+        ''', (bvid, uid, json.dumps(profile, ensure_ascii=False),
+              datetime.now().isoformat()))
         conn.commit()
 
 
 def load_user_data(uid: int) -> tuple[dict, dict] | None:
-    """加载用户数据和画像"""
+    """加载全局用户采集数据；第二项仅为旧版 users.profile_json 兼容返回。"""
     with closing(get_db()) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT data_json, profile_json FROM users WHERE uid = ?", (uid,))
@@ -393,6 +494,15 @@ def has_user_data(uid: int) -> bool:
         cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM users WHERE uid = ?", (uid,))
         row = cursor.fetchone()
+    return row is not None
+
+
+def has_video_profile(bvid: str, uid: int) -> bool:
+    """检查指定视频下是否已有该 UID 的画像。"""
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM video_profiles WHERE bvid = ? AND uid = ?",
+            (bvid, uid)).fetchone()
     return row is not None
 
 
@@ -578,6 +688,7 @@ def clear_video_cache(bvid: str):
     清除指定视频的缓存（供 --force 强制重采使用）
 
     - 删除该 bvid 的全部 senders 记录
+    - 删除该 bvid 的视频专属画像
     - users 表无 bvid 列，按 uid 关联：仅删除"该 bvid 的 senders 引用、
       且不再被其他 bvid 的 senders 引用"的用户数据，避免误删共享缓存
     - 删除该 bvid 的全部 danmaku 弹幕行
@@ -592,6 +703,7 @@ def clear_video_cache(bvid: str):
         uids = [r["uid"] for r in cursor.fetchall()]
 
         cursor.execute("DELETE FROM senders WHERE bvid = ?", (bvid,))
+        cursor.execute("DELETE FROM video_profiles WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM videos WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM comments WHERE bvid = ?", (bvid,))
@@ -626,6 +738,8 @@ def delete_video_data(bvid: str) -> dict:
 
         counts = {}
         counts["senders"] = cursor.execute("DELETE FROM senders WHERE bvid = ?", (bvid,)).rowcount
+        counts["video_profiles"] = cursor.execute(
+            "DELETE FROM video_profiles WHERE bvid = ?", (bvid,)).rowcount
         counts["danmaku"] = cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,)).rowcount
         counts["comments"] = cursor.execute("DELETE FROM comments WHERE bvid = ?", (bvid,)).rowcount
         counts["false_positive"] = cursor.execute(
@@ -645,9 +759,12 @@ def delete_video_data(bvid: str) -> dict:
                 "DELETE FROM llm_cache WHERE cache_key LIKE ? ESCAPE '\\'",
                 (f"deep:{uid}:%",)).rowcount
         counts["global_uid_map"] = 0
+        counts["global_uid_conflicts"] = 0
         for mh in mid_hashes:
             counts["global_uid_map"] += cursor.execute(
                 "DELETE FROM global_uid_map WHERE mid_hash = ?", (mh,)).rowcount
+            counts["global_uid_conflicts"] += cursor.execute(
+                "DELETE FROM global_uid_conflicts WHERE mid_hash = ?", (mh,)).rowcount
         counts["users"] = 0
         for uid in uids:
             counts["users"] += cursor.execute("DELETE FROM users WHERE uid = ?", (uid,)).rowcount
@@ -662,22 +779,59 @@ def save_global_uid(mid_hash: str, uid: int, source: str):
     upsert 全局映射：新条目 hit_count=1；重复命中 hit_count+1 并刷新 last_seen
     source: 评论区验证 / CRC32破解 / 充电名单 / 互动弹幕 / 视频信息
 
-    冲突覆盖按来源优先级（见 _GLOBAL_UID_SOURCE_PRIORITY）：明文来源 > CRC32破解，
-    仅当新来源优先级 >= 旧来源才覆盖 uid/source，防止破解结果被低置信来源反复冲掉；
-    先查旧 source 再决定，同一连接事务内完成。
+    来源优先级控制不同证据等级的覆盖；同一可信等级发现不同 UID 时将 hash 隔离，
+    不再自动归因，避免 CRC32 碰撞在跨视频复用时把用户映射覆盖成另一个人。
     """
     now = datetime.now().isoformat()
     with closing(get_db()) as conn:
         cursor = conn.cursor()
+        # 先取得写锁，使冲突检查、占位和更新成为跨线程/进程的原子序列。
+        cursor.execute("BEGIN IMMEDIATE")
         new_pri = _GLOBAL_UID_SOURCE_PRIORITY.get(source, 0)
+        conflict = cursor.execute(
+            "SELECT candidates_json FROM global_uid_conflicts WHERE mid_hash = ?",
+            (mid_hash,)).fetchone()
+        if conflict:
+            try:
+                candidates = json.loads(conflict["candidates_json"])
+            except (TypeError, ValueError):
+                candidates = []
+            if not isinstance(candidates, list):
+                candidates = []
+            candidate = {"uid": uid, "source": source}
+            if candidate not in candidates:
+                candidates.append(candidate)
+            cursor.execute('''
+                UPDATE global_uid_conflicts
+                SET candidates_json=?, last_seen=?, hit_count=hit_count+1
+                WHERE mid_hash=?
+            ''', (json.dumps(candidates, ensure_ascii=False), now, mid_hash))
+            conn.commit()
+            return
+
         # INSERT OR IGNORE 先行占位：先查后插在并发写（web job × run.py）下会撞主键
-        # 抛 IntegrityError，占位后该行必存在，后续只需按来源优先级决定是否覆盖
+        # 抛 IntegrityError，占位后该行必存在，后续按来源等级与 UID 冲突决定处理
         cursor.execute(
             "INSERT OR IGNORE INTO global_uid_map (mid_hash, uid, source, first_seen, last_seen, hit_count)"
             " VALUES (?, ?, ?, ?, ?, 0)", (mid_hash, uid, source, now, now))
         row = cursor.execute(
-            "SELECT source FROM global_uid_map WHERE mid_hash = ?", (mid_hash,)).fetchone()
+            "SELECT uid, source, first_seen FROM global_uid_map WHERE mid_hash = ?",
+            (mid_hash,)).fetchone()
         old_pri = _GLOBAL_UID_SOURCE_PRIORITY.get(row["source"], 0)
+        if row["uid"] != uid and new_pri == old_pri and new_pri > 0:
+            candidates = [
+                {"uid": row["uid"], "source": row["source"]},
+                {"uid": uid, "source": source},
+            ]
+            cursor.execute("DELETE FROM global_uid_map WHERE mid_hash = ?", (mid_hash,))
+            cursor.execute('''
+                INSERT INTO global_uid_conflicts
+                    (mid_hash, candidates_json, first_seen, last_seen, hit_count)
+                VALUES (?, ?, ?, ?, 2)
+            ''', (mid_hash, json.dumps(candidates, ensure_ascii=False), row["first_seen"], now))
+            conn.commit()
+            return
+
         if new_pri >= old_pri:
             cursor.execute('''
                 UPDATE global_uid_map SET uid=?, source=?, last_seen=?, hit_count=hit_count+1

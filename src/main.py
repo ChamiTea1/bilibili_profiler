@@ -19,7 +19,7 @@ from config import (MAX_ANALYZE_USERS_HARD_CAP, ANALYZE_USERS_FLOOR, ANALYZE_USE
                     HISTORY_MULTIPAGE_ENABLED, HISTORY_MULTIPAGE_MAX_PAGES)
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_video_info
-from storage import load_user_data, has_user_data, load_senders, update_user_profile
+from storage import load_user_data, has_user_data, load_senders, save_video_profile
 from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
 from storage import save_comments, update_comment_problems
 from storage import load_danmaku, load_comments, append_danmaku
@@ -667,7 +667,7 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
                 print(f"  [{idx}/{total}] [失败] UID:{uid} {data['error']}")
             return uid, None
         # 立即落库：Ctrl+C 中断后已采集数据不丢失，重跑时命中上方缓存跳过。
-        # profile 暂存空 dict，阶段6分析后以 INSERT OR REPLACE 覆盖
+        # 视频专属画像在阶段6另存到 video_profiles，不写入全局用户行。
         save_err = None
         try:
             save_user_data(uid, data.get("name", ""), data.get("level", 0), data, {})
@@ -735,7 +735,7 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
     return user_data_map
 
 
-def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sender_groups: dict,
+def phase_analyze(bvid: str, resolved: dict, spam_results: dict, user_data_map: dict, sender_groups: dict,
                   comment_location_map: dict | None = None, uid_comments: dict | None = None,
                   video_info: dict | None = None):
     """阶段6: 画像分析
@@ -789,8 +789,9 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
                 profile["comment_problem"] = info["comment_problem"]
             profiles.append(profile)
 
-            # 保存到数据库
-            save_user_data(uid, user_data.get("name", ""), user_data.get("level", 0), user_data, profile)
+            # 全局采集资料与视频专属画像分表保存，避免同一 UID 跨视频覆盖弹幕/评论证据。
+            save_user_data(uid, user_data.get("name", ""), user_data.get("level", 0), user_data)
+            save_video_profile(bvid, uid, profile)
         except Exception as e:
             print(f"  [Phase 6] 警告: UID:{uid} 画像分析失败，已跳过: {e}")
 
@@ -798,7 +799,7 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
     return profiles
 
 
-def phase_ai_analysis(video_info: dict, profiles: list[dict]):
+def phase_ai_analysis(bvid: str, video_info: dict, profiles: list[dict]):
     """阶段7: LLM 重点深掘（兴趣分 top K 单人单调用，结果直接注入 profile；
     全员粗筛已砍——命中人数扩大后粗筛是 token 大头，普通用户由规则标签勾画轮廓）"""
     if not LLM_API_KEY:
@@ -818,10 +819,9 @@ def phase_ai_analysis(video_info: dict, profiles: list[dict]):
             uid = p.get("uid")
             if uid in deep:
                 p["ai_deep"] = deep[uid]
-                # 深掘结果必须落库：web 报告读的是 users.profile_json，
-                # 阶段6已在深掘前落库，这里注入后不回写的话报告页永远看不到
+                # 深掘结果写回该视频画像，并刷新 updated_at 供报告缓存指纹识别。
                 try:
-                    update_user_profile(uid, p)
+                    save_video_profile(bvid, uid, p)
                 except Exception as e:
                     print(f"[Phase 7] 警告: UID:{uid} 深掘结果落库失败（{e}），重跑可补")
         print(f"[Phase 7] 完成: {len(deep)} 人生成深度画像")
@@ -1000,12 +1000,12 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
                               max_users=max_users, force=force, cache_only=skip_collect)
 
     # 阶段6: 画像分析（评论IP属地/本视频评论/问题弹幕在此贯通进画像）
-    profiles = timer.run("阶段6 画像分析", phase_analyze, resolved, spam_results, user_data_map,
+    profiles = timer.run("阶段6 画像分析", phase_analyze, bvid, resolved, spam_results, user_data_map,
                          sender_groups, comment_location_map, uid_comments, video_info)
 
     # 阶段7: LLM 重点深掘（结果在 phase 内直接注入 profile；LLM_DEEP_ENABLED 可整段关闭）
     if LLM_DEEP_ENABLED:
-        timer.run("阶段7 LLM深掘", phase_ai_analysis, video_info, profiles)
+        timer.run("阶段7 LLM深掘", phase_ai_analysis, bvid, video_info, profiles)
     else:
         print("\n[Phase 7] 跳过 (config.py 中 LLM_DEEP_ENABLED=False)")
 
