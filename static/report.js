@@ -49,6 +49,10 @@ if (densityCanvas && densityData && (densityData.pages || []).length) {
     const drawDensity = (idx) => {
         const p = densityPages[idx];
         const tag = (densityData.multi ? 'P' + p.page + (p.part ? ' ' + p.part : '') : (p.part || ''));
+        // AI 高能点标注（服务端峰值检测+LLM 判爆发原因）：悬停命中柱的 tooltip 追加
+        // 爆发原因（不做柱色高亮，保持时间轴配色统一）
+        const peakByI = {};
+        (p.peaks || []).forEach(pk => { peakByI[pk.i] = pk; });
         if (densityChart) densityChart.destroy();   // 切换分P需销毁旧实例，否则 canvas 复用出错
         densityChart = new Chart(densityCanvas, {type:'bar',
             data:{labels:p.labels, datasets:[{label:'弹幕数', data:p.data, backgroundColor:'#00a1d6', borderRadius:2}]},
@@ -61,7 +65,13 @@ if (densityCanvas && densityData && (densityData.pages || []).length) {
                     const query = (densityData.multi ? 'p=' + p.page + '&' : '') + 't=' + t;
                     window.open('https://www.bilibili.com/video/' + PAGE_DATA.bvid + '?' + query, '_blank', 'noopener');
                 },
-                plugins:{legend:{display:false}, tooltip:{callbacks:{title: items => (tag ? tag + ' · ' : '') + '视频时间 ' + items[0].label + '（点击跳转）'}}},
+                plugins:{legend:{display:false}, tooltip:{callbacks:{
+                    title: items => (tag ? tag + ' · ' : '') + '视频时间 ' + items[0].label + '（点击跳转）',
+                    afterBody: items => {
+                        const pk = peakByI[items[0].index];
+                        return pk ? ['🔥 ' + pk.label + '（' + pk.kind + '）'] : [];
+                    }
+                }}},
                 scales:{x:{ticks:{autoSkip:true, maxTicksLimit:20}}, y:{beginAtZero:true}}}});
         if (densityPager) {
             densityPager.querySelectorAll('button').forEach((b, i) => b.classList.toggle('active', i === idx));

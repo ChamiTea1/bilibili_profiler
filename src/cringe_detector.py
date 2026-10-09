@@ -34,6 +34,10 @@ PROBLEM_CATEGORIES = ["中二抒情", "尬夸捧杀", "引战阴阳", "人身攻
 # 判定缓存口径版本号：判定口径或缓存结构变更时 bump，旧缓存自动失效（旧孤儿键不清理）
 _DM_CACHE_VERSION = "v4"    # 问题弹幕（v4：批次缓存 key 改稳定前缀，不再嵌整段 digest）
 _CMT_CACHE_VERSION = "v4"   # 问题评论（v4：整段缓存值由 {rpid:verdict} 改 {content:verdict}，修复续采新增同内容评论漏标）
+_PEAK_CACHE_VERSION = "v1"  # 弹幕高能点标注（密度时间轴峰值时段的爆发原因）
+
+# 高能点爆发原因类别（web 密度时间轴峰值标注；prompt 与校验共用）
+PEAK_KINDS = ["名场面", "吵架对线", "剧透讨论", "刷屏玩梗", "情绪爆发", "其他"]
 
 # 整轮重试总耗时熔断预算与瞬态重试次数已迁移至
 # config.LLM_RETRY_BUDGET_SECONDS / config.LLM_TRANSIENT_RETRIES
@@ -568,3 +572,85 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
 
     print(f"[问题评论] 检测完成: {len(results)} 条问题评论")
     return results
+
+
+# ========== 弹幕高能点标注（web 密度时间轴峰值时段的爆发原因） ==========
+
+def detect_density_peaks(bvid: str, peaks: list[dict], video_info: dict) -> dict[int, dict]:
+    """LLM 标注弹幕密度峰值时段的爆发原因（名场面/吵架对线/剧透讨论/刷屏玩梗/情绪爆发/其他）。
+
+    peaks: [{"idx": 时段编号(调用方自定，回映键), "label": 视频时间串(如 02:30),
+             "count": 该时段弹幕数, "samples": [弹幕内容...]}]
+    返回 {idx: {"label": 10字内概括, "kind": PEAK_KINDS 之一}}；
+    未配置 Key / 无峰值 / 调用失败 → 空 dict（调用方静默降级，时间轴照常渲染）。
+
+    单次调用（峰值 ≤ DENSITY_PEAK_MAX 个，token 量小）；结果按全部样本内容指纹
+    缓存到 llm_cache（peak:{bvid}:v1），弹幕量变化（指纹变）自动重判。
+    """
+    if not LLM_API_KEY or not peaks:
+        return {}
+
+    fingerprint = hashlib.sha256("\n".join(
+        f"{p['idx']}|{p['count']}|" + "|".join(p["samples"]) for p in peaks
+    ).encode("utf-8")).hexdigest()[:16]
+    cache_key = f"peak:{bvid}:{_PEAK_CACHE_VERSION}:{LLM_MODEL}:{fingerprint}"
+    cached = load_llm_cache(cache_key)
+    if cached:
+        try:
+            data = json.loads(cached)
+            if isinstance(data, dict):
+                return {int(k): v for k, v in data.items()
+                        if isinstance(v, dict) and v.get("kind") in PEAK_KINDS}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            print("[高能点] 警告: 缓存内容损坏，重新标注")
+
+    title = video_info.get("title", "未知视频")
+    lines = []
+    for p in peaks:
+        sample = "\n".join(f"- {s}" for s in p["samples"][:40])
+        lines.append(f"时段{p['idx']}（视频时间 {p['label']} 附近，弹幕 {p['count']} 条）：\n{sample}")
+    prompt = f"""你是B站弹幕分析师。以下是视频《{title}》弹幕密度时间轴上的 {len(peaks)} 个爆发时段（弹幕量显著高于周围的峰值），每段附弹幕样本。
+请判断每个时段弹幕爆发的原因。只输出一个 JSON 数组：
+[{{"i": 时段编号, "label": "10字内概括", "kind": "名场面|吵架对线|剧透讨论|刷屏玩梗|情绪爆发|其他"}}]
+判定口径：
+- 名场面：经典场面/高光时刻引发的集体反应（名台词、神演出、燃点泪点）
+- 吵架对线：观点冲突、互喷、拉踩、节奏对立
+- 剧透讨论：剧情关键点、结局、反转的集中讨论
+- 刷屏玩梗：玩梗接龙、复制粘贴刷屏（同类内容重复占多数）
+- 情绪爆发：感动、泪目、欢呼、惊叹等情绪集中爆发
+- 其他：无法归类
+不要输出任何 JSON 之外的内容。
+
+{chr(10).join(lines)}"""
+
+    try:
+        client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+        extra = _batch_thinking_extra(LLM_BASE_URL, LLM_MODEL)   # 标注类任务同判定口径关思考
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=LLM_MAX_TOKENS,
+            temperature=0.3,
+            **extra,
+        )
+        raw = resp.choices[0].message.content or ""
+        left, right = raw.find("["), raw.rfind("]")
+        if left == -1 or right <= left:
+            return {}
+        data = json.loads(raw[left:right + 1])
+        if not isinstance(data, list):
+            return {}
+        valid_idx = {p["idx"] for p in peaks}    # 幻觉编号掐掉，不越界回映
+        result: dict[int, dict] = {}
+        for v in data:
+            i = v.get("i") if isinstance(v, dict) else None
+            if (isinstance(i, int) and not isinstance(i, bool) and i in valid_idx
+                    and v.get("kind") in PEAK_KINDS):
+                result[i] = {"label": str(v.get("label", ""))[:12], "kind": v["kind"]}
+        if result:
+            save_llm_cache(cache_key, json.dumps(result, ensure_ascii=False))
+        return result
+    except Exception as e:
+        # 高能点标注属锦上添花：失败只告警不重试（下次渲染借缓存指纹重判）
+        print(f"[高能点] 警告: LLM 标注失败（{type(e).__name__}: {str(e)[:80]}），本次不标注")
+        return {}

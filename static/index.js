@@ -45,3 +45,34 @@ function idxRender() {
     document.getElementById('idxNext').addEventListener('click', () => { idxState.page++; idxRender(); });
     idxRender();
 })();
+
+// 跨视频屏蔽列表导出：读面板勾选（标准/最少命中视频数/上限）→ fetch 生成 → blob 下载。
+// 无命中/服务端错误时 alert 提示而非下载空文件（与报告页单视频导出同模式）
+function blkExportCross() {
+    const crit = [
+        document.getElementById('blkCringe').checked ? 'cringe' : '',
+        document.getElementById('blkSpam').checked ? 'spam' : '',
+        document.getElementById('blkCmt').checked ? 'cmt' : '',
+    ].filter(Boolean);
+    if (!crit.length) { alert('请至少勾选一项导出标准'); return; }
+    const minVideos = parseInt(document.getElementById('blkMinVideos').value, 10) || 2;
+    const max = parseInt(document.getElementById('blkMax').value, 10) || 200;
+    const lowconf = document.getElementById('blkLowconf').checked ? '&lowconf=1' : '';
+    const url = '/api/blocklist/cross?crit=' + encodeURIComponent(crit.join(',')) +
+        '&min_videos=' + minVideos + '&max=' + max + lowconf;
+    fetch(url)
+        .then(r => {
+            if (!r.ok) return r.json().then(j => { throw new Error(j.error || ('HTTP ' + r.status)); });
+            return r.blob();
+        })
+        .then(blob => {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'blocklist_cross.json';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(a.href), 5000);   // 稍延迟回收，避免下载未开始即失效
+        })
+        .catch(e => alert('跨视频屏蔽列表导出失败：' + e.message));
+}

@@ -191,6 +191,11 @@ ATTACK_FOCUS_MAX_N = 20            # 名额上限；实际名额随攻击边数�
 # B站屏蔽列表导出（概览页操作条：把问题发送者导出为播放器「弹幕屏蔽列表」可导入的 JSON）
 BLOCKLIST_MAX_UIDS = 200           # 单次导出上限；B站屏蔽列表容量约 200 条，超出按严重度截断
 
+# 弹幕高能点 AI 标注（概览页密度时间轴：峰值时段取弹幕样本让 LLM 判断爆发原因）
+DENSITY_PEAK_MAX = 5               # 每视频最多标注的峰值时段数（跨全部分P取弹幕量最高的 N 个）
+DENSITY_PEAK_MIN_COUNT = 10        # 峰值桶最少弹幕数（低于此不成「爆发」，防小视频噪声）
+DENSITY_PEAK_SAMPLE = 30           # 每个峰值时段取多少条弹幕样本喂给 LLM
+
 # ========== Web 报告配置 ==========
 WEB_AUTOSTART = True   # run.py/quick_test.py 分析完毕自动启动 web.py 并用浏览器打开报告页（False 关闭）
 

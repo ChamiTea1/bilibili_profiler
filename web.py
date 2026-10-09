@@ -51,7 +51,8 @@ from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTO
                      COMMENT_HEAT_REPLY_WEIGHT, PROBLEM_COMMENT_TOP_N,
                      ATTACK_FOCUS_TOP_N, ATTACK_FOCUS_MAX_N, USER_CARD_URL, NAV_URL,
                      REPLY_TREE_MAX_DEPTH, WEB_JOB_MAX_KEPT, ANALYZE_MAX_TARGETS,
-                     REPEAT_EVENT_TOP_N, BLOCKLIST_MAX_UIDS)
+                     REPEAT_EVENT_TOP_N, BLOCKLIST_MAX_UIDS,
+                     DENSITY_PEAK_MAX, DENSITY_PEAK_MIN_COUNT, DENSITY_PEAK_SAMPLE)
 import config as _config
 from auth import load_cookie, verify_cookie, _try_refresh_cookie
 from api_client import BiliAPIClient
@@ -69,6 +70,7 @@ from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from up_analyzer import fetch_up_wordcloud
 from spam_detector import batch_detect_spam, detect_repeat_events, pool_distribution_from_rows
+from cringe_detector import detect_density_peaks
 from llm_analyzer import LLMAnalyzer
 from up_analyzer import _tokenize
 from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summary_stats,
@@ -864,9 +866,62 @@ def _build_blocklist(bvid: str, crit: set, max_uids: int,
             "type": 2, "filter": str(uid), "opened": True, "id": i,
             "comment": "；".join(info[uid]["notes"])[:60],
         })
+    # detail：uid → 排序用计分（跨视频聚合复用；单视频路由不消费）
+    detail = {uid: {"sev": info[uid]["sev"], "score": info[uid]["score"],
+                    "count": info[uid]["count"]} for uid in matched_uids}
     return {"entries": entries, "matched": len(matched_uids),
             "skipped_unresolved": skipped_unresolved,
-            "skipped_lowconf": len(excluded_lowconf)}
+            "skipped_lowconf": len(excluded_lowconf), "detail": detail}
+
+
+def _build_cross_blocklist(crit: set, min_videos: int, max_uids: int,
+                           include_lowconf: bool = False) -> dict:
+    """跨视频合并屏蔽榜：在 >= min_videos 个视频都命中问题标准的发送者优先。
+
+    B站用户屏蔽是全站生效的，单视频屏蔽列表覆盖面有限；「在多个视频都发问题
+    弹幕/刷屏」的人才是真正的惯犯，屏蔽性价比最高。实现上逐视频复用
+    _build_blocklist（max 不设限拿全量命中集），按 uid 聚合：
+      - videos_hit：命中视频数（排序首位——惯犯程度）
+      - sev/score/count：各视频取最大值（烦人程度）
+    低置信度口径与单视频一致（逐视频排除；include_lowconf 放开）。
+
+    Returns: {"entries": [...], "matched": 符合视频数门槛的总人数, "videos": 库内视频数}
+    """
+    with closing(get_db()) as conn:
+        bvids = [r["bvid"] for r in conn.execute("SELECT bvid FROM videos").fetchall()]
+
+    agg: dict[int, dict] = {}      # uid -> {videos, sev, score, count, notes}
+    for bvid in bvids:
+        try:
+            r = _build_blocklist(bvid, crit, 10 ** 9, include_lowconf=include_lowconf)
+        except sqlite3.Error as e:
+            print(f"[Web] 跨视频屏蔽榜：{bvid} 构建失败跳过: {e}")
+            continue
+        for e in r["entries"]:
+            uid = int(e["filter"])
+            d = (r.get("detail") or {}).get(uid) or {}
+            ent = agg.setdefault(uid, {"videos": 0, "sev": 0, "score": 0.0,
+                                       "count": 0, "notes": []})
+            ent["videos"] += 1
+            ent["sev"] = max(ent["sev"], d.get("sev", 0))
+            ent["score"] = max(ent["score"], d.get("score", 0.0))
+            ent["count"] = max(ent["count"], d.get("count", 0))
+            note = e.get("comment") or ""
+            if note and note not in ent["notes"]:
+                ent["notes"].append(note)
+
+    matched = [uid for uid, ent in agg.items() if ent["videos"] >= min_videos]
+    matched.sort(key=lambda u: (-agg[u]["videos"], -agg[u]["sev"],
+                                -agg[u]["score"], -agg[u]["count"], u))
+    selected = matched[:max_uids]
+    entries = []
+    for i, uid in enumerate(selected, 1):
+        ent = agg[uid]
+        entries.append({
+            "type": 2, "filter": str(uid), "opened": True, "id": i,
+            "comment": (f"{ent['videos']}个视频命中；" + "；".join(ent["notes"]))[:60],
+        })
+    return {"entries": entries, "matched": len(matched), "videos": len(bvids)}
 
 
 def _video_page_meta(video_info: dict | None) -> dict[int, dict]:
@@ -1012,6 +1067,63 @@ def _danmaku_density(bvid: str, duration, video_info: dict | None = None) -> dic
     default = max(range(len(pages)), key=lambda i: sum(pages[i]["data"]))
     return {"multi": len(pages) > 1, "onepage_fallback": fallback,
             "pages": pages, "default": default}
+
+
+def _annotate_density_peaks(bvid: str, density: dict | None, video_info: dict) -> dict | None:
+    """密度时间轴高能点标注：峰值桶取弹幕样本喂 LLM 判断爆发原因，原地挂到各 page。
+
+    峰值判据（每分P独立）：桶弹幕数 >= max(DENSITY_PEAK_MIN_COUNT, 该P桶数的P90)——
+    低于最小条数的"峰"多为噪声；全视频按弹幕量取前 DENSITY_PEAK_MAX 个（跨分P）。
+    标注结果（含缓存命中/LLM 失败降级为不标注）挂 page["peaks"] = [{"i": 桶下标,
+    "label", "kind"}]；未配置 LLM_API_KEY 时直接原样返回（纯本地渲染零成本路径）。
+    """
+    if not density or not LLM_API_KEY:
+        return density
+    # 1) 逐分P找候选峰桶（P90 阈值 + 最小条数下限）
+    candidates = []   # (count, page_idx, bucket)
+    for pi, page in enumerate(density["pages"]):
+        data = page["data"]
+        if len(data) < 5:
+            continue
+        srt = sorted(data)
+        p90 = srt[min(len(srt) - 1, int(len(srt) * 0.9))]
+        threshold = max(DENSITY_PEAK_MIN_COUNT, p90)
+        for b, n in enumerate(data):
+            if n >= threshold:
+                candidates.append((n, pi, b))
+    if not candidates:
+        return density
+    candidates.sort(reverse=True)
+    candidates = candidates[:DENSITY_PEAK_MAX]
+
+    # 2) 逐峰取该时段弹幕样本（桶边界以 starts 为准；末桶右界为该P时长）
+    peaks_payload: list[dict] = []
+    with closing(get_db()) as conn:
+        for n, pi, b in candidates:
+            page = density["pages"][pi]
+            start = (page["starts"] or [0] * len(page["data"]))[b]
+            end = (page["starts"][b + 1] if b + 1 < len(page["starts"])
+                   else page["duration"])
+            samples = [r["content"] for r in conn.execute(
+                "SELECT content FROM danmaku WHERE bvid = ? AND page = ? "
+                "AND time >= ? AND time < ? ORDER BY timestamp DESC LIMIT ?",
+                (bvid, page["page"], start, end, DENSITY_PEAK_SAMPLE)).fetchall()]
+            if not samples:
+                continue
+            peaks_payload.append({"idx": len(peaks_payload), "label": page["labels"][b],
+                                  "count": n, "samples": samples,
+                                  "_page": pi, "_bucket": b})
+
+    # 3) LLM 标注（cringe_detector：缓存/降级/幻觉编号过滤都在里面）
+    verdicts = detect_density_peaks(bvid, peaks_payload, video_info) if peaks_payload else {}
+    for p in peaks_payload:
+        v = verdicts.get(p["idx"])
+        if not v:
+            continue
+        page = density["pages"][p["_page"]]
+        page.setdefault("peaks", []).append(
+            {"i": p["_bucket"], "label": v["label"], "kind": v["kind"]})
+    return density
 
 
 def _danmaku_attr_stats(bvid: str) -> dict | None:
@@ -2105,6 +2217,35 @@ def index():
             <tbody>{rows_html}</tbody>
         </table>
     </div>'''
+
+    # 跨视频屏蔽列表导出：B站用户屏蔽全站生效，「多个视频都命中」的惯犯优先屏蔽。
+    # 面板与单视频导出同格式（REPORT_CSS 内联已带 .blk-* 样式）；有已分析视频即展示
+    cross_blk_html = ""
+    if rows:
+        cross_blk_html = f'''
+    <div class="xv-panel">
+        <h2>🚫 跨视频屏蔽列表导出</h2>
+        <details class="blk-export">
+            <summary class="filter-btn"
+                     title="把在多个视频都命中问题标准的发送者导出为B站播放器「弹幕屏蔽列表」
+可导入的用户屏蔽 JSON——跨视频惯犯最值得屏蔽">展开导出面板</summary>
+            <div class="blk-panel">
+                <label><input type="checkbox" id="blkCringe" checked> 问题弹幕发送者</label>
+                <label><input type="checkbox" id="blkSpam" checked> 高/中风险刷屏</label>
+                <label><input type="checkbox" id="blkCmt"> 问题评论作者</label>
+                <label class="blk-sub"><input type="checkbox" id="blkLowconf"
+                        title="CRC32 反查的 UID 可能张冠李戴，勾选即接受误屏蔽风险"> 含低置信度UID（可能误屏蔽，慎选）</label>
+                <label class="blk-sub">至少在 <input type="number" id="blkMinVideos" class="blk-num"
+                        min="1" max="50" value="{CROSS_VIDEO_MIN_VIDEOS}"> 个视频命中</label>
+                <label class="blk-sub">上限 <input type="number" id="blkMax" class="blk-num"
+                        min="1" max="2000" value="{BLOCKLIST_MAX_UIDS}"> 条</label>
+                <button class="filter-btn" onclick="blkExportCross()">⬇ 导出 JSON</button>
+                <p class="blk-note">与单视频导出同一导入方法（网页播放器 → 弹幕设置 → 弹幕屏蔽
+                列表 → 右键导入）；排序以「命中视频数」为首位——在多个视频都发问题弹幕/刷屏
+                的人是惯犯，屏蔽性价比最高。库内共 {len(rows)} 个已分析视频。</p>
+            </div>
+        </details>
+    </div>'''
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -2132,6 +2273,7 @@ def index():
         <span id="idxPageInfo"></span>
         <button id="idxNext" class="pager-btn">下一页</button>
     </div>
+    {cross_blk_html}
     {overlap_html}
 </div>
 <script src="/static/index.js"></script>
@@ -2242,6 +2384,7 @@ def video_page(bvid: str):
     board_html += _fp_dm_block(fp_dm_used)   # 已标记误报弹幕的撤销入口
     panel = _danmaku_panel_stats(bvid)
     density = _danmaku_density(bvid, row["duration"], video_info)  # 概览页弹幕密度时间轴
+    density = _annotate_density_peaks(bvid, density, video_info)  # 峰值时段 AI 高能点标注（失败/无Key 静默降级）
     rq = _resolve_quality(bvid)                          # 概览页解析质量区块
     repeat_block = _repeat_events_block(bvid)            # 概览页群体复读事件区块（含全池分布自检）
     dm_attrs = _danmaku_attr_stats(bvid)                 # 弹幕属性分布（mode/color）
@@ -2291,6 +2434,9 @@ def video_page(bvid: str):
                           f'点击柱条跳转该分P对应时段核验）')
         else:
             dense_hint = "（点击柱条跳转对应时段核验）"
+        # 高能点标注存在时提示悬停可见（LLM 对峰值时段爆发原因的判断；不做柱色高亮）
+        if any(pg.get("peaks") for pg in density["pages"]):
+            dense_hint += "；AI 已标注高能点，悬停柱条可查看爆发原因"
         dense_pager = ('<div class="density-pager" id="densityPager"></div>'
                        if density["multi"] else "")
         dense_note = ""
@@ -2942,6 +3088,42 @@ def api_blocklist(bvid: str):
     safe_name = re.sub(r"[^A-Za-z0-9_-]", "", bvid) or "video"   # 文件名白名单化
     resp = Response(payload, mimetype="application/json")
     resp.headers["Content-Disposition"] = f'attachment; filename="blocklist_{safe_name}.json"'
+    return resp
+
+
+@app.route("/api/blocklist/cross")
+def api_blocklist_cross():
+    """跨视频合并屏蔽列表导出：在 >= min_videos 个视频都命中问题标准的发送者优先。
+
+    与单视频导出同一条目格式（type=2 用户屏蔽）；排序以「命中视频数」（惯犯程度）
+    为首位。min_videos 默认 CROSS_VIDEO_MIN_VIDEOS，夹紧到 [1,50]；其余参数同单视频。"""
+    crit = {c.strip() for c in request.args.get("crit", "cringe,spam").split(",")}
+    crit &= _BLOCKLIST_CRITERIA
+    if not crit:
+        return jsonify({"error": "未选择任何导出标准（crit 可选 cringe/spam/cmt）"}), 400
+    try:
+        min_videos = int(request.args.get("min_videos", CROSS_VIDEO_MIN_VIDEOS))
+    except ValueError:
+        min_videos = CROSS_VIDEO_MIN_VIDEOS
+    min_videos = max(1, min(min_videos, 50))
+    try:
+        max_uids = int(request.args.get("max", BLOCKLIST_MAX_UIDS))
+    except ValueError:
+        max_uids = BLOCKLIST_MAX_UIDS
+    max_uids = max(1, min(max_uids, 2000))
+    include_lowconf = request.args.get("lowconf") == "1"
+    try:
+        result = _build_cross_blocklist(crit, min_videos, max_uids,
+                                        include_lowconf=include_lowconf)
+    except sqlite3.Error as e:
+        print(f"[Web] 跨视频屏蔽列表构建失败: {e}")
+        return jsonify({"error": "数据库查询失败，请稍后重试"}), 500
+    if not result["entries"]:
+        return jsonify({"error": f"没有在 ≥{min_videos} 个视频命中标准的已解析发送者"
+                                 f"（库内共 {result['videos']} 个视频）"}), 404
+    payload = json.dumps(result["entries"], ensure_ascii=False, indent=2)
+    resp = Response(payload, mimetype="application/json")
+    resp.headers["Content-Disposition"] = 'attachment; filename="blocklist_cross.json"'
     return resp
 
 

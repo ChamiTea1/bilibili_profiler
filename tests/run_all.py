@@ -51,7 +51,8 @@ SCRIPTS = [
     "tests/offline/regress_repeat_events.py",   # 群体复读事件检测口径 17 项
     "tests/offline/regress_port_config.py",     # 端口配置（--port/环境变量/回退）5 项
     "tests/offline/regress_review_fixes.py",    # 本轮 code review 修复定点验证 10 项
-    "tests/offline/regress_blocklist.py",       # B站屏蔽列表导出（选人/误报/低置信度/路由）11 项
+    "tests/offline/regress_blocklist.py",       # B站屏蔽列表导出（选人/误报/低置信度/路由/跨视频）17 项
+    "tests/offline/regress_density_peaks.py",   # 弹幕高能点 AI 标注（峰值/缓存/降级）7 项
 ]
 SUMMARY_RE = re.compile(r"(\d+) 项通过,\s*(\d+) 项失败")
 

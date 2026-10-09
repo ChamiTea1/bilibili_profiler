@@ -131,6 +131,35 @@ check("合法请求 200 + 附件下载头",
 check("未知视频 404", tc.get("/api/video/BVnope/blocklist").status_code == 404)
 check("非法 crit 400", tc.get("/api/video/%s/blocklist?crit=bogus" % BV).status_code == 400)
 
+print("=== 6. 跨视频合并屏蔽榜（惯犯优先）===")
+# 第二个视频：101 再命中问题弹幕（跨视频惯犯）；109 仅在此视频刷屏（单视频命中）
+BV2 = "BVblk000002"
+storage.save_video_info(BV2, {"bvid": BV2, "title": "t2", "cid": 2})
+storage.save_sender(BV2, "g101", 101, "高", "评论区验证", 7, ["骂人"], "低", 0.0)
+# 本地架构：画像按 (bvid,uid) 存 video_profiles，save_user_data 不再落 profile_json
+storage.save_video_profile(BV2, 101, _profile(
+    101, cringe=_cringe(_item("骂人", "人身攻击", 2))))
+storage.save_sender(BV2, "g109", 109, "高", "评论区验证", 25, ["冲"] * 25, "高", 8.0)
+rc = webmod._build_cross_blocklist({"cringe", "spam"}, 2, 200)
+cross_uids = [int(e["filter"]) for e in rc["entries"]]
+check("双视频命中者入选、单视频命中者按 min_videos 排除",
+      cross_uids == [101] and 109 not in cross_uids and 103 not in cross_uids,
+      "(uid %s)" % cross_uids)
+check("comment 标注命中视频数", "2个视频命中" in rc["entries"][0]["comment"],
+      "(%s)" % rc["entries"][0]["comment"])
+rc1 = webmod._build_cross_blocklist({"cringe", "spam"}, 1, 200)
+check("min_videos=1 时单视频命中者也入选（按命中视频数排序）",
+      101 in [int(e["filter"]) for e in rc1["entries"]]
+      and int(rc1["entries"][0]["filter"]) == 101,
+      "(前2 %s)" % [e["filter"] for e in rc1["entries"][:2]])
+resp_c = tc.get("/api/blocklist/cross?crit=cringe,spam&min_videos=2")
+check("跨视频路由 200 + 附件下载头 + type=2 条目",
+      resp_c.status_code == 200 and "attachment" in resp_c.headers.get("Content-Disposition", "")
+      and b'"type": 2' in resp_c.data,
+      "(status %d)" % resp_c.status_code)
+check("跨视频无命中 404", tc.get("/api/blocklist/cross?crit=cmt&min_videos=2").status_code == 404)
+check("跨视频非法 crit 400", tc.get("/api/blocklist/cross?crit=bogus").status_code == 400)
+
 print("")
 print("==== 屏蔽列表导出: %d 项通过, %d 项失败 ====" % (ok, fail))
 sys.exit(1 if fail else 0)
