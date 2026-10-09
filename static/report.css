@@ -137,6 +137,19 @@
 .ov-dl .filter-btn { text-decoration:none; }
 #reportJobStatus { font-size:13px; color:#f57c00; }
 
+/* B站屏蔽列表导出（操作条内的下拉面板：导出标准/上限/说明） */
+.blk-export { display:inline-block; position:relative; }
+.blk-export summary { list-style:none; cursor:pointer; }
+.blk-export summary::-webkit-details-marker { display:none; }
+.blk-panel { position:absolute; z-index:60; top:calc(100% + 6px); left:0; width:340px;
+             background:white; border-radius:12px; box-shadow:0 6px 24px rgba(0,0,0,0.15);
+             padding:12px 14px; display:flex; flex-direction:column; gap:6px; }
+.blk-panel label { font-size:13px; color:#555; display:flex; align-items:center; gap:6px; }
+.blk-panel label.blk-sub { color:#888; font-size:12px; padding-left:6px; }
+.blk-num { width:64px; padding:2px 6px; border:1px solid #ddd; border-radius:6px; font-size:12px; }
+.blk-note { font-size:11px; color:#999; line-height:1.5; margin:4px 0 0; }
+.blk-panel .filter-btn { align-self:flex-start; }
+
 /* 弹幕密度时间轴独占整行（宽幅直方图）；图表高度不写死，随容器宽高比自适应；
    与下方 charts-grid 图表卡之间补间隔（density 卡独立于网格之外，自身带下边距） */
 .chart-wide { grid-column:1 / -1; margin-bottom:20px; }

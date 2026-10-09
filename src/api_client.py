@@ -63,6 +63,8 @@ class BiliAPIClient:
         self._proxy_active = False
         # RLock：_get_wbi_key/_ensure_buvid3 在持有锁的请求路径中可能嵌套发请求
         self._lock = threading.RLock()
+        # immediate 交互请求的独立串行锁：不与批量限速锁共用（见 _request_immediate）
+        self._immediate_lock = threading.Lock()
         self._wbi_key = None
         self._wbi_key_date = None  # WBI 密钥缓存日期，img_key/sub_key 全站统一、每日更替
         self._wbi_key_fail_ts = 0.0  # WBI 密钥获取失败时刻（负缓存，60s 内不再重打 NAV）
@@ -143,12 +145,16 @@ class BiliAPIClient:
             )
             data = resp.json().get("data") or {}    # 风控期 data 可能为 null，避免 AttributeError
             self._buvid3 = data.get("b_3", "")
+            # cookie 写入持 _lock：其他线程可能正在 _request_locked（持锁）里迭代 jar
+            # （prepare 阶段读 cookies），无锁 set 会触发 dict changed size during iteration
             if self._buvid3:
-                self.session.cookies.set("buvid3", self._buvid3, domain=".bilibili.com")
+                with self._lock:
+                    self.session.cookies.set("buvid3", self._buvid3, domain=".bilibili.com")
             # spi 同时返回 b_4（buvid4），一并写入 cookie
             buvid4 = data.get("b_4", "")
             if buvid4:
-                self.session.cookies.set("buvid4", buvid4, domain=".bilibili.com")
+                with self._lock:
+                    self.session.cookies.set("buvid4", buvid4, domain=".bilibili.com")
         except Exception:
             pass
         if not self._buvid3:
@@ -172,7 +178,8 @@ class BiliAPIClient:
             )
             ticket = (data.get("data") or {}).get("ticket", "")
             if ticket:
-                self.session.cookies.set("bili_ticket", ticket, domain=".bilibili.com")
+                with self._lock:    # 同 _ensure_buvid3：防无锁 set 与持锁请求的 jar 迭代竞态
+                    self.session.cookies.set("bili_ticket", ticket, domain=".bilibili.com")
                 self._bili_ticket_ok = True
             else:
                 self._bili_ticket_fail_ts = time.time()
@@ -199,7 +206,7 @@ class BiliAPIClient:
         if self._throttle < old:
             print(f"[API] 单元采集成功，降速倍率回落: {old:.2f} → {self._throttle:.2f}")
 
-    def _sleep_if_needed(self, url: str, immediate: bool = False):
+    def _sleep_if_needed(self, url: str):
         # -412 全局冷却：本方法在 _request_locked 的锁内执行，
         # 冷却等待会阻塞其他线程拿锁，即所有请求一起暂停（全局冷却的预期语义）
         remaining = self._risk_cooldown_until - time.time()
@@ -207,11 +214,8 @@ class BiliAPIClient:
             if remaining > 1:
                 print(f"[API] 风控冷却中，等待 {remaining:.0f} 秒...")
             time.sleep(remaining)
-        # immediate=True：交互式单次请求（如报告页悬停词云）跳过随机限速间隔——
-        # 限速是批量采集的风控约束，人点一下不属于批量行为；风控冷却仍然生效。
-        if immediate:
-            return
         # 区间内随机取间隔（消除固定节奏特征），再乘自适应倍率
+        # （immediate 交互请求不走本方法：见 _request_immediate 的免限速通道）
         lo, hi = REQUEST_DELAY_LONG if self._is_risk_api(url) else REQUEST_DELAY
         delay = random.uniform(lo, hi) * self._throttle
         elapsed = time.time() - self._last_request_time
@@ -220,10 +224,33 @@ class BiliAPIClient:
         self._last_request_time = time.time()
 
     def _request_locked(self, method: str, url: str, immediate: bool = False, **kwargs) -> requests.Response:
-        """限速与请求发出原子化（线程安全）；全局冷却等待在锁内的 _sleep_if_needed 中执行"""
+        """限速与请求发出原子化（线程安全）；全局冷却等待在锁内的 _sleep_if_needed 中执行。
+
+        immediate=True（交互式单次请求，如报告页悬停词云）走 _request_immediate 独立
+        通道：批量线程的限速睡眠在 _lock 内执行，若交互请求共用该锁，会被拖去排队
+        0.8~8s/次（风控冷却期最长数百秒），"交互单发免限速"即名存实亡。"""
+        if immediate:
+            return self._request_immediate(method, url, **kwargs)
         with self._lock:
-            self._sleep_if_needed(url, immediate=immediate)
+            self._sleep_if_needed(url)
             # setdefault：调用方显式传 timeout（如 _get_wbi_key 的 timeout=10）时保留，避免关键字冲突
+            kwargs.setdefault("timeout", 15)
+            return self.session.request(method, url, **kwargs)
+
+    def _request_immediate(self, method: str, url: str, **kwargs) -> requests.Response:
+        """交互式单次请求通道：跳过随机限速间隔（人点一下不属批量行为），但
+        -412 风控冷却是全局语义（所有请求一起暂停）仍生效——锁外读共享截止时刻
+        等待（float 读写靠 GIL 原子，与锁内写的竞态最多多等/少等一瞬，可接受）。
+        交互请求之间用 _immediate_lock 串行（防连点连发绕过"单次"语义）。
+        残留竞态：与凭证明置（buvid3/bili_ticket 首次注入，持 _lock）并发的
+        jar 迭代理论上可抛 RuntimeError——窗口仅凭据首置一次，且失败方有调用方
+        兜底降级（词云悬停失败显示空态），可接受。"""
+        remaining = self._risk_cooldown_until - time.time()
+        if remaining > 0:
+            if remaining > 1:
+                print(f"[API] 风控冷却中，交互请求等待 {remaining:.0f} 秒...")
+            time.sleep(remaining)
+        with self._immediate_lock:
             kwargs.setdefault("timeout", 15)
             return self.session.request(method, url, **kwargs)
 
@@ -490,8 +517,10 @@ class BiliAPIClient:
     def get_cookies_dict(self) -> dict:
         """jar 中可能存在同名不同域的重复 cookie（如 spi 写入的 buvid3 与登录
         态文件里的 buvid3 域不同），dict(jar) 会抛 CookieConflictError；
-        逐条遍历按名去重（后写覆盖先写），规避冲突。"""
+        逐条遍历按名去重（后写覆盖先写），规避冲突。
+        遍历持 _lock：与凭据注入的 cookies.set（持锁）串行，防迭代中被改。"""
         result = {}
-        for c in self.session.cookies:
-            result[c.name] = c.value
+        with self._lock:
+            for c in self.session.cookies:
+                result[c.name] = c.value
         return result

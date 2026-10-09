@@ -272,9 +272,11 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
 
     # done=1 的已完成视频重复调用：回拨检查点滚动补采最近 HISTORY_RECENT_REFRESH_DAYS 天
     # （dmid 幂等去重，重复调用快速；last_date 仍是历史高水位，不落库回拨值）
-    # 注意日志顺序：续采提示必须在回拨判定之后打印——回拨会把 last_date 往前拨，
-    # 先打印就会自相矛盾（"今天已完成"紧接着"重采最近3天"）
-    if done_before and last_date and last_date >= today.isoformat():
+    # 回拨不设 last_date >= today 前置条件：跨天重跑时（last_date 停在昨天）若不回拨，
+    # 已达 HISTORY_MAX_DAYS 上限的视频会在天数检查处直接 break——滚动窗口一天也补不进，
+    # 新增弹幕永久冻结（refresh_mode 豁免上限，见下方建清单处）
+    refresh_mode = done_before
+    if refresh_mode:
         cutoff = (today - timedelta(days=HISTORY_RECENT_REFRESH_DAYS)).isoformat()
         fetched_dates = {d for d in fetched_dates if d <= cutoff}
         last_date = cutoff
@@ -321,10 +323,12 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     window_complete = True          # 月份索引全部成功才算时间窗完整
 
     # 1) 先串行建待采日期清单（月份索引每月一个请求，远少于天数）；
-    #    月份降序 + 月内日期降序：上限耗尽保留最新日期
+    #    月份降序 + 月内日期降序：上限耗尽保留最新日期。
+    #    refresh_mode 豁免天数上限：滚动补采窗口固定为 cutoff 之后的几天（≤3 天），
+    #    上限管的是"回溯多早"而非"补采几条"；已达上限的 done 视频不豁免则永远补不进新弹幕
     work_dates: list[str] = []
     for month in reversed(months):
-        if fetched_days + len(work_dates) >= HISTORY_MAX_DAYS:
+        if not refresh_mode and fetched_days + len(work_dates) >= HISTORY_MAX_DAYS:
             truncated = True
             break
         try:
@@ -348,7 +352,7 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         if not dates:
             continue   # 该月确实无弹幕（空列表），属合法空月
         for date in sorted(dates, reverse=True):
-            if fetched_days + len(work_dates) >= HISTORY_MAX_DAYS:
+            if not refresh_mode and fetched_days + len(work_dates) >= HISTORY_MAX_DAYS:
                 truncated = True
                 break
             # 续采判据：有日期集时**只认日期集**。降序遍历下 last_date 是"最新已采日"，

@@ -51,7 +51,7 @@ c = WbiClient(pages=3)
 out = C._fetch_comments_wbi(1, c, 100, bvid="BVC1")
 kv = {r["key"]: r["value"] for r in storage.get_db().execute(
     "SELECT key, value FROM phase_state WHERE bvid='BVC1' AND phase='comment'")}
-check("三页全部采集", len(out) == 3 and len(c.__dict__) > 0, "(得到 %d 条主评论)" % len(out))
+check("三页全部采集", len(out) == 3, "(得到 %d 条主评论)" % len(out))
 check("自然结束写 done=1", kv.get("done") == "1" and kv.get("mode") == "wbi")
 
 print("=== 2. 首页请求异常 → 返回 None（调用方降级旧接口）===")

@@ -88,7 +88,6 @@ check("重跑补齐失败月份后才写 done", len(fds2) == 20 and kv2.get("don
       "(已采 %d 天, done=%s)" % (len(fds2), kv2.get("done")))
 
 print("=== 2. P0-2 线程池异常路径收尾 ===")
-import concurrent.futures.thread as _t
 real = storage.append_danmaku; cnt = {"n": 0}
 def flaky(b, dms, seen):
     cnt["n"] += 1
@@ -137,17 +136,18 @@ xml = ('<i><d p="1,1,25,16777215,1700000000,0,zzzz,111">bad</d>'
 dms = danmaku.parse_danmaku_xml(xml)
 check("非法 mid_hash 丢弃、合法短 hash 补零", [d["mid_hash"] for d in dms] == ["000a1b2c", "00000abc"], str([d["mid_hash"] for d in dms]))
 class FCli2:
-    def get_raw(s, u, params=None, **k): raise AssertionError("不应发起请求")
-danmaku.fetch_all_danmaku({"pages": [{"page": 1}, {"cid": 5, "page": 2}]}, FCli2()) if False else None
+    def get_raw(s, u, params=None, **k):
+        if (params or {}).get("oid") == 5:
+            return type("R", (), {"content": b"<i></i>"})()   # 含 cid 的分P返回空 XML
+        raise AssertionError("不应发起请求")
 import io, contextlib
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
-    out = danmaku.fetch_all_danmaku({"pages": [{"page": 1}]}, FCli2())
-check("缺 cid 的分P被跳过不中断", out == [] and "缺少 cid" in buf.getvalue())
+    out = danmaku.fetch_all_danmaku({"pages": [{"page": 1}, {"cid": 5, "page": 2}]}, FCli2())
+check("缺 cid 的分P被跳过、含 cid 的分P照常请求", out == [] and "缺少 cid" in buf.getvalue())
 import profile_analyzer as pa
 tg = pa.tag_activity_pattern({"activity_type": "深夜党", "peak_hour": 3})
 check("时段标签不重复", tg.count("深夜党") == 1, str(tg))
-check("follower 为 None 不崩", True)  # 见下 report 渲染测试
 import report
 html = report.generate_user_card({"uid": 1, "name": "n", "follower": None, "following": None,
                                   "like_num": None, "danmaku": {}, "tags": [],

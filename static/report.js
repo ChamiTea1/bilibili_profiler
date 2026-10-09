@@ -195,9 +195,10 @@ function fetchUpWc(upUid) {
 const wcWarmQueue = [];
 const wcWarmQueued = new Set();
 let wcWarmTimer = null;
+let wcWarming = false;   // 消费泵是否在途：wcWarmTimer 在 fetch pending 期间为 null，观察器仅凭 timer 判定会并发第二支泵
 function wcWarmNext() {
     const uid = wcWarmQueue.shift();
-    if (!uid) { wcWarmTimer = null; return; }
+    if (!uid) { wcWarmTimer = null; wcWarming = false; return; }   // 队列耗尽不再安排下一轮：释放泵标志，后续触发可重启
     fetchUpWc(uid).finally(() => { wcWarmTimer = setTimeout(wcWarmNext, 700); });
 }
 const wcObserver = new IntersectionObserver(entries => {
@@ -208,7 +209,8 @@ const wcObserver = new IntersectionObserver(entries => {
             wcWarmQueue.push(uid);
         }
     }
-    if (wcWarmQueue.length && !wcWarmTimer) wcWarmNext();
+    // 以 wcWarming 看守整个泵生命周期（含 fetch pending 窗口）：密集滚动多次触发也只保留一支泵，守住 700ms 节流
+    if (wcWarmQueue.length && !wcWarming) { wcWarming = true; wcWarmNext(); }
 }, {rootMargin: '200px'});
 document.querySelectorAll('.up-chip[data-up-uid]').forEach(c => wcObserver.observe(c));
 
@@ -667,7 +669,7 @@ function drawAfEdges() {
     }
     // 明细列表的挑事者条目前缀同色圆点：图与列表颜色互参
     colorNodes.forEach(n => {
-        const item = document.querySelector(`.af-item[data-side="a"][data-uid="${n.id}"]`);
+        const item = document.querySelector(`.af-item[data-side="a"][data-uid="${CSS.escape(String(n.id))}"]`);
         const line = item && item.querySelector('.af-line');
         if (line && !line.querySelector('.af-dot')) {
             const dot = document.createElement('span');
@@ -828,6 +830,7 @@ function gotoUser(uid) {
 const BVID = PAGE_DATA.bvid;
 const dmState = {page: 1};
 let dmTimer = null;
+let dmReqSeq = 0;   // 弹幕请求自增序号：防抖后仍可能并发多个 in-flight 请求，旧响应后到不得覆盖新响应
 
 function dmParams() {
     const p = new URLSearchParams();
@@ -874,7 +877,7 @@ function dmRestoreFromUrl() {
 
 function escHtml(s) {
     return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function fmtVideoTime(sec) {
@@ -883,6 +886,7 @@ function fmtVideoTime(sec) {
 }
 
 function loadDanmaku() {
+    const seq = ++dmReqSeq;   // 本次请求序号：响应回来若已有更新请求发出则丢弃，防止旧响应覆盖新表格
     const err = document.getElementById('dmError');
     const spinner = document.getElementById('dmSpinner');
     err.style.display = 'none';
@@ -893,6 +897,7 @@ function loadDanmaku() {
             return r.json();
         })
         .then(data => {
+            if (seq !== dmReqSeq) return;   // 过期响应：已有更新的请求在途，不渲染避免表格与 URL/筛选不一致
             const tbody = document.getElementById('dmTbody');
             tbody.innerHTML = data.rows.map(row => {
                 // uid 只接受整数（服务端已归一为 int）：非整数一律不渲染跳转链接，
@@ -900,7 +905,10 @@ function loadDanmaku() {
                 const uidNum = Number(row.uid);
                 const sender = Number.isInteger(uidNum)
                     ? '<a onclick="gotoUser(' + uidNum + ')">' + escHtml(row.name || uidNum) + '</a><br><span class="dm-time">UID:' + uidNum + '</span>'
-                    : '<span class="dm-time">' + escHtml(row.mid_hash) + '</span>';
+                    : (row.name
+                        // 遮蔽态（uid 被服务端遮蔽为非整数字符串）：不渲染跳转链接，但遮蔽昵称 row.name 仍展示（过 escHtml，防御不放松）
+                        ? escHtml(row.name) + '<br><span class="dm-time">' + escHtml(row.mid_hash) + '</span>'
+                        : '<span class="dm-time">' + escHtml(row.mid_hash) + '</span>');
                 const dup = row.dup_count > 1 ? ' <span class="dm-time">×' + row.dup_count + '</span>' : '';
                 // 颜色只接受 #rrggbb（服务端已归一）：否则不渲染色块，防 CSS 声明注入
                 const safeColor = /^#[0-9a-fA-F]{6}$/.test(row.color || '') ? row.color : '';
@@ -930,10 +938,11 @@ function loadDanmaku() {
             dmSyncUrl();
         })
         .catch(e => {
+            if (seq !== dmReqSeq) return;   // 过期请求的失败不展示（当前在途的是更新请求）
             document.getElementById('dmErrorText').textContent = '弹幕加载失败: ' + e.message;
             err.style.display = 'flex';
         })
-        .finally(() => { spinner.style.display = 'none'; });
+        .finally(() => { if (seq === dmReqSeq) spinner.style.display = 'none'; });   // 过期请求不得提前关掉新请求的 spinner
 }
 
 // 页码输入跳转（spec 3）
@@ -1171,6 +1180,36 @@ function toggleMask() {
     location.reload();
 }
 
+// B站屏蔽列表导出：读面板勾选标准/上限 → fetch 生成 → blob 下载；
+// 无命中/服务端错误时 alert 提示而非下载空文件（uid 参数走 encodeURIComponent 防注入）
+function blkExport(bvid) {
+    const crit = [
+        document.getElementById('blkCringe').checked ? 'cringe' : '',
+        document.getElementById('blkSpam').checked ? 'spam' : '',
+        document.getElementById('blkCmt').checked ? 'cmt' : '',
+    ].filter(Boolean);
+    if (!crit.length) { alert('请至少勾选一项导出标准'); return; }
+    const max = parseInt(document.getElementById('blkMax').value, 10) || 200;
+    const lowconf = document.getElementById('blkLowconf').checked ? '&lowconf=1' : '';
+    const url = '/api/video/' + encodeURIComponent(bvid) +
+        '/blocklist?crit=' + encodeURIComponent(crit.join(',')) + '&max=' + max + lowconf;
+    fetch(url)
+        .then(r => {
+            if (!r.ok) return r.json().then(j => { throw new Error(j.error || ('HTTP ' + r.status)); });
+            return r.blob();
+        })
+        .then(blob => {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'blocklist_' + bvid + '.json';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(a.href), 5000);   // 稍延迟回收，避免下载未开始即失效
+        })
+        .catch(e => alert('屏蔽列表导出失败：' + e.message));
+}
+
 function reportRegen() {
     if (!confirm('重新生成 ' + BVID + ' 的报告？将清空该视频缓存并后台重跑完整分析流水线。')) return;
     const status = document.getElementById('reportJobStatus');
@@ -1185,10 +1224,13 @@ function reportRegen() {
         .catch(() => { status.textContent = '网络错误'; });
 }
 
+// 重新生成轮询连续失败计数：>=5 判定状态接口不可用，停止轮询并提示（参照 pollJob 熔断模式，独立计数防与手动分析轮询互相干扰）
+let regenPollFails = 0;
 function reportPollRegen(jobId) {
     fetch('/api/job/' + jobId)
         .then(r => r.json())
         .then(j => {
+            regenPollFails = 0;   // 成功响应清零连续失败计数
             const status = document.getElementById('reportJobStatus');
             if (j.error) { status.textContent = '任务状态查询失败: ' + j.error; return; }
             if (j.finished) {
@@ -1201,7 +1243,14 @@ function reportPollRegen(jobId) {
             }
             setTimeout(() => reportPollRegen(jobId), 3000);
         })
-        .catch(() => setTimeout(() => reportPollRegen(jobId), 3000));
+        .catch(() => {
+            regenPollFails++;
+            if (regenPollFails >= 5) {   // 熔断：job 接口持续异常，不再 3s 间隔无限轮询
+                document.getElementById('reportJobStatus').textContent = '状态查询失败，请刷新页面查看';
+                return;
+            }
+            setTimeout(() => reportPollRegen(jobId), 3000);
+        });
 }
 
 function reportDelete() {

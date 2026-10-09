@@ -157,7 +157,9 @@ MAX_DYNAMIC_PAGES = 5        # 动态最大翻页（对画像而言近 5 页足�
 MAX_FOLLOWING_PAGES = 5       # 关注列表最大翻页（每页20，他人最多100）
 MAX_FOLLOWER_PAGES = 2       # 粉丝列表最大翻页
 MAX_FAV_CONTENTS = 20        # 收藏夹内容采样数
-COLLECT_WORKERS = 3       # 并发采集线程数（BiliAPIClient已线程安全，限速为全局共享）
+# 并发模型说明：阶段5 用户采集走 combo_pool 按账号分片（每账号一子池、限速按号独立、
+# 线程↔分片绑定），线程数不再由单独的 COLLECT_WORKERS 配置控制（该死配置已移除，
+# 旧注释"限速为全局共享"与现行按号独立架构矛盾）
 
 # ========== 画像配置 ==========
 SPAM_HIGH_THRESHOLD = (10, 0.7)    # (弹幕数, 重复率)
@@ -185,6 +187,9 @@ PROBLEM_COMMENT_TOP_N = 30         # 榜单最多展示条数
 # 争执焦点区块（高回复评论页顶部：问题回复按 parent_rpid 还原「谁攻击谁」）
 ATTACK_FOCUS_TOP_N = 5             # 挑事者/被围攻者双榜保底名额
 ATTACK_FOCUS_MAX_N = 20            # 名额上限；实际名额随攻击边数浮动：每10条攻击边+1
+
+# B站屏蔽列表导出（概览页操作条：把问题发送者导出为播放器「弹幕屏蔽列表」可导入的 JSON）
+BLOCKLIST_MAX_UIDS = 200           # 单次导出上限；B站屏蔽列表容量约 200 条，超出按严重度截断
 
 # ========== Web 报告配置 ==========
 WEB_AUTOSTART = True   # run.py/quick_test.py 分析完毕自动启动 web.py 并用浏览器打开报告页（False 关闭）
@@ -248,6 +253,8 @@ WBI_KEY_FAIL_TTL = 60              # WBI 密钥获取失败负缓存秒数（原
 CRED_FAIL_TTL = 300                # buvid3/bili_ticket 获取失败重试间隔秒数（原 api_client._CRED_FAIL_TTL）
 REPLY_TREE_MAX_DEPTH = 50          # 高回复评论树渲染递归深度上限（原 web.py _REPLY_TREE_MAX_DEPTH）
 WEB_JOB_MAX_KEPT = 100             # web 内存 job 表淘汰上限（原 web.py _JOB_MAX_KEPT）
+WEB_PAGE_CACHE_MAX_ENTRIES = 32    # 报告页 HTML 缓存最多保留的（视频, 遮蔽状态）条目数
+WEB_PAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024  # 报告页 HTML 缓存总字节上限（超出即整体清空重建）
 ANALYZE_MAX_TARGETS = 200          # /api/analyze 单次 mid_hashes 上限（原 web.py _ANALYZE_MAX_TARGETS）
 SPAM_BURST_WINDOW_SECONDS = 10     # 刷屏突发检测的滑动窗口长度（秒，原 spam_detector._BURST_WINDOW_SECONDS）
 SPAM_BURST_HIGH_COUNT = 5          # 窗口内 ≥N 条判高强度突发（原 spam_detector._BURST_HIGH_COUNT）

@@ -16,7 +16,7 @@ from combo_pool import build_pool
 from danmaku import collect_danmaku_data, group_by_sender
 from spam_detector import batch_detect_spam
 from cringe_detector import detect_cringe_danmaku
-from comment import fetch_comments, build_comment_uid_map, build_comment_location_map
+from comment import fetch_comments, build_comment_uid_map
 from uid_resolver import resolve_sender
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
@@ -159,7 +159,7 @@ def main():
             mid_hash, group["contents"], comment_uid_map, pool
         )
         if not uid:
-            print(f"  ❌ UID 解析失败!")
+            print("  ❌ UID 解析失败!")
             continue
         risk_note = " ⚠️可能误识别" if collision_risk else ""
         print(f"  ✅ UID={uid} (方法: {method}, 置信度: {confidence}){risk_note}")

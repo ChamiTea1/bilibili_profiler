@@ -140,7 +140,9 @@ def _download_binary(dest: str) -> bool:
         return False
     for name in names:
         expected = _KNOWN_SHA256[name]
-        tmp = dest + ".tmp"
+        # tmp 名带 pid：两进程并发下载时固定名 tmp 会互相删除/替换对方（os.replace
+        # 异常换源能自愈，但何必留这个坑）
+        tmp = f"{dest}.tmp.{os.getpid()}"
         for url in _gh_download_urls(assets[name]):
             try:
                 print(f"[ProxyCore] 下载 mihomo 核心: {url}")
@@ -163,7 +165,7 @@ def _download_binary(dest: str) -> bool:
                 print(f"[ProxyCore] 下载失败（{name}）: {e}")
                 if os.path.exists(tmp):
                     os.remove(tmp)
-    print(f"[ProxyCore] 自动下载均未通过校验/失败，已放弃")
+    print("[ProxyCore] 自动下载均未通过校验/失败，已放弃")
     _manual_hint(dest)
     return False
 
@@ -298,6 +300,13 @@ class ProxyCore:
             try:
                 os.makedirs(_RUNTIME_DIR, exist_ok=True)
                 cfg_path = os.path.join(_RUNTIME_DIR, "config.yaml")
+                # 上次进程被 SIGKILL 时 atexit 不会执行，含订阅凭证的 config.yaml
+                # 可能残留磁盘：写新配置前先清残留（含订阅凭证的文件不该在核心
+                # 未运行时躺在磁盘上）
+                try:
+                    os.remove(cfg_path)
+                except OSError:
+                    pass
                 # os.open 带 0o600 创建：消除"先写后 chmod"的权限窗口（含订阅凭证）
                 fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -313,6 +322,7 @@ class ProxyCore:
                     **self._pdeathsig_kwargs())
             except OSError as e:
                 print(f"[ProxyCore] 核心启动失败: {e}")
+                self._stop_locked()     # 回收进程句柄并清掉刚写入的含凭证配置
                 return None
             if not self._atexit_registered:
                 atexit.register(self.stop)
@@ -321,7 +331,7 @@ class ProxyCore:
             for _ in range(60):
                 if self._proc.poll() is not None:
                     print(f"[ProxyCore] 核心进程退出（code={self._proc.returncode}），禁用内置核心")
-                    self._proc = None
+                    self._stop_locked()     # 核心已死：清残留进程引用与含凭证配置
                     return None
                 nodes = ctl.refresh_nodes() if ctl.available() else []
                 if nodes:

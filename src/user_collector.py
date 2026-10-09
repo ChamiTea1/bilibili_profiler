@@ -6,7 +6,6 @@
 维度3: 社交关系网络
 维度4: 行为模式分析
 """
-import time
 from datetime import datetime, timezone, timedelta
 from api_client import BiliAPIClient
 from config import (

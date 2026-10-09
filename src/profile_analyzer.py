@@ -4,18 +4,20 @@
 将原始采集数据转化为结构化画像和标签。
 """
 from datetime import datetime, timedelta, timezone
-from collections import Counter
 
 
 # ========== 标签生成器 ==========
 
 def tag_account_type(uid: int, level: int) -> list[str]:
-    """账号类型标签"""
+    """账号类型标签（按 UID 位数粗划注册年代；档位按 2026 年口径校准，
+    随时间推移整体右移——8 位 UID 已是约 7 年老号，不宜再压在"中期"）"""
     tags = []
     uid_str = str(uid)
     if len(uid_str) <= 6:
         tags.append("B站原住民")
     elif len(uid_str) <= 8:
+        tags.append("早期用户")
+    elif len(uid_str) <= 9:
         tags.append("中期用户")
     else:
         tags.append("新用户")
@@ -68,11 +70,12 @@ def tag_following_type(followings: list[dict]) -> list[str]:
     if not followings:
         return []
 
-    # 基于名称关键词的粗略分类
+    # 基于名称关键词的粗略分类（关键词须够特异："日常"这类泛词会让"游戏日常"
+    # 之类名称同时命中游戏+生活两个圈层，虚高明显）
     keywords = {
         "知识": ["罗翔", "半佛", "智能路障", "键客行", "宋浩", "李永乐", "科普"],
         "游戏": ["老番茄", "纯黑", "敖厂长", "C菌", "女流", "游戏", "电竞", "LOL", "原神", "王者"],
-        "生活": ["何同学", "影视飓风", "毕导", "大祥哥", "绵羊", "美食", "旅行", "日常"],
+        "生活": ["何同学", "影视飓风", "毕导", "大祥哥", "绵羊", "美食", "旅行", "vlog", "Vlog"],
         "虚拟": ["虚拟", "Vtuber", "Vup", "嘉然", "乃琳", "贝拉", "向晚", "阿梓", "七海"],
         "鬼畜": ["鬼畜", "伊丽莎白", "泽野", "螳螂", "短裙"],
         "动画": ["番剧", "动画", "动漫", "二次元", "MAD", "AMV"],
@@ -115,8 +118,10 @@ def tag_favorite_style(folders: list[dict]) -> list[str]:
     if any(w in name_str for w in ["归档", "已完成", "看完", "整理", "分类"]):
         tags.append("强迫症型")
 
-    # 文艺型
-    if any(w in name_str for w in ["诗", "远方", "梦", "星", "月", "云", "风"]):
+    # 文艺型（双字以上词，单字"星/月/梦/云/风"会把"星穹铁道""梦幻抽卡"等
+    # 游戏名误挂文艺标签）
+    if any(w in name_str for w in ["诗和远方", "诗意", "远方", "月亮", "月光", "星辰",
+                                   "大海", "晚风", "云海", "梦境", "浪漫"]):
         tags.append("文艺型")
 
     # 抽象/年轻

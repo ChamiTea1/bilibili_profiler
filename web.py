@@ -40,7 +40,7 @@ if sys.version_info < (3, 12):
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from flask import Flask, abort, jsonify, request, send_from_directory
+from flask import Flask, Response, abort, jsonify, request, send_from_directory
 
 from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTORY_MAX_DAYS,
                      MAX_FOOTPRINT_VIDEOS, MAX_FOOTPRINT_DANMAKU_SAMPLES,
@@ -51,7 +51,7 @@ from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTO
                      COMMENT_HEAT_REPLY_WEIGHT, PROBLEM_COMMENT_TOP_N,
                      ATTACK_FOCUS_TOP_N, ATTACK_FOCUS_MAX_N, USER_CARD_URL, NAV_URL,
                      REPLY_TREE_MAX_DEPTH, WEB_JOB_MAX_KEPT, ANALYZE_MAX_TARGETS,
-                     REPEAT_EVENT_TOP_N)
+                     REPEAT_EVENT_TOP_N, BLOCKLIST_MAX_UIDS)
 import config as _config
 from auth import load_cookie, verify_cookie, _try_refresh_cookie
 from api_client import BiliAPIClient
@@ -448,16 +448,36 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
     print(f"[Job {job_id}] 完成: 成功 {len(JOBS[job_id]['results'])}/{len(mid_hashes)}")
 
 
-def _run_analysis_job_bound(job_id: str, bvid: str, mid_hashes: list[str]):
-    """线程入口：绑定池使用方=job_id 后再跑分析 job。
+def _run_analysis_job_entry(job_id: str, bvid: str, mid_hashes: list[str]):
+    """线程入口：绑定池使用方=job_id（风控账本按 job 隔离）+ 兜底循环外异常。
 
-    组合池是模块级单例（多个不同 bvid 的 job 并发共享）。账号轮换/长冷却/代理降级
-    是 IP 层面的全局状态，共享正确；但「整圈风控」进度必须按 job 隔离，否则
-    A job 的风控账本会被并发的 B job 一次成功清零（A 反复长冷却却永不放弃），
-    或被 B 的风控累加而提前放弃。绑定后池内按 owner 记账（见 combo_pool.pool_owner）。
+    两件事缺一不可：
+    - pool_owner：组合池是模块级单例（多个不同 bvid 的 job 并发共享）。账号轮换/
+      长冷却/代理降级是 IP 层面的全局状态，共享正确；但「整圈风控」进度必须按 job
+      隔离，否则 A job 的账本会被并发的 B job 一次成功清零（A 反复长冷却却永不放弃），
+      或被 B 的风控累加而提前放弃（见 combo_pool.pool_owner）。
+    - 异常兜底：库读取（load_senders 等）不在 per-item try 内，外部 run.py --force
+      删表重建/库损坏时会抛 sqlite3.Error；阶段函数还会 raise SystemExit（继承
+      BaseException，常规 except Exception 接不住）。不兜底的话 job 线程崩溃后
+      finished 永为 False，该视频的删除/重新分析因 _has_running_job 恒真而永久
+      409，只能重启解锁。
     """
-    with pool_owner(job_id):
-        _run_analysis_job(job_id, bvid, mid_hashes)
+    try:
+        with pool_owner(job_id):
+            _run_analysis_job(job_id, bvid, mid_hashes)
+    except SystemExit as e:
+        with JOBS_LOCK:
+            JOBS[job_id]["errors"].append({"mid_hash": None, "error": f"分析被终止: {e}"})
+        print(f"[Job {job_id}] 分析被终止（SystemExit: {e}）")
+    except Exception as e:
+        with JOBS_LOCK:
+            JOBS[job_id]["errors"].append({"mid_hash": None, "error": f"job 异常终止: {type(e).__name__}: {e}"})
+        print(f"[Job {job_id}] 异常终止: {type(e).__name__}: {e}")
+    finally:
+        with JOBS_LOCK:
+            JOBS[job_id]["finished"] = True
+            JOBS[job_id]["current"] = ""
+        _invalidate_page_cache(bvid)   # 异常路径的部分结果也已落库，页缓存必须失效
 
 
 # ========== 数据加载辅助 ==========
@@ -699,6 +719,156 @@ def _danmaku_panel_stats(bvid: str) -> dict:
     }
 
 
+# ========== B站屏蔽列表导出（概览页操作条：导入B站后不再看到这些发送者的弹幕） ==========
+
+_BLOCKLIST_CRITERIA = {"cringe", "spam", "cmt"}   # 合法导出标准（cringe=问题弹幕 / spam=刷屏 / cmt=问题评论）
+
+
+def _build_blocklist(bvid: str, crit: set, max_uids: int,
+                     include_lowconf: bool = False) -> dict:
+    """构建B站播放器「弹幕屏蔽列表」可导入的用户屏蔽条目（uid → type=2 条目）。
+
+    选人标准（crit 为 _BLOCKLIST_CRITERIA 的子集，可多选）：
+      - cringe：问题弹幕发送者（画像 cringe 聚合非空；dm 误报按内容扣除后为空则不算）
+      - spam：高/中风险刷屏发送者（spam 误报标记按低风险口径排除）
+      - cmt：问题评论作者（comments.problem 非空，cmt 误报按 rpid 扣除）
+    排序按烦人程度：问题严重度 > 刷屏分 > 弹幕数；截断至 max_uids（B站屏蔽列表容量约 200）。
+
+    低置信度（confidence="低"，CRC32 反查可能误识别）默认排除——屏蔽错人比漏屏蔽更糟；
+    问题评论命中的 uid 是评论区明文 UID，天然可信，不受该排除影响。
+    未解析发送者（uid 为空）无 UID 可写，计入 skipped_unresolved 供 UI 提示。
+
+    条目格式对齐播放器导出口径（面板右键导入 json）：type=2 用户屏蔽、filter=uid 字符串、
+    opened=true、id 为序号（导入/同步后由服务端重新分配）、comment 为来源摘要。
+
+    Returns: {"entries": [条目], "matched": 命中总数, "skipped_unresolved": int,
+              "skipped_lowconf": int}
+    """
+    fp = load_false_positives(bvid)
+    fp_dm = {t for k, t in fp if k == "dm"}
+    fp_spam = {t for k, t in fp if k == "spam"}
+    fp_cmt = {t for k, t in fp if k == "cmt"}
+
+    info: dict[int, dict] = {}        # uid -> {sev, score, count, notes, lowconf, plain}
+    skipped_unresolved = 0
+
+    def _upsert(uid: int, sev: int = 0, score: float = 0.0, count: int = 0,
+                note: str = "", lowconf: bool = False, plain: bool = False):
+        ent = info.setdefault(uid, {"sev": 0, "score": 0.0, "count": 0,
+                                    "notes": [], "lowconf": False, "plain": False})
+        ent["sev"] = max(ent["sev"], sev)
+        ent["score"] = max(ent["score"], score or 0.0)
+        ent["count"] = max(ent["count"], count)
+        if note and note not in ent["notes"]:
+            ent["notes"].append(note)
+        # lowconf 只增不清（多行合并时保守）；plain（明文评论来源）可抵消 lowconf
+        ent["lowconf"] = ent["lowconf"] or lowconf
+        ent["plain"] = ent["plain"] or plain
+
+    with closing(get_db()) as conn:
+        # 1) senders 行：spam 维度 + 画像 cringe/评论直引严重度 + 置信度。
+        #    画像取 video_profiles（同 uid 在不同视频的画像不可共用），旧库无该表/无
+        #    该行时回退 users.profile_json（旧版全局画像）
+        rows = conn.execute('''
+            SELECT s.mid_hash, s.uid, s.confidence, s.spam_level, s.spam_score,
+                   s.danmaku_count,
+                   COALESCE(vp.profile_json, u.profile_json) AS profile_json
+            FROM senders s
+            LEFT JOIN video_profiles vp ON vp.bvid = s.bvid AND vp.uid = s.uid
+            LEFT JOIN users u ON u.uid = s.uid
+            WHERE s.bvid = ?
+        ''', (bvid,)).fetchall()
+
+        # 2) 问题评论作者（评论区明文 UID，无画像也计入；cmt 误报按 rpid 扣除）
+        cmt_counts: dict[int, int] = {}
+        if "cmt" in crit:
+            sql = ("SELECT uid, COUNT(*) AS n FROM comments "
+                   "WHERE bvid = ? AND problem != ''")
+            params: list = [bvid]
+            if fp_cmt:
+                marks = sorted(fp_cmt)
+                sql += " AND CAST(rpid AS TEXT) NOT IN (%s)" % ",".join("?" * len(marks))
+                params += marks
+            sql += " GROUP BY uid"
+            cmt_counts = {r["uid"]: r["n"] for r in conn.execute(sql, params).fetchall()}
+
+    for r in rows:
+        uid = r["uid"]
+        dm_count = r["danmaku_count"] or 0
+        lowconf = (r["confidence"] == "低")
+        # cringe：画像聚合（dm 误报按内容扣除，与 _sender_meta 同口径）
+        cringe_hit, cringe_sev, cringe_cats = False, 0, []
+        if "cringe" in crit and r["profile_json"]:
+            try:
+                cr = json.loads(r["profile_json"]).get("cringe") or {}
+                items = cr.get("items") or cr.get("examples") or []
+                kept = [it for it in items if it.get("content") not in fp_dm]
+                if kept:
+                    cringe_hit = True
+                    cringe_sev = max((it.get("severity", 1) for it in kept), default=1)
+                    cringe_cats = list(dict.fromkeys(
+                        it.get("category") for it in kept if it.get("category")))
+            except Exception:
+                cringe_hit = False
+        # spam：高/中风险（spam 误报标记降级为低，与展示层同口径）
+        spam_hit = ("spam" in crit and r["spam_level"] in ("高", "中")
+                    and r["mid_hash"] not in fp_spam)
+
+        if uid is None:
+            # 未解析：仅 spam 维度可判（cringe 依赖画像、画像依赖 uid），计入提示数
+            if spam_hit:
+                skipped_unresolved += 1
+            continue
+        if cringe_hit:
+            _upsert(uid, sev=cringe_sev, count=dm_count,
+                    note="问题弹幕:" + "/".join(cringe_cats[:2]),
+                    lowconf=lowconf)
+        if spam_hit:
+            _upsert(uid, score=r["spam_score"] or 0.0, count=dm_count,
+                    note=f"刷屏{r['spam_level']}风险{r['spam_score'] or 0:.1f}分",
+                    lowconf=lowconf)
+        # 评论直引作者：画像里带真实严重度（无画像的作者走下方 cmt_counts 兜底，严重度按 1）
+        if "cmt" in crit and r["profile_json"]:
+            try:
+                cp = json.loads(r["profile_json"]).get("comment_problem") or {}
+                if cp.get("hits"):
+                    _upsert(uid, sev=cp.get("max_severity") or 1, count=dm_count,
+                            note=f"问题评论{cp['hits']}条", plain=True)
+            except Exception:
+                pass
+        if not cringe_hit and not spam_hit and uid not in cmt_counts:
+            # 与屏蔽无关的发送者也登记 count：同 uid 命中评论维度时弹幕数参与排序
+            info.setdefault(uid, {"sev": 0, "score": 0.0, "count": dm_count,
+                                  "notes": [], "lowconf": lowconf, "plain": False})
+
+    for uid, n in cmt_counts.items():
+        _upsert(uid, sev=1, note=f"问题评论{n}条", plain=True)
+
+    # 筛选命中者：至少有一条 note（= 至少命中一项导出标准）
+    matched_uids = [uid for uid, ent in info.items() if ent["notes"]]
+    # 低置信度排除：仅无明文来源佐证的 uid（CRC32 反查可能误识别，屏蔽错人不可逆）
+    if include_lowconf:
+        excluded_lowconf: set[int] = set()
+    else:
+        excluded_lowconf = {uid for uid in matched_uids
+                            if info[uid]["lowconf"] and not info[uid]["plain"]}
+    selected = [uid for uid in matched_uids if uid not in excluded_lowconf]
+    # 烦人程度排序：严重度 > 刷屏分 > 弹幕数（同分按 uid 稳定序）
+    selected.sort(key=lambda u: (-info[u]["sev"], -info[u]["score"],
+                                 -info[u]["count"], u))
+    selected = selected[:max_uids]
+
+    entries = []
+    for i, uid in enumerate(selected, 1):
+        entries.append({
+            "type": 2, "filter": str(uid), "opened": True, "id": i,
+            "comment": "；".join(info[uid]["notes"])[:60],
+        })
+    return {"entries": entries, "matched": len(matched_uids),
+            "skipped_unresolved": skipped_unresolved,
+            "skipped_lowconf": len(excluded_lowconf)}
+
+
 def _video_page_meta(video_info: dict | None) -> dict[int, dict]:
     """分P元信息：{分P序号: {"part": 分P标题, "duration": 该P时长秒数}}。
 
@@ -800,9 +970,18 @@ def _danmaku_density(bvid: str, duration, video_info: dict | None = None) -> dic
     for pno in grouped:
         d = (meta.get(pno) or {}).get("duration") or 0
         if d > 0:
-            axes[pno] = d
-        elif len(grouped) == 1 and total > 0:
-            axes[pno] = total
+            axes[pno] = int(d)
+    if len(grouped) == 1 and not axes and total > 0:
+        axes[next(iter(grouped))] = total
+    elif 0 < len(axes) < len(grouped):
+        # 部分分P有时长、部分缺失：缺失P 以该P弹幕最大时刻近似轴长兜底（尾部空桶
+        # 恒 0 不影响阅读）——不兜底的话这些P 的弹幕会整块从时间轴消失（"全缺"
+        # 才走下方单轴降级，部分缺时静默丢数据）。全缺时维持单轴降级口径不变
+        for pno in grouped:
+            if pno not in axes:
+                approx = max(grouped[pno]) + 1 if grouped[pno] else 0
+                if approx > 0:
+                    axes[pno] = int(approx)
     fallback = False
     if not axes and len(grouped) > 1 and total > 0:
         # 多分P但分P时长全未知（旧报告缺 video_info_json.pages）：降级为旧的单轴口径——
@@ -1734,9 +1913,11 @@ def _hot_comments_html(bvid: str, aid: int | None, fp_cmt: set[str] = frozenset(
             subs_html = '<div class="hot-subs"><div class="hot-sub-label ov-none">暂无子回复被采集</div></div>'
         origin = (f'<a class="hot-origin" href="https://www.bilibili.com/video/av{aid}#reply{it["rpid"]}" '
                   f'target="_blank" rel="noopener">去B站围观 ↗</a>') if aid else ""
-        # 评论组讨论主题词云（主楼+全部回复的词频，悬停静止弹窗用；分词只产出纯中文词，JSON 注入单引号属性安全）
+        # 评论组讨论主题词云（主楼+全部回复的词频，悬停静止弹窗用）。
+        # 双引号属性 + esc：不依赖"分词只产出纯中文词"的隐式契约（未来分词支持
+        # 含引号的英文词时单引号属性即破，此处按常规属性转义口径写）
         wc = _group_wordcloud([it["content"]] + [s["content"] for s in it["subs"]])
-        wc_attr = f" data-wc='{json.dumps(wc, ensure_ascii=False)}'" if wc else ""
+        wc_attr = f' data-wc="{esc(json.dumps(wc, ensure_ascii=False))}"' if wc else ""
         items_html.append(f'''
             <div class="hot-item"{wc_attr}>
                 <div class="hot-head">
@@ -2158,9 +2339,11 @@ def video_page(bvid: str):
         mode_card = ""
         if dm_attrs:
             if dm_attrs["colors"]:
+                # 颜色值过 _norm_color 白名单（#rrggbb）：esc 只防 HTML 逃逸、不防
+                # CSS 声明注入（background:url(...)），与 api_danmaku 出口同口径
                 color_chips = ('<h4 class="dm-sub-h">弹幕颜色 Top12</h4><div class="dm-color-chips">'
                                + "".join(
-                                   f'<span class="dm-color-chip"><i style="background:{esc(c)}"></i>{esc(c)} ×{n:,}</span>'
+                                   f'<span class="dm-color-chip"><i style="background:{_norm_color(c)}"></i>{esc(c)} ×{n:,}</span>'
                                    for c, n in dm_attrs["colors"]) + '</div>')
             if dm_attrs["mode"]:
                 mode_card = '<div class="chart-card"><h3>弹幕模式分布</h3><canvas id="dmModeChart"></canvas></div>'
@@ -2278,6 +2461,24 @@ def video_page(bvid: str):
             <button class="filter-btn btn-danger" onclick="reportDelete()">🗑 删除报告</button>
             <button class="filter-btn" onclick="toggleMask()"
                     title="开启后全站昵称只显示最后一个字、UID 只显示前三位（Cookie 持久化，所有页面共享）">{'已隐藏信息' if mask else '未隐藏信息'}</button>
+            <details class="blk-export">
+                <summary class="filter-btn"
+                         title="把问题发送者导出为B站播放器「弹幕屏蔽列表」可导入的用户屏蔽 JSON——导入后就看不到这些人的弹幕了">🚫 屏蔽列表导出</summary>
+                <div class="blk-panel">
+                    <label><input type="checkbox" id="blkCringe" checked> 问题弹幕发送者</label>
+                    <label><input type="checkbox" id="blkSpam" checked> 高/中风险刷屏</label>
+                    <label><input type="checkbox" id="blkCmt"> 问题评论作者</label>
+                    <label class="blk-sub"><input type="checkbox" id="blkLowconf"
+                            title="CRC32 反查的 UID 可能张冠李戴，勾选即接受误屏蔽风险"> 含低置信度UID（可能误屏蔽，慎选）</label>
+                    <label class="blk-sub">上限 <input type="number" id="blkMax" class="blk-num"
+                            min="1" max="2000" value="{BLOCKLIST_MAX_UIDS}"> 条</label>
+                    <button class="filter-btn" onclick="blkExport({esc(js_json(bvid))})">⬇ 导出 JSON</button>
+                    <p class="blk-note">导入方法：网页播放器 → 弹幕设置 → 弹幕屏蔽列表 → 面板空白处右键 → 导入 json，
+                    导入后逐条确认开启/同步。B站屏蔽列表容量约 {BLOCKLIST_MAX_UIDS} 条，超出按严重度截断。
+                    仅已解析 UID 可导出（低置信度默认排除，防误屏蔽无辜用户）；
+                    导出含真实 UID，不受「隐藏信息」开关影响（屏蔽必须用真实 UID）。</p>
+                </div>
+            </details>
             <span class="ov-dl">{links}</span>
             <span id="reportJobStatus"></span>
         </div>
@@ -2347,6 +2548,7 @@ def video_page(bvid: str):
 
 
 @app.route("/user/<int:uid>")
+@_db_guard
 def user_page(uid: int):
     """用户互动时间线页：该用户在全部已分析视频中的弹幕/评论足迹，按最近互动倒序
     （与卡片「其他视频足迹」互补：全量视频 + 时间维度 + 覆盖评论-only 用户）。
@@ -2461,7 +2663,7 @@ def api_analyze(bvid: str):
     if not _registered_job_target_exists(job_id, bvid):
         _finish_registered_job(job_id)
         return jsonify({"error": "未知视频"}), 404
-    threading.Thread(target=_run_analysis_job_bound,
+    threading.Thread(target=_run_analysis_job_entry,
                      args=(job_id, bvid, mid_hashes), daemon=True).start()
     return jsonify({"job_id": job_id})
 
@@ -2703,6 +2905,46 @@ def _norm_color(value) -> str:
     return value if isinstance(value, str) and _COLOR_RE.fullmatch(value) else ""
 
 
+@app.route("/api/video/<bvid>/blocklist")
+def api_blocklist(bvid: str):
+    """B站弹幕屏蔽列表导出（用户屏蔽条目 JSON 数组，播放器屏蔽列表面板右键导入）。
+
+    GET 参数：crit=cringe,spam,cmt（导出标准，默认 cringe,spam）；max=条数上限
+    （默认 BLOCKLIST_MAX_UIDS，夹紧到 [1,2000]）；lowconf=1 纳入低置信度 UID。
+    纯读库无副作用；无命中条目时 404 JSON（前端 alert 提示而非下载空文件）。"""
+    try:
+        video_row = _load_video_row(bvid)
+    except sqlite3.Error as e:
+        print(f"[Web] 屏蔽列表导出失败（videos 表）: {e}")
+        return jsonify({"error": "数据库查询失败，请稍后重试"}), 500
+    if video_row is None:
+        return jsonify({"error": "未知视频"}), 404
+    crit = {c.strip() for c in request.args.get("crit", "cringe,spam").split(",")}
+    crit &= _BLOCKLIST_CRITERIA
+    if not crit:
+        return jsonify({"error": "未选择任何导出标准（crit 可选 cringe/spam/cmt）"}), 400
+    try:
+        max_uids = int(request.args.get("max", BLOCKLIST_MAX_UIDS))
+    except ValueError:
+        max_uids = BLOCKLIST_MAX_UIDS
+    max_uids = max(1, min(max_uids, 2000))
+    include_lowconf = request.args.get("lowconf") == "1"
+    try:
+        result = _build_blocklist(bvid, crit, max_uids, include_lowconf=include_lowconf)
+    except sqlite3.Error as e:
+        print(f"[Web] 屏蔽列表构建失败: {e}")
+        return jsonify({"error": "数据库查询失败，请稍后重试"}), 500
+    if not result["entries"]:
+        hint = ("；有未解析发送者命中标准但无 UID 可导出" if result["skipped_unresolved"]
+                else "")
+        return jsonify({"error": f"没有符合条件的已解析发送者{hint}"}), 404
+    payload = json.dumps(result["entries"], ensure_ascii=False, indent=2)
+    safe_name = re.sub(r"[^A-Za-z0-9_-]", "", bvid) or "video"   # 文件名白名单化
+    resp = Response(payload, mimetype="application/json")
+    resp.headers["Content-Disposition"] = f'attachment; filename="blocklist_{safe_name}.json"'
+    return resp
+
+
 @app.route("/api/video/<bvid>/danmaku")
 def api_danmaku(bvid: str):
     """弹幕 JSON API（spec 4）。
@@ -2807,7 +3049,7 @@ def api_danmaku(bvid: str):
         "send_time": "first_send_time",
         "dup_count": "dup_count",
         "sender_count": "sender_count",
-    }.get(args.get("sort", "video_time"), "first_video_time")
+    }.get(args.get("sort", "video_time"), "first_pt")   # 兜底值必须是有效列（白名单防注入 + 防非法 sort 500）
 
     where_sql = " AND ".join(where)
     # sender_count：发送者在本视频的总弹幕数，子查询按 mid_hash 预聚合
@@ -2937,12 +3179,19 @@ def _pid_is_webpy(pid: int) -> bool:
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command",
                  f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"],
                 capture_output=True, text=True, timeout=15)
-            return "web.py" in (out.stdout or "")
+            # 命令行按空白切分后须有以 web.py 结尾的参数（引号剥离）：子串匹配会
+            # 把 `vim web.py`/`less web.py` 等无关进程一并误杀；含空格路径切分
+            # 破碎时判 False（保守方向：不杀，只是要求手动处理）
+            return any(tok.strip('"').endswith("web.py")
+                       for tok in (out.stdout or "").split())
         except (OSError, subprocess.SubprocessError):
             return False
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return "web.py" in f.read().decode(errors="ignore")
+            argv = f.read().decode(errors="ignore").split("\0")
+        # argv[0] 是解释器（python），脚本参数须以 web.py 结尾（./web.py、
+        # 绝对路径均覆盖）；整串子串匹配会把 `vim web.py` 之类误杀
+        return any(a.endswith("web.py") for a in argv)
     except OSError:
         return False
 
@@ -2963,7 +3212,12 @@ def _stop_server(port: int):
         print(f"[Web] 记录中的进程 {pid} 已不存在或不是本项目的 web.py，清理残留 pidfile")
         _clear_pid(port)
         return
-    os.kill(pid, signal.SIGTERM)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        # 无权限/进程刚退出：不清 pidfile（保留记录便于提权后重试）
+        print(f"[Web] 向进程 {pid} 发送停止信号失败（{e}），pidfile 保留，可稍后重试")
+        return
     for _ in range(10):
         if not _pid_is_webpy(pid):
             break
@@ -3025,7 +3279,7 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGTERM, _on_term)
     print(f"[Web] 交互式报告服务已启动: http://127.0.0.1:{port}")
-    print(f"[Web] 停止服务: python web.py --stop"
+    print("[Web] 停止服务: python web.py --stop"
           + (f" --port {port}" if port != 8001 else ""))
     # threaded=True：弹幕大查询/词云采集不阻塞其它请求（job 轮询、页面加载）
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)

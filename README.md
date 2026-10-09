@@ -399,7 +399,7 @@ python run.py <BV号>                     # 完整流水线
 
 | 脚本 | 项数 | 覆盖 |
 |---|---|---|
-| `tests/offline/regress_core.py` | 20 | 历史弹幕断点续采（中断后必须补齐、失败日挂账、不误写 done）、**月份索引失败不得误标完成**、线程池收尾、`post()` 重试请求体、**刷屏相似度抽样须还原全量口径**、**组合池风控账本按 job 隔离**、限速预算熔断、画像渲染容错等 |
+| `tests/offline/regress_core.py` | 19 | 历史弹幕断点续采（中断后必须补齐、失败日挂账、不误写 done）、**月份索引失败不得误标完成**、线程池收尾、`post()` 重试请求体、**刷屏相似度抽样须还原全量口径**、**组合池风控账本按 job 隔离**、限速预算熔断、画像渲染容错等 |
 | `tests/offline/regress_comment_path.py` | 10 | wbi/legacy 翻页与降级、请求异常保留已采、真重复页检测、缺 rpid 脏行、刷新计数 |
 | `tests/offline/regress_judge_danmaku.py` | 4 | 问题弹幕判定必须被采纳并归到正确发送者（防"解析了却没采纳"） |
 | `tests/offline/regress_judge_comment.py` | 3 | 问题评论判定必须回映到正确 rpid |
@@ -410,6 +410,8 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_density_multip.py` | 9 | 多分P 密度轴按各分P 内部时间分别建桶、默认选弹幕最多的P、单分P 口径不变、缺元信息降级 |
 | `tests/offline/regress_multipart_pages.py` | 14 | 历史弹幕按分P 采集与检查点隔离（分P 1 键名不变）、画像样本「P{n} mm:ss」与排序、旧画像渲染期回填、弹幕浏览器首次出现按 (分P, 时间) |
 | `tests/offline/regress_port_config.py` | 5 | 端口解析优先级（`--port` > `PROFILER_PORT` > 8001）、非法/越界回退、两个入口的 `--help` 都暴露 `--port`（Windows 换端口可用性） |
+| `tests/offline/regress_review_fixes.py` | 10 | 全库审查修复定点验证：批量模式不被 SystemExit 击穿、LLM 批次缓存保序指纹、CancelledError 不穿透降级链、历史弹幕达上限后滚动补采不冻结、`shard_pools` 继承代理恢复链等 |
+| `tests/offline/regress_blocklist.py` | 11 | B站屏蔽列表导出：三标准选人、误报扣除、低置信度默认排除、严重度排序截断、条目口径（type=2）、路由下载与 404/400 口径 |
 
 `tests/run_all.py` 会自动挑选带依赖的解释器（当前解释器 → 仓库 `.venv`），从任意目录运行均可，失败时退出码非 0，可直接接 CI。
 

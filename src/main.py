@@ -24,7 +24,7 @@ from storage import clear_video_cache, update_sender_spam, save_global_uid, load
 from storage import save_comments, update_comment_problems
 from storage import load_danmaku, load_comments, append_danmaku
 from storage import get_phase_state, set_phase_state
-from auth import get_auth_client
+from auth import get_auth_client, LoginRequiredError
 from combo_pool import build_pool
 from api_client import RiskControlError
 from danmaku import collect_danmaku_data, group_by_sender, fetch_command_dms, build_command_uid_map
@@ -643,16 +643,19 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
 
         该用户的采集过程日志进行级缓冲（log=buf.append），完成时持锁一次性
         整块输出——多号并行分片下不再出现 A/B 两个用户的日志逐行交错。"""
-        print(f"  [{idx}/{total}] 采集 UID:{uid}...")
+        with print_lock:
+            print(f"  [{idx}/{total}] 采集 UID:{uid}...")
         # 检查是否已缓存（--force 时跳过缓存强制重采，结果覆盖写 users 表）
         if not force:
             try:
                 cached = load_user_data(uid) if has_user_data(uid) else None
             except Exception as e:
                 cached = None
-                print(f"  [警告] UID:{uid} 缓存读取失败（{e}），按未缓存处理")
+                with print_lock:
+                    print(f"  [警告] UID:{uid} 缓存读取失败（{e}），按未缓存处理")
             if cached:
-                print(f"  [缓存] UID:{uid} 使用已采集数据")
+                with print_lock:
+                    print(f"  [缓存] UID:{uid} 使用已采集数据")
                 return uid, cached[0]
         buf: list[str] = []
         try:
@@ -1087,6 +1090,18 @@ def run_batch(batch_file: str, force: bool = False, max_users: int | None = None
         except KeyboardInterrupt:
             # Ctrl+C 不再继续后续视频，但仍打印已完成的汇总
             print(f"\n[Batch] 用户中断，跳过后续 {total - idx} 个视频")
+            failed.append(bvid)
+            break
+        except SystemExit as e:
+            # 阶段函数对视频不存在/已删除/风控会 raise SystemExit——它继承
+            # BaseException，不在此接住会击穿整个批量循环（后续视频全跳过、无汇总）
+            print(f"\n[Batch] 警告: {bvid} 分析终止（退出码 {e.code}），继续下一个")
+            failed.append(bvid)
+        except LoginRequiredError as e:
+            # 登录需要人工扫码：无人值守的批量继续跑只会逐个空等 3 分钟扫码超时，
+            # 中止整批并给出指引（已完成的视频仍打印汇总）
+            print(f"\n[Batch] 登录已失效且自动刷新失败（{e}），中止批量分析")
+            print("[Batch] 请先运行 python login.py 重新扫码登录，再重跑批量")
             failed.append(bvid)
             break
         except Exception as e:

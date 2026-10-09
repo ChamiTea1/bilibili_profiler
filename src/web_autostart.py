@@ -75,6 +75,10 @@ def maybe_launch_web(bvid: str):
                 # Popen 抛异常时子进程未持有句柄，父进程必须自行关闭，防文件描述符泄漏
                 log_f.close()
                 raise
+            finally:
+                # Popen 成功后句柄已由子进程继承，父进程自身的引用同样要关闭——
+                # 常驻父进程（run.py 批量模式）不关会逐次泄漏一个 fd
+                log_f.close()
             # 等服务就绪（最多约 5 秒）
             for _ in range(10):
                 if _alive():

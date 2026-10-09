@@ -14,8 +14,8 @@ from api_client import BiliAPIClient
 from config import COMMENT_MAIN_WBI_URL, COMMENT_MAIN_URL, COMMENT_REPLY_URL
 from config import MAX_COMMENT_PAGES, COMMENT_REPLY_MAX_PAGES, CHARGE_LIST_URL
 from config import COMMENT_REFRESH_MAX_PAGES, UID_HARVEST_MAX_PAGES
-from storage import (get_db, get_phase_state, load_comments, save_comments,
-                     set_phase_state, save_global_uid, load_global_uid_map)
+from storage import (get_db, get_phase_state, load_comments, load_comment_uids,
+                     save_comments, set_phase_state, save_global_uid, load_global_uid_map)
 from uid_resolver import calc_crc32
 
 
@@ -100,7 +100,8 @@ def _fetch_sub_replies(oid: int, root_rpid, rcount: int, preview: list[dict],
                 fetched.append(c)
 
         # data.page.count 为子评论总数，翻够页数或本页为空即终止
-        total = (page_data.get("page") or {}).get("count", 0)
+        # （count 可能为 null——风控/异常响应下 `pn * 20 >= None` 会 TypeError 逃逸）
+        total = (page_data.get("page") or {}).get("count") or 0
         if not replies or pn * 20 >= total:
             break
     else:
@@ -432,7 +433,8 @@ def harvest_comment_uids(oid: int, client: BiliAPIClient, bvid: str,
     返回本轮新收割的 {crc32_hex: uid}。"""
     done = get_phase_state(bvid, "uid_harvest", "done") == "1"
     # 已知集合：本视频已入库评论 uid + 全局映射库 uid（碰撞守卫：crc 已被占且 uid 不同则跳过）
-    local_uids: set[int] = {c["uid"] for c in load_comments(bvid)}
+    # 只取 uid 列（load_comment_uids）：大评论区全列拉取（含正文数 MB）纯属浪费
+    local_uids: set[int] = load_comment_uids(bvid)
     known_uids: set[int] = set(local_uids)
     global_map = load_global_uid_map()
     known_uids.update(v["uid"] for v in global_map.values())

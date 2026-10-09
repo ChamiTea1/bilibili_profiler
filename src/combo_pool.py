@@ -131,20 +131,26 @@ class ComboPool:
             return self._accounts[self._idx]
 
     def rotate(self, reason: str = ""):
-        """换下一账号 + 切下一节点（切节点失败仅换号并记日志）。
+        """换下一账号（纯内存操作，锁内调用）；节点切换由 run() 在锁外经 _switch_node 补做。
 
         仅在 run() 持锁路径调用，自身不再取锁。
+        Clash 控制器调用是网络 I/O（每次最长约 5s 超时），若在池锁内做节点切换，
+        共享该池的分片线程会在取锁处停摆 10-15s，抵消多号并行吞吐——账号轮换留
+        锁内、切节点移锁外。
         """
         self._idx = (self._idx + 1) % len(self._accounts)
-        name = self._accounts[self._idx][0]
-        if self._clash:
-            nxt = self._clash.pick_next_node()
-            if nxt and self._clash.switch_node(nxt):
-                print(f"[Pool] {reason} → 换号[{name}] + 切节点[{nxt}]")
-                return
-            print(f"[Pool] {reason} → 换号[{name}]（切节点失败，保持当前 IP）")
-        else:
-            print(f"[Pool] {reason} → 换号[{name}]")
+        print(f"[Pool] {reason} → 换号[{self._accounts[self._idx][0]}]")
+
+    def _switch_node(self, reason: str = ""):
+        """切下一 Clash 节点（网络 I/O，必须在池锁外调用；失败仅记日志保持当前 IP）"""
+        clash = self._clash
+        if not clash:
+            return
+        nxt = clash.pick_next_node()
+        if nxt and clash.switch_node(nxt):
+            print(f"[Pool] {reason} → 切节点[{nxt}]")
+            return
+        print(f"[Pool] {reason} → 切节点失败，保持当前 IP")
 
     def _cooldown_seconds(self) -> float:
         """风控长冷却基准时长：单账号子池换号无意义（冷却只是等风控消退），
@@ -230,8 +236,25 @@ class ComboPool:
                 with self._lock:
                     if self._proxy_url is None:
                         raise   # 已转直连仍报代理错误属异常，直接上抛
-                    self._on_proxy_fault(e)
-                # 代理故障不消耗风控圈：原地重试（已切节点或已转直连）
+                    self._proxy_fail_streak += 1
+                    streak = self._proxy_fail_streak
+                    if streak >= _PROXY_FAIL_STRIP_THRESHOLD:
+                        print(f"[Pool] 代理连续 {streak} 次连接失败，判定 IP 池不可用，摘代理转直连: {e}")
+                        self._strip_proxy()
+                        # 代理故障不消耗风控圈：原地重试（已转直连）
+                        continue
+                # 未达摘代理阈值：死节点记账 + 切下一节点。
+                # Clash 调用是网络 I/O（每次最长约 5s），放锁外防分片线程取锁停摆
+                clash = self._clash
+                if clash:
+                    cur = clash.current_node()
+                    if cur:
+                        clash.mark_dead(cur)   # 故障即记死名单（即时反应，不等 600s 一轮的健康检查）
+                    nxt = clash.pick_next_node()
+                    if nxt and clash.switch_node(nxt):
+                        print(f"[Pool] 代理连接失败，已切换节点 → {nxt}（第 {streak} 次）")
+                        continue
+                print(f"[Pool] 代理连接失败（第 {streak} 次，无法切节点）: {e}")
                 continue
             except RiskControlError as e:
                 with self._lock:
@@ -250,33 +273,14 @@ class ComboPool:
                         self._cooldown_until = time.time() + wait
                         led.marks = [False] * len(self._accounts)
                     self.rotate(f"风控({desc})")
+                # 切节点是 Clash 网络调用：放锁外（同上，防分片线程取锁停摆 10-15s）
+                self._switch_node(f"风控({desc})")
                 continue
             # 业务成功：清零风控圈与代理故障计数（一次霉运不污染后续单元）
             with self._lock:
                 self._ledger(owner).reset(len(self._accounts))
                 self._proxy_fail_streak = 0
             return result
-
-    def _on_proxy_fault(self, e: Exception):
-        """代理连接失败：先切节点重试；连续失败达阈值判定 IP 池不可用，摘代理转直连。
-
-        仅在 run() 持锁路径调用，自身不再取锁。
-        """
-        self._proxy_fail_streak += 1
-        if self._proxy_fail_streak >= _PROXY_FAIL_STRIP_THRESHOLD:
-            print(f"[Pool] 代理连续 {self._proxy_fail_streak} 次连接失败，判定 IP 池不可用，摘代理转直连: {e}")
-            self._strip_proxy()
-            return
-        if self._clash:
-            # 故障即把当前节点记入死名单（即时反应，不等 600s 一轮的健康检查），再切下一个
-            cur = self._clash.current_node()
-            if cur:
-                self._clash.mark_dead(cur)
-            nxt = self._clash.pick_next_node()
-            if nxt and self._clash.switch_node(nxt):
-                print(f"[Pool] 代理连接失败，已切换节点 → {nxt}（第 {self._proxy_fail_streak} 次）")
-                return
-        print(f"[Pool] 代理连接失败（第 {self._proxy_fail_streak} 次，无法切节点）: {e}")
 
     def _strip_proxy(self):
         """摘掉池内全部账号的代理，转直连（IP 池故障降级）。
@@ -311,8 +315,12 @@ class ComboPool:
             p._ledgers = {None: _Ledger(1)}     # 子池单账号，账本独立（不并入主池使用方账本）
             p._proxy_fail_streak = 0
             p._cooldown_until = 0.0
-            p._proxy_backup = None
-            p._proxy_strip_ts = 0.0
+            # 继承主池的摘代理降级状态：主池若在阶段1-4 已摘代理（_proxy_backup 待恢复），
+            # 不继承的话子池 _proxy_backup=None，_maybe_restore_proxy 永久短路——
+            # 600s 重探恢复链断裂，本进程内永久直连。子池各自独立恢复自检（串行于
+            # _restore_lock），多子池重复自检有界（每次间隔 PROXY_RETRY_AFTER）
+            p._proxy_backup = self._proxy_backup
+            p._proxy_strip_ts = self._proxy_strip_ts
             p._lock = threading.Lock()
             p._restore_lock = threading.Lock()
             pools.append(p)

@@ -12,6 +12,7 @@
 实际判定范围已扩展为"问题弹幕"。
 """
 import hashlib
+import concurrent.futures
 import json
 import random
 import threading
@@ -191,9 +192,13 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
 
     # 注意：key 固定嵌主用厂商的 LLM_MODEL——备用厂商兜底产出的判定也会存进该命名空间
     # （跨厂商略有混样，换取中断重跑时的缓存命中率；判定口径以内容为准，与厂商基本无关，可接受）
+    # 指纹必须保序（不 sorted）：缓存负载是顺序敏感的全局下标（bi*batch_size+批内位置），
+    # 若指纹做成顺序无关的内容集合，条目在批次窗口内重排（弹幕次数/评论点赞漂移会改变
+    # 批内排序）而集合不变时，旧缓存的判定会按下标静默错标到另一条内容上（张冠李戴），
+    # 且 failed==0 时错标结果还会以"新结果"身份固化进整段缓存。
     def batch_cache_key(bi: int) -> str:
-        digest = hashlib.sha256("\n".join(sorted(
-            it["content"] for it in batches[bi])).encode("utf-8")).hexdigest()[:16]
+        digest = hashlib.sha256("\n".join(
+            it["content"] for it in batches[bi]).encode("utf-8")).hexdigest()[:16]
         return f"{cache_prefix}@batch:{LLM_MODEL}:{digest}"
 
     def work(bi: int) -> str:
@@ -271,6 +276,11 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                 bi = futures[fut]
                 try:
                     raw = fut.result()
+                except concurrent.futures.CancelledError:
+                    # 致命错误取消的排队批次：CancelledError 继承 BaseException，
+                    # 不在此吞掉会穿透所有 except Exception 降级链（含 main 的阶段
+                    # 降级包装），让整个分析以 CancelledError 栈硬崩溃、掩盖真实根因
+                    continue
                 except _FATAL_LLM_ERRORS as e:
                     print(f"[{label}] 错误: 批次 {bi + 1} 致命错误（{type(e).__name__}: {e}），中止判定")
                     fatal = fatal or e
@@ -295,6 +305,15 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                 if batch_verdicts is None:          # 防御：work 已校验，理论不可达
                     still_failed.append(bi)
                     continue
+                # 下标限定在本批区间：prompt 只展示本批编号，合法下标必落在
+                # [bi*size, bi*size+本批条数) 内；LLM 幻觉/复读出的跨批下标在此掐掉，
+                # 防止误标到其它批次的无辜内容（弹幕路径 seen_idx 先到先得，跨批伪
+                # 下标还会挤掉真批次的合法判定）
+                lo = bi * batch_size
+                hi = lo + len(batches[bi])
+                batch_verdicts = [v for v in batch_verdicts
+                                  if isinstance(v.get("i"), int) and not isinstance(v.get("i"), bool)
+                                  and lo <= v["i"] < hi]
                 if not batch_verdicts:
                     # 空数组是合法结果：模型常在 [] 后附一段"未发现问题"的自然语言说明，
                     # 这不算解析失败（真正的坏响应已在 work() 抛 _UnparseableResponse 重试）
@@ -483,11 +502,14 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
         like_of[content] = max(like_of.get(content, 0), c.get("like") or 0)
     items = [{"content": c} for c in content_rpids]
     # 评论量比弹幕更难压缩：按最高点赞降序截断，优先判定可见度高的评论
-    # （点赞相同按内容字典序决胜——保证跨运行排序稳定，批次级缓存才能命中）
     items.sort(key=lambda x: (-like_of.get(x["content"], 0), x["content"]))
     if len(items) > COMMENT_CRINGE_MAX_ITEMS:
         print(f"[问题评论] 去重后 {len(items)} 条超出上限，按点赞截取前 {COMMENT_CRINGE_MAX_ITEMS} 条")
         items = items[:COMMENT_CRINGE_MAX_ITEMS]
+    # 截断后改纯内容字典序分批：批次缓存指纹按批内顺序计算（下标映射依赖顺序），
+    # 而点赞数每次刷新都漂移——继续用点赞作批内排序键会让整批指纹随点赞变化频繁
+    # 失效；纯字典序让批次组成与点赞漂移解耦（只有截断边界变化才改变批次集合）
+    items.sort(key=lambda x: x["content"])
     if not items:
         return {}
 

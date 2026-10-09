@@ -25,7 +25,9 @@ def check(name, cond, extra=""):
     if cond: ok += 1; print("  ✔ %s %s" % (name, extra))
     else: fail += 1; print("  ✘ %s %s" % (name, extra))
 
-RESP = ['[{"i": 4, "category": "广告引流", "severity": 2, "reason": "群号引流"}]',
+# i 必须落在其所在批次的全局下标区间内（批次0=items[0:3]，即 0~2）——
+# 下标区间校验会掐掉跨批幻觉下标，故假响应用批内合法下标
+RESP = ['[{"i": 1, "category": "广告引流", "severity": 2, "reason": "群号引流"}]',
         '[]\n\n注：经逐条审核，未发现符合八类问题弹幕定义的内容。']
 CNT = {"n": 0}
 class _Comp:
@@ -51,7 +53,7 @@ groups = {d["mid_hash"]: {"mid_hash": d["mid_hash"], "count": 1, "contents": [d[
 info = {"bvid": "BVcrg000001", "title": "t", "desc": "", "owner": {"name": "up"}}
 
 res = cd.detect_cringe_danmaku(dms, groups, info)
-hit = res.get("h004")
+hit = res.get("h001")
 check("判定被采纳并归到正确发送者", bool(hit) and hit["count"] == 1,
       "(结果 %s)" % json.dumps(res, ensure_ascii=False)[:120])
 check("类别/严重度正确", bool(hit) and hit["categories"] == ["广告引流"] and hit["max_severity"] == 2,
@@ -60,7 +62,7 @@ check("空数组批次不误判、不产生条目", len(res) == 1, "(涉及发�
 
 calls_after_first = CNT["n"]
 res2 = cd.detect_cringe_danmaku(dms, groups, info)
-check("整段缓存命中（重跑零 LLM 调用）", CNT["n"] == calls_after_first and res2.get("h004", {}).get("count") == 1,
+check("整段缓存命中（重跑零 LLM 调用）", CNT["n"] == calls_after_first and res2.get("h001", {}).get("count") == 1,
       "(额外调用 %d 次)" % (CNT["n"] - calls_after_first))
 
 print("")

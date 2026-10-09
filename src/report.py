@@ -221,8 +221,9 @@ def generate_user_card(profile: dict) -> str:
     dm_pages = dm.get("video_pages") or []
     # 多分P：画像里记了 multi_page 即标；旧画像无该键时按样本分P 兜底推断
     multi_page = bool(dm.get("multi_page")) or (bool(dm_pages) and max(dm_pages) > 1)
-    # 分P 未知的样本记 0（web 端回填歧义时不标分P，宁可不标也不标错）
-    paired = [(c, dm_times[i] if i < len(dm_times) else 0,
+    # 分P 未知的样本记 0（web 端回填歧义时不标分P，宁可不标也不标错）；
+    # 样本 time 为 null 的同样按 0 占位（旧画像残留，防 t//60 与排序比较崩溃）
+    paired = [(c, (dm_times[i] or 0) if i < len(dm_times) else 0,
                int(dm_pages[i] or 0) if i < len(dm_pages) else 0)
               for i, c in enumerate(dm_contents)]
     # 多分P 时先按分P 再按分P 内时间排序（time 是分P 内相对秒数，跨分P 比大小无意义）
@@ -276,13 +277,13 @@ def generate_user_card(profile: dict) -> str:
     ip_location = profile.get("ip_location", "")
 
     # 视频（recent 带 bvid，渲染为新标签页超链接；过滤空 bvid 防死链）
-    vid = profile.get("video", {})
-    vid_count = vid.get("count", 0)
+    vid = profile.get("video") or {}
+    vid_count = vid.get("count") or 0
     vid_recent = [v for v in vid.get("recent", [])[:3] if v.get("bvid")]
 
     # 动态
-    dyn = profile.get("dynamic", {})
-    dyn_count = dyn.get("count", 0)
+    dyn = profile.get("dynamic") or {}
+    dyn_count = dyn.get("count") or 0
     dyn_total_likes = dyn.get("total_likes", 0)
 
     # 采集时间（users.collected_at 渲染期注入，ISO 串取日期部分）；缺失不渲染
@@ -309,7 +310,8 @@ def generate_user_card(profile: dict) -> str:
             if up_name in up_detail_map:
                 i, up = up_detail_map[up_name]
                 wf = up.get("word_freq", [])
-                tip = f"粉丝:{up.get('follower',0):,} | 投稿:{up.get('video_count',0)} | 分区:{up.get('top_category','?')}"
+                tip = (f"粉丝:{up.get('follower') or 0:,} | 投稿:{up.get('video_count') or 0}"
+                       f" | 分区:{up.get('top_category') or '?'}")
                 kw = ", ".join(w for w, _ in wf[:5]) if wf else ""
                 if kw:
                     tip += f" | 关键词: {kw}"
@@ -538,16 +540,24 @@ def sort_profiles_by_risk(profiles: list[dict]) -> list[dict]:
     """用户卡片排序：AI 深掘画像优先（有 ai_deep/ai_analysis 的排最前）；
     再按风险等级 高→中→低；同级按兴趣分（刷屏分/问题弹幕严重度/弹幕数）降序"""
     risk_rank = {"高": 0, "中": 1, "低": 2}
+
+    def _num(p: dict, section: str, key: str) -> float:
+        """排序键数值防御：旧画像 JSON 里 section 可能整体为 null、数值键也可能为
+        null（senders.spam_score 可空）——直接 .get().get() 会 -None 抛 TypeError
+        炸整页，统一按 0 参与排序（与 generate_user_card 的 None 防御同口径）"""
+        v = (p.get(section) or {}).get(key)
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
     return sorted(profiles, key=lambda p: (
         # AI 深掘画像置顶：深掘内容是报告价值最高的部分，应最先看到
         0 if (p.get("ai_deep") or p.get("ai_analysis")) else 1,
-        risk_rank.get(p.get("danmaku", {}).get("spam_level", "低"), 2),
-        -p.get("danmaku", {}).get("spam_score", 0.0),
-        -p.get("cringe", {}).get("max_severity", 0),
+        risk_rank.get((p.get("danmaku") or {}).get("spam_level", "低"), 2),
+        -_num(p, "danmaku", "spam_score"),
+        -_num(p, "cringe", "max_severity"),
         # 问题评论直引作者（P0-a）：无弹幕问题记录时按问题评论严重度/命中数参与排序
-        -p.get("comment_problem", {}).get("max_severity", 0),
-        -p.get("comment_problem", {}).get("hits", 0),
-        -p.get("danmaku", {}).get("count", 0),
+        -_num(p, "comment_problem", "max_severity"),
+        -_num(p, "comment_problem", "hits"),
+        -_num(p, "danmaku", "count"),
     ))
 
 

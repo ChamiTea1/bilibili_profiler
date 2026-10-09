@@ -3,7 +3,6 @@
 """
 from collections import defaultdict
 from lxml import etree
-from typing import Optional
 
 from api_client import BiliAPIClient
 from config import VIDEO_INFO_URL, DANMAKU_XML_URL, DANMAKU_VIEW_URL
@@ -188,7 +187,7 @@ def collect_danmaku_data(bvid: str, client: BiliAPIClient) -> tuple[dict, list[d
     title = video_info.get("title", "")
     print(f"[Danmaku] 视频: {title}")
 
-    print(f"[Danmaku] 获取弹幕...")
+    print("[Danmaku] 获取弹幕...")
     danmaku_list = fetch_all_danmaku(video_info, client)
     print(f"[Danmaku] 获取到 {len(danmaku_list)} 条弹幕")
 
@@ -252,21 +251,28 @@ def fetch_command_dms(video_info: dict, client: BiliAPIClient) -> list[dict]:
         corrupt = []   # 损坏条目计数（长度越界截断/单条解析失败），结束统一告警
         pos = 0
         while pos < len(raw):
-            tag, pos = _read_varint(raw, pos)
-            field_no, wire_type = tag >> 3, tag & 0x07
-            if field_no == 9 and wire_type == 2:  # commandDms
-                length, pos = _read_varint(raw, pos)
-                elem_bytes, pos, truncated = _take_bytes(raw, pos, length)
-                if truncated:
-                    corrupt.append(pos)
-                try:
-                    items.append(_parse_command_dm(elem_bytes, corrupt))
-                except Exception:
-                    # 单条损坏跳过不丢整份（对齐 parse_danmaku_proto 的 per-item 策略）
-                    corrupt.append(pos)
-                    continue
-            else:
-                pos = _skip_field(raw, pos, wire_type)
+            # 流中段损坏（varint 越界/未知 wire type 的 _skip_field）保留已解析部分
+            # 返回：互动弹幕的明文 mid 是 UID 破解的关键证据，不为单点损坏丢弃整份
+            # （对齐 parse_danmaku_proto 的部分解析策略；原先外层 try 会连已解析 items 一起丢）
+            try:
+                tag, pos = _read_varint(raw, pos)
+                field_no, wire_type = tag >> 3, tag & 0x07
+                if field_no == 9 and wire_type == 2:  # commandDms
+                    length, pos = _read_varint(raw, pos)
+                    elem_bytes, pos, truncated = _take_bytes(raw, pos, length)
+                    if truncated:
+                        corrupt.append(pos)
+                    try:
+                        items.append(_parse_command_dm(elem_bytes, corrupt))
+                    except Exception:
+                        # 单条损坏跳过不丢整份（对齐 parse_danmaku_proto 的 per-item 策略）
+                        corrupt.append(pos)
+                        continue
+                else:
+                    pos = _skip_field(raw, pos, wire_type)
+            except (ValueError, IndexError):
+                corrupt.append(pos)
+                break
         if corrupt:
             print(f"[Danmaku] 警告：互动弹幕响应含 {len(corrupt)} 处损坏，已截断/跳过")
         if items:

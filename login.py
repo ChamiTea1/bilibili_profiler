@@ -25,6 +25,14 @@ from api_client import BiliAPIClient
 MAX_WAIT_SECONDS = 300   # 二维码轮询总时长上限（5 分钟，覆盖扫码+确认）
 
 
+def _remove_qr(qr_path: str):
+    """删除临时二维码图片（所有退出路径都清理，避免残留过期二维码造成混淆）"""
+    try:
+        os.remove(qr_path)
+    except OSError:
+        pass
+
+
 def main():
     # 位置参数即账号名：python login.py alt1 → data/cookies/alt1.json
     name = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -35,7 +43,7 @@ def main():
         sys.exit(1)
 
     print("=" * 50)
-    print(f"  B站扫码登录工具" + (f"（小号: {name}）" if name else "（主号）"))
+    print("  B站扫码登录工具" + (f"（小号: {name}）" if name else "（主号）"))
     print("=" * 50)
 
     # 检查已有 cookie
@@ -84,13 +92,11 @@ def main():
             print(f"\n  Cookie已保存到: {cookie_path}")
             print("  现在可以运行: python run.py BVxxxxxxxx")
             # 登录成功后顺手删除临时二维码图片（避免残留过期二维码造成混淆）
-            try:
-                os.remove(qr_path)
-            except OSError:
-                pass
+            _remove_qr(qr_path)
             return
         if code == 86038:
             print("\n[✗] 二维码已过期，请重新运行本程序")
+            _remove_qr(qr_path)
             return
         if code != last_code:
             if code == 86090:
@@ -103,6 +109,7 @@ def main():
         time.sleep(3)
 
     print(f"\n[✗] 等待超时（{MAX_WAIT_SECONDS // 60}分钟），请重新运行本程序")
+    _remove_qr(qr_path)
 
 
 if __name__ == "__main__":

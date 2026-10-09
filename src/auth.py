@@ -12,7 +12,6 @@ import re
 import tempfile
 import uuid
 import qrcode
-from io import BytesIO
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_OAEP
 from Crypto.Hash import SHA256
@@ -36,8 +35,55 @@ REFRESH_PUBKEY = """-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDLgd2OAkcGVtoE3ThUREbio0Eg
 Uc/prcajMKXvkCKFCWhJYJcLkcM2DKKcSeFpD/j6Boy538YXnR6VhcuUJOhH2x71
 nzPjfdTcqMz7djHum0qSZA0AyCBDABUqCrfNgCiJ00Ra7GmRj+YCK1NJEuewlb40
-JNrRuoEUXpabUzGB8QIDAQAB
+JNrRuoEUXpabTuMzGB8gIDAQAB
 -----END PUBLIC KEY-----"""
+
+
+class LoginRequiredError(Exception):
+    """需要人工扫码登录（二维码过期/扫码超时）：无人值守场景（批量分析、web job）
+    捕获后应中止/终止而非继续——逐个空等 3 分钟扫码超时纯属浪费"""
+
+
+# 跨进程 cookie 刷新互斥（refresh_token 一次性，两进程并发刷新同一账号会互相
+# 烧掉对方的登录态）。fcntl 仅 POSIX；Windows 无 flock 时退化为无锁（单进程场景无影响）
+try:
+    import fcntl
+except ImportError:      # pragma: no cover - Windows
+    fcntl = None
+
+
+def _refresh_lock(path: str | None):
+    """cookie 刷新的跨进程文件锁（上下文管理器）：拿锁期间其它进程的刷新请求阻塞
+    等待（内核保证持有进程退出自动释放，不会死锁）"""
+    import contextlib
+
+    lock_path = (path or COOKIE_PATH) + ".refresh.lock"
+
+    @contextlib.contextmanager
+    def _noop():
+        yield
+
+    if fcntl is None:
+        return _noop()
+    try:
+        os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+        fh = open(lock_path, "w", encoding="utf-8")
+    except OSError:
+        return _noop()   # 锁文件都建不了（只读目录等）：退化为无锁，刷新本身仍会失败降级
+
+    @contextlib.contextmanager
+    def _locked():
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)     # 阻塞等锁：持有者崩溃内核自动释放
+            yield
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            fh.close()
+
+    return _locked()
 
 
 def generate_qrcode_image(url: str, filepath: str = "qrcode.png") -> str:
@@ -131,81 +177,97 @@ def _get_correspond_path() -> str:
 
 
 def _try_refresh_cookie(client: BiliAPIClient, path: str | None = None) -> bool:
-    """尝试刷新 cookie，返回是否成功；path 为小号 cookie 路径（默认主号）"""
+    """尝试刷新 cookie，返回是否成功；path 为小号 cookie 路径（默认主号）
+
+    跨进程互斥（_refresh_lock）：refresh_token 一次性，run.py 与 web.py 两进程
+    并发刷新同一账号时后者必失败且旧 token 作废；拿锁后先重读磁盘——等锁期间
+    别的进程可能已刷新成功落盘，直接采用其结果，不再消耗自己手里的旧 token。
+    """
     refresh_token = getattr(client, "_refresh_token", None)
     if not refresh_token:
         return False
 
-    try:
-        print("[Auth] 尝试刷新Cookie...")
+    with _refresh_lock(path):
+        # 拿到锁后重读磁盘：等锁期间其它进程已完成刷新并落盘（token 与内存值不同），
+        # 直接采用新登录态（调用方随后会重新 verify_cookie 验证）
+        disk = load_cookie(path)
+        if disk and disk.get("_refresh_token") and disk["_refresh_token"] != refresh_token:
+            new_rt = disk.pop("_refresh_token")
+            client.update_cookies(disk)
+            client._refresh_token = new_rt
+            print("[Auth] 检测到其它进程已完成刷新（文件锁串行化），采用其新登录态")
+            return True
 
-        # Step 1: 获取 correspondPath
-        correspond_path = _get_correspond_path()
-
-        # Step 2: 获取 refresh_csrf（该页面是 HTML，需要原始响应用正则提取；
-        # get_raw 重试耗尽会 raise，这里接住降级为刷新失败）
-        buvid = str(uuid.uuid1())
         try:
-            resp = client.get_raw(
-                f"https://www.bilibili.com/correspond/1/{correspond_path}",
-                cookies={"buvid3": buvid},
+            print("[Auth] 尝试刷新Cookie...")
+
+            # Step 1: 获取 correspondPath
+            correspond_path = _get_correspond_path()
+
+            # Step 2: 获取 refresh_csrf（该页面是 HTML，需要原始响应用正则提取；
+            # get_raw 重试耗尽会 raise，这里接住降级为刷新失败）
+            buvid = str(uuid.uuid1())
+            try:
+                resp = client.get_raw(
+                    f"https://www.bilibili.com/correspond/1/{correspond_path}",
+                    cookies={"buvid3": buvid},
+                )
+            except Exception as e:
+                print(f"[Auth] 获取 refresh_csrf 请求失败: {e}")
+                return False
+            match = re.search(r'<div id="1-name">(.+?)</div>', resp.text)
+            if not match:
+                print("[Auth] refresh_csrf 提取失败")
+                return False
+            refresh_csrf = match.group(1)
+
+            # Step 3: 执行刷新（requests.Session 会自动把响应 Set-Cookie 写入 cookie jar）
+            data = client.post(
+                "https://passport.bilibili.com/x/passport-login/web/cookie/refresh",
+                data={
+                    "csrf": client.get_cookies_dict().get("bili_jct", ""),
+                    "refresh_csrf": refresh_csrf,
+                    "refresh_token": refresh_token,
+                    "source": "main_web",
+                },
+                cookies={"buvid3": str(uuid.uuid1())},
             )
+            if data.get("code") != 0:
+                print(f"[Auth] 刷新失败: {data.get('message', '')}")
+                return False
+
+            # Step 4: 更新 cookies（Step 3 的新 cookie 已自动写入 session，直接读取）
+            new_cookies = client.get_cookies_dict()
+            new_refresh_token = (data.get("data") or {}).get("refresh_token", "")
+
+            client._refresh_token = new_refresh_token or refresh_token
+            # 先落盘再 confirm：窗口期崩溃也不丢登录态。
+            # save_cookie 单独 try：落盘失败时服务端轮换已完成、内存态有效，
+            # 仍按刷新成功返回 True，只醒目告警（不兜成 False 让调用方误判重扫）
+            try:
+                save_cookie(client, path)
+            except Exception as e:
+                print(f"[Auth] !!!警告!!! Cookie刷新成功但落盘失败（{path or COOKIE_PATH}）: {e}；"
+                      f"本次会话不受影响，重启后需重新扫码登录")
+
+            # Step 5: 确认刷新（按B站协议用旧 refresh_token 确认，保持不变）
+            confirm = client.post(
+                "https://passport.bilibili.com/x/passport-login/web/confirm/refresh",
+                data={
+                    "csrf": new_cookies.get("bili_jct", ""),
+                    "refresh_token": refresh_token,
+                },
+            )
+            if confirm.get("code") != 0:
+                print(f"[Auth] 警告: 刷新确认接口返回异常: code={confirm.get('code')} "
+                      f"{confirm.get('message', '')}")
+
+            print("[Auth] Cookie刷新成功!")
+            return True
+
         except Exception as e:
-            print(f"[Auth] 获取 refresh_csrf 请求失败: {e}")
+            print(f"[Auth] Cookie刷新异常: {e}")
             return False
-        match = re.search(r'<div id="1-name">(.+?)</div>', resp.text)
-        if not match:
-            print("[Auth] refresh_csrf 提取失败")
-            return False
-        refresh_csrf = match.group(1)
-
-        # Step 3: 执行刷新（requests.Session 会自动把响应 Set-Cookie 写入 cookie jar）
-        data = client.post(
-            "https://passport.bilibili.com/x/passport-login/web/cookie/refresh",
-            data={
-                "csrf": client.get_cookies_dict().get("bili_jct", ""),
-                "refresh_csrf": refresh_csrf,
-                "refresh_token": refresh_token,
-                "source": "main_web",
-            },
-            cookies={"buvid3": str(uuid.uuid1())},
-        )
-        if data.get("code") != 0:
-            print(f"[Auth] 刷新失败: {data.get('message', '')}")
-            return False
-
-        # Step 4: 更新 cookies（Step 3 的新 cookie 已自动写入 session，直接读取）
-        new_cookies = client.get_cookies_dict()
-        new_refresh_token = (data.get("data") or {}).get("refresh_token", "")
-
-        client._refresh_token = new_refresh_token or refresh_token
-        # 先落盘再 confirm：窗口期崩溃也不丢登录态。
-        # save_cookie 单独 try：落盘失败时服务端轮换已完成、内存态有效，
-        # 仍按刷新成功返回 True，只醒目告警（不兜成 False 让调用方误判重扫）
-        try:
-            save_cookie(client, path)
-        except Exception as e:
-            print(f"[Auth] !!!警告!!! Cookie刷新成功但落盘失败（{path or COOKIE_PATH}）: {e}；"
-                  f"本次会话不受影响，重启后需重新扫码登录")
-
-        # Step 5: 确认刷新（按B站协议用旧 refresh_token 确认，保持不变）
-        confirm = client.post(
-            "https://passport.bilibili.com/x/passport-login/web/confirm/refresh",
-            data={
-                "csrf": new_cookies.get("bili_jct", ""),
-                "refresh_token": refresh_token,
-            },
-        )
-        if confirm.get("code") != 0:
-            print(f"[Auth] 警告: 刷新确认接口返回异常: code={confirm.get('code')} "
-                  f"{confirm.get('message', '')}")
-
-        print("[Auth] Cookie刷新成功!")
-        return True
-
-    except Exception as e:
-        print(f"[Auth] Cookie刷新异常: {e}")
-        return False
 
 
 def login_by_qrcode() -> BiliAPIClient:
@@ -265,7 +327,7 @@ def login_by_qrcode() -> BiliAPIClient:
                 last_status = 86090
         elif code == 86038:
             print("\n[Auth] 二维码已过期，请重新运行程序")
-            raise Exception("二维码过期")
+            raise LoginRequiredError("二维码过期，需重新扫码登录")
         else:
             msg = (result.get("data") or {}).get("message", "未知状态")
             if last_status != code:
@@ -274,7 +336,7 @@ def login_by_qrcode() -> BiliAPIClient:
 
         time.sleep(2)
 
-    raise Exception("登录超时（3分钟）")
+    raise LoginRequiredError("登录超时（3分钟未确认扫码）")
 
 
 def get_auth_client() -> BiliAPIClient:
