@@ -2607,6 +2607,7 @@ def video_page(bvid: str):
             <button class="filter-btn btn-danger" onclick="reportDelete()">🗑 删除报告</button>
             <button class="filter-btn" onclick="toggleMask()"
                     title="开启后全站昵称只显示最后一个字、UID 只显示前三位（Cookie 持久化，所有页面共享）">{'已隐藏信息' if mask else '未隐藏信息'}</button>
+            <span class="ov-dl">{links}</span>
             <details class="blk-export">
                 <summary class="filter-btn"
                          title="把问题发送者导出为B站播放器「弹幕屏蔽列表」可导入的用户屏蔽 JSON——导入后就看不到这些人的弹幕了">🚫 屏蔽列表导出</summary>
@@ -2625,7 +2626,6 @@ def video_page(bvid: str):
                     导出含真实 UID，不受「隐藏信息」开关影响（屏蔽必须用真实 UID）。</p>
                 </div>
             </details>
-            <span class="ov-dl">{links}</span>
             <span id="reportJobStatus"></span>
         </div>
         {coverage_note}
