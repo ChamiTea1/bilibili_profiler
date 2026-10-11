@@ -39,7 +39,8 @@ def pick_python() -> str:
 
 PY = pick_python()
 SCRIPTS = [
-    "tests/offline/regress_core.py",            # 主回归 19 项
+    "tests/offline/regress_comprehensive_fixes.py", # 全库审查：存储隔离、事务、缓存、失败覆盖和界面
+    "tests/offline/regress_core.py",            # 主回归 14 项
     "tests/offline/regress_comment_path.py",    # 评论采集路径 10 项
     "tests/offline/regress_judge_danmaku.py",   # 问题弹幕判定聚合 4 项
     "tests/offline/regress_judge_comment.py",   # 问题评论判定聚合 3 项
@@ -102,9 +103,8 @@ def run_lint() -> bool:
                           cwd=str(ROOT), capture_output=True, text=True,
                           encoding="utf-8", errors="replace")
     out = (proc.stdout or "") + (proc.stderr or "")
-    # 没装 pyflakes 时 `python -m pyflakes` 会以非 0 退出并在 stderr 报 "No module named"——
-    # 这不是代码问题，若当作失败项，离线回归全过也会让退出码变成 1（误报，且会卡住 pre-commit/CI）。
-    # （PY 一定是可执行的解释器，原先的 FileNotFoundError 分支实际到不了）
+    # 模块缺失时 pyflakes 以非零码退出并在 stderr 报 "No module named"——
+    # （PY 一定是可执行的解释器，FileNotFoundError 分支实际到不了）
     if proc.returncode != 0 and "No module named" in out:
         print("  未安装 pyflakes，跳过（pip install pyflakes）")
         return True

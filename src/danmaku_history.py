@@ -255,6 +255,7 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     done_before = False
     fetched_dates: set[str] = set()
     failed_dates: set[str] = set()
+    failed_months: set[str] = set()
     if bvid:
         from storage import (append_danmaku, get_phase_state, load_danmaku,
                              set_phase_state)
@@ -262,6 +263,7 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         done_before = get_phase_state(bvid, "danmaku", _state_key("done", page)) == "1"
         fetched_dates = _load_date_set(bvid, "fetched_dates", page)
         failed_dates = _load_date_set(bvid, "failed_dates", page)
+        failed_months = _load_date_set(bvid, "failed_months", page)
         if seen_dmids is None:
             seen_dmids = {r["dmid"] for r in load_danmaku(bvid) if r["dmid"]}
     seen_dmids = seen_dmids if seen_dmids is not None else set()
@@ -327,6 +329,7 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     #    refresh_mode 豁免天数上限：滚动补采窗口固定为 cutoff 之后的几天（≤3 天），
     #    上限管的是"回溯多早"而非"补采几条"；已达上限的 done 视频不豁免则永远补不进新弹幕
     work_dates: list[str] = []
+    months = sorted(set(months) | failed_months)
     for month in reversed(months):
         if not refresh_mode and fetched_days + len(work_dates) >= HISTORY_MAX_DAYS:
             truncated = True
@@ -337,20 +340,23 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
             # 网络/风控异常：该月按失败处理（不写 done），并立即落盘挂账待下轮补采
             print(f"[历史弹幕] {tag}警告：{month} 月份索引请求异常（{e}），跳过该月")
             window_complete = False
+            failed_months.add(month)
             if bvid:
+                _save_date_set(bvid, "failed_months", failed_months, page)
                 _save_date_set(bvid, "failed_dates", failed_dates, page)
             continue
         if dates is None:
-            # 索引返回失败（code != 0，非异常路径）：该月按失败处理，保留续采入口。
-            # ⚠️ 不能与"本月无弹幕"的空列表同等处理——那样 window_complete 仍为 True，
-            # 该月日期从未进入待采清单，最后却在 :433 照写 done=1，之后滚动补采
-            # 只回拨最近几天，该月弹幕就此永久静默丢失且不再重试。
             window_complete = False
+            failed_months.add(month)
             if bvid:
-                _save_date_set(bvid, "failed_dates", failed_dates, page)
+                _save_date_set(bvid, "failed_months", failed_months, page)
             continue
+        retry_month = month in failed_months
         if not dates:
-            continue   # 该月确实无弹幕（空列表），属合法空月
+            failed_months.discard(month)
+            if bvid:
+                _save_date_set(bvid, "failed_months", failed_months, page)
+            continue
         for date in sorted(dates, reverse=True):
             if not refresh_mode and fetched_days + len(work_dates) >= HISTORY_MAX_DAYS:
                 truncated = True
@@ -360,11 +366,20 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
             # 高水位兜底只保留两种语义成立的场景：旧版检查点（无日期集，升序时代
             # "last_date 及以前已完成"成立）、已完成视频的滚动补采（done=1 时窗口内
             # 日期均已处置，含设计性截断——不该被重新翻出来补采）。
-            watermark_skip = bool(resume_before) and (done_before or not fetched_dates)
+            watermark_skip = bool(resume_before) and not retry_month and (done_before or not fetched_dates)
             if date not in failed_dates and (
                     date in fetched_dates or (watermark_skip and date <= resume_before)):
                 continue            # 该日已落库（失败日除外：不被高水位跳过，重试补采）
             work_dates.append(date)
+            if retry_month:
+                failed_dates.add(date)
+        if retry_month:
+            # 先将待补日期挂账再清月份：此处中断也不会丢失滚动窗口之外的日期。
+            if bvid:
+                _save_date_set(bvid, "failed_dates", failed_dates, page)
+            failed_months.discard(month)
+            if bvid:
+                _save_date_set(bvid, "failed_months", failed_months, page)
 
     # 2) 按日并发采集：历史快照每天一个独立请求、无游标链，组合池多号分片时
     #    按账号并行（限速按号独立，吞吐≈账号数倍）；单池/裸 client 时串行照旧。
@@ -443,7 +458,7 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
             set_phase_state(bvid, "danmaku", _state_key("truncated", page), "1")
         if done_before:
             pass   # 滚动补采路径：保持 done=1
-        elif window_complete and not failed_dates:
+        elif window_complete and not failed_dates and not failed_months:
             # 时间窗完整迭代且无任何失败（含截断场景）才标完成；否则保留续采入口
             set_phase_state(bvid, "danmaku", _state_key("done", page), "1")
         else:

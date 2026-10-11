@@ -281,3 +281,19 @@ UID_HARVEST_MAX_PAGES = 500        # 评论 UID 收割（纯翻页取 uid 建 CR
 PROXY_NODE_DEAD_TTL = 660          # 节点死名单 TTL（秒，略大于订阅健康检查间隔 600s，到期允许复活重试）
 COMMENT_REFRESH_MAX_PAGES = 10     # 评论增量刷新（done=1 重跑）按时间序回翻的页数上限
 LLM_BATCH_THINKING = os.environ.get("LLM_BATCH_THINKING", "off")  # 判定批次思考强度：off(关)/low(低档)/default(厂商原生)
+
+# 长图导出：尺寸、质量与资源上限
+LONG_IMAGE_WIDTH = 1080           # 长图基准宽度（像素），高度按区块内容自适应
+LONG_IMAGE_MIN_WIDTH = 720        # 下限：低于此宽度中文正文会挤成竖条，宁可报错也不出畸形图
+LONG_IMAGE_MAX_PIXELS = 40_000_000  # 上限：宽×高 防超大图打爆内存（1080 宽约合 3.7 万 px 高）
+LONG_IMAGE_FONT = ""              # 中文字体路径；留空则自动探测系统 CJK 字体（详见 long_image._find_font）
+LONG_IMAGE_SCALE = 2              # 2 倍超采样后再降采样，边缘抗锯齿（微信压缩后小字不糊）
+LONG_IMAGE_CRADLE_TOP_N = 12      # 问题弹幕榜取前 N 人
+LONG_IMAGE_ATTACK_TOP_N = 5       # 争执焦点挑事者/被围攻者各取前 N
+LONG_IMAGE_COMMENT_TOP_N = 8      # 问题评论榜取前 N
+LONG_IMAGE_REPEAT_TOP_N = 6       # 群体复读事件取前 N
+LONG_IMAGE_USER_TOP_N = 10        # 用户画像卡取前 N
+LONG_IMAGE_QUOTE_MAX_LINES = 3    # 单条原文最多折行数（超出截断加省略号）
+
+# 空投稿词云短缓存，临时请求失败不缓存
+UP_WORDCLOUD_EMPTY_TTL = 300

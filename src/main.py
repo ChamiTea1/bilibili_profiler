@@ -19,7 +19,7 @@ from config import (MAX_ANALYZE_USERS_HARD_CAP, ANALYZE_USERS_FLOOR, ANALYZE_USE
                     HISTORY_MULTIPAGE_ENABLED, HISTORY_MULTIPAGE_MAX_PAGES)
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_video_info
-from storage import load_user_data, has_user_data, load_senders, save_video_profile
+from storage import load_user_data, has_user_data, load_senders, update_user_profile
 from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
 from storage import save_comments, update_comment_problems
 from storage import load_danmaku, load_comments, append_danmaku
@@ -27,7 +27,8 @@ from storage import get_phase_state, set_phase_state
 from auth import get_auth_client, LoginRequiredError
 from combo_pool import build_pool
 from api_client import RiskControlError
-from danmaku import collect_danmaku_data, group_by_sender, fetch_command_dms, build_command_uid_map
+from danmaku import (collect_danmaku_data, group_by_sender, fetch_command_dms,
+                    build_command_uid_map, fetch_danmaku, DanmakuCollectionError)
 from danmaku import get_video_info
 from danmaku_history import fetch_history_danmaku
 from comment import collect_comment_data, fetch_charge_uid_map, refresh_comments
@@ -123,7 +124,7 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
         last = get_phase_state(bvid, "danmaku", "last_date")
         fmt = get_phase_state(bvid, "danmaku", "format")
         existing = load_danmaku(bvid)
-        if existing or done == "1":
+        if existing or done == "1" or fmt is not None:
             prev_info = load_video_info(bvid) or {}
             try:
                 video_info = get_video_info(bvid, client)
@@ -139,6 +140,27 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
             # 历史合并后补算缺失的覆盖率），必须在 save_video_info 覆盖前取出
             if prev_info.get("danmaku_coverage"):
                 video_info["danmaku_coverage"] = prev_info["danmaku_coverage"]
+            pending_pages = prev_info.get("realtime_failed_pages") or []
+            if not existing and "realtime_failed_pages" not in prev_info:
+                # 旧版本曾把请求全失败写成空池完成；无法确认的空池至少重新验证一次。
+                pending_pages = list(range(1, len(video_info.get("pages") or [1]) + 1))
+            if pending_pages:
+                remaining = []
+                seen = {d["dmid"] for d in existing if d.get("dmid")}
+                pages = video_info.get("pages") or [{"cid": video_info.get("cid"), "page": 1}]
+                for pg in pending_pages:
+                    try:
+                        cid = pages[pg - 1]["cid"]
+                        retry = fetch_danmaku(cid, client)
+                        for d in retry:
+                            d["page"] = pg
+                        append_danmaku(bvid, retry, seen)
+                    except Exception as e:
+                        print(f"[Phase 2] 警告: 分P {pg} 实时弹幕补采失败（{e}），下次重试")
+                        remaining.append(pg)
+                video_info["realtime_failed_pages"] = remaining
+            else:
+                video_info["realtime_failed_pages"] = []
             save_video_info(bvid, video_info)
             command_dms = fetch_command_dms(video_info, client)
             video_info["command_dms"] = command_dms
@@ -181,11 +203,16 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
                     }
                     save_video_info(bvid, video_info)
                 print(f"[Phase 2] 断点续采：历史弹幕续采完成，库内共 {len(danmaku_list)} 条")
+            if video_info.get("realtime_failed_pages"):
+                set_phase_state(bvid, "danmaku", "done", "0")
             return video_info, danmaku_list, group_by_sender(danmaku_list), command_dms
 
     # 视频不存在/已删除或触发风控时给友好中文提示并以非零码退出，不再抛原始 traceback
     try:
         video_info, danmaku_list, sender_groups = collect_danmaku_data(bvid, client)
+    except DanmakuCollectionError as e:
+        video_info, danmaku_list, sender_groups = e.video_info, [], {}
+        print(f"[Phase 2] 警告: {e}；本轮继续历史弹幕和评论分析")
     except Exception as e:
         print(f"[Phase 2] 错误: 视频信息/弹幕获取失败: {e}")
         print("[Phase 2] 可能原因: 视频不存在或已删除、BV号错误、或触发风控，请检查后重试")
@@ -194,13 +221,19 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
     # 新格式哨兵：必须先于任何数据落库写入（先于实时池 append 与历史逐日检查点），
     # 否则中断点早于首个检查点时重跑无法与旧版完整落库区分
     set_phase_state(bvid, "danmaku", "format", "v2")
+    # 先记录待采分P；即使实时池落库后、历史采集中断，也能重试未确认的实时页。
+    pending_info = dict(video_info, realtime_failed_pages=list(
+        range(1, len(video_info.get("pages") or [1]) + 1)))
+    save_video_info(bvid, pending_info)
 
     # 实时弹幕池先增量落库存底（中断后重跑可基于库内数据续采历史弹幕）
     seen_dmids: set = set()
     try:
         append_danmaku(bvid, danmaku_list, seen_dmids)
+        save_video_info(bvid, video_info)
     except Exception as e:
         print(f"[Phase 2] 警告: 弹幕落库失败（{e}），web.py 弹幕浏览器将无本视频数据")
+        video_info["realtime_failed_pages"] = pending_info["realtime_failed_pages"]
 
     # 实时弹幕池只保留最近几千条；开启历史弹幕时逐日拉取弹幕池快照补全历史
     # （bvid 传入后逐日增量落库+检查点，中断可续；fetch 内部完成时置 done=1）
@@ -218,10 +251,12 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
         except Exception as e:
             print(f"[Main] 警告：历史弹幕采集失败，降级为仅实时弹幕池: {e}")
     else:
-        set_phase_state(bvid, "danmaku", "done", "1")
+        set_phase_state(bvid, "danmaku", "done", "0" if video_info.get("realtime_failed_pages") else "1")
 
     # 落库时机在历史合并之后：danmaku_coverage 由上方写入 video_info，
     # 提前保存会导致 Web 概览页拿不到覆盖率
+    if video_info.get("realtime_failed_pages"):
+        set_phase_state(bvid, "danmaku", "done", "0")
     save_video_info(bvid, video_info)
 
     print(f"[Phase 2] 已落库 {len(load_danmaku(bvid))} 条弹幕（danmaku 表）")
@@ -394,6 +429,18 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
             global_hit += 1
     print(f"[Phase 4] 全局映射库: {len(global_map)} 条（补充 {global_hit} 条到交叉验证映射）")
 
+    for h, old in cached_map.items():
+        if h in sender_groups and h in plain_uid_map and (
+                old["uid"] != plain_uid_map[h] or old["confidence"] != "高"
+                or old["method"] == METHOD_CRC32_CRACK):
+            grp = sender_groups[h]
+            save_sender(bvid, h, plain_uid_map[h], "高", method_map[h], grp["count"], grp["contents"],
+                        (spam_results or {}).get(h, {}).get("spam_level", old["spam_level"]),
+                        (spam_results or {}).get(h, {}).get("spam_score", old["spam_score"]))
+            old.update(uid=plain_uid_map[h], confidence="高", method=method_map[h],
+                       danmaku_count=grp["count"], contents=grp["contents"])
+            save_global_uid(h, plain_uid_map[h], method_map[h])
+
     # 2. 筛选需要新解析的sender：不在缓存中的，以及缓存中 uid 为 NULL 的历史解析失败记录
     #    （评论交叉验证随新评论变好，失败记录值得重试；save_sender 为 INSERT OR REPLACE 会覆盖旧记录）
     unresolved = {}
@@ -550,8 +597,7 @@ def phase_comment_cringe(comments: list, video_info: dict) -> dict | None:
     """阶段3.5: 问题评论检测（LLM）
 
     返回 {rpid: {category, severity, reason}}；未配置 Key / 无评论 / 检测失败返回 None。
-    None 与「检测成功但零命中」的空 dict 必须区分：前者不回写 comments.problem 列
-    （保留库内已有标注），后者要回写空集以清除可能过时的旧标注。"""
+    成功结果附 judged_rpids，只有成功覆盖的评论能清除旧标注；失败范围保留。"""
     if not comments:
         return None
     if not LLM_API_KEY:
@@ -670,7 +716,7 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
                 print(f"  [{idx}/{total}] [失败] UID:{uid} {data['error']}")
             return uid, None
         # 立即落库：Ctrl+C 中断后已采集数据不丢失，重跑时命中上方缓存跳过。
-        # 视频专属画像在阶段6另存到 video_profiles，不写入全局用户行。
+        # profile 暂存空 dict，阶段6分析后以 INSERT OR REPLACE 覆盖
         save_err = None
         try:
             save_user_data(uid, data.get("name", ""), data.get("level", 0), data, {})
@@ -738,7 +784,7 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
     return user_data_map
 
 
-def phase_analyze(bvid: str, resolved: dict, spam_results: dict, user_data_map: dict, sender_groups: dict,
+def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sender_groups: dict,
                   comment_location_map: dict | None = None, uid_comments: dict | None = None,
                   video_info: dict | None = None):
     """阶段6: 画像分析
@@ -761,7 +807,8 @@ def phase_analyze(bvid: str, resolved: dict, spam_results: dict, user_data_map: 
         if not uid or uid not in user_data_map:
             continue
 
-        user_data = user_data_map[uid]
+        user_data = dict(user_data_map[uid])
+        user_data.pop("ip_location", None)
 
         # 评论IP属地贯通：原样保留 API 返回格式（如 "IP属地：江苏"），无属地则不设该键
         if uid in comment_location_map:
@@ -792,9 +839,8 @@ def phase_analyze(bvid: str, resolved: dict, spam_results: dict, user_data_map: 
                 profile["comment_problem"] = info["comment_problem"]
             profiles.append(profile)
 
-            # 全局采集资料与视频专属画像分表保存，避免同一 UID 跨视频覆盖弹幕/评论证据。
-            save_user_data(uid, user_data.get("name", ""), user_data.get("level", 0), user_data)
-            save_video_profile(bvid, uid, profile)
+            # 保存到数据库
+            save_user_data(uid, user_data.get("name", ""), user_data.get("level", 0), user_data, profile, bvid=(video_info or {}).get("bvid"))
         except Exception as e:
             print(f"  [Phase 6] 警告: UID:{uid} 画像分析失败，已跳过: {e}")
 
@@ -802,7 +848,7 @@ def phase_analyze(bvid: str, resolved: dict, spam_results: dict, user_data_map: 
     return profiles
 
 
-def phase_ai_analysis(bvid: str, video_info: dict, profiles: list[dict]):
+def phase_ai_analysis(video_info: dict, profiles: list[dict]):
     """阶段7: LLM 重点深掘（兴趣分 top K 单人单调用，结果直接注入 profile；
     全员粗筛已砍——命中人数扩大后粗筛是 token 大头，普通用户由规则标签勾画轮廓）"""
     if not LLM_API_KEY:
@@ -822,9 +868,10 @@ def phase_ai_analysis(bvid: str, video_info: dict, profiles: list[dict]):
             uid = p.get("uid")
             if uid in deep:
                 p["ai_deep"] = deep[uid]
-                # 深掘结果写回该视频画像，并刷新 updated_at 供报告缓存指纹识别。
+                # 深掘结果必须落库：web 报告读的是所属视频的 video_profiles，
+                # 阶段6已在深掘前落库，这里注入后不回写的话报告页永远看不到
                 try:
-                    save_video_profile(bvid, uid, p)
+                    update_user_profile(uid, p, bvid=video_info.get("bvid"))
                 except Exception as e:
                     print(f"[Phase 7] 警告: UID:{uid} 深掘结果落库失败（{e}），重跑可补")
         print(f"[Phase 7] 完成: {len(deep)} 人生成深度画像")
@@ -882,7 +929,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
         max_users = max(1, max_users)
 
     # --port：写入环境变量后，web_autostart.maybe_launch_web 拉起的 web.py 子进程
-    # （继承环境）与它拼接的报告页 URL 会一致地用该端口；未传则沿用现有环境/默认 8001
+    # （继承环境）与它拼接的报告页 URL 会一致地用该端口；未传则沿用现有环境/默认 8000
     if port is not None:
         os.environ["PROFILER_PORT"] = str(port)
 
@@ -914,15 +961,8 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     video_info, danmaku_list, sender_groups, command_dms = timer.run(
         "阶段2 弹幕采集", phase_danmaku, bvid, pool, resume=not force)
 
-    # 弹幕为空时提前终止：后续评论/解析/画像均无意义，避免白跑全流程产出空报告
     if not danmaku_list:
-        # 空弹幕也落 done=1/format 哨兵（参照 phase_danmaku 正常路径写法）：
-        # 否则重跑时 resume 判据对空库恒 falsy，永远全量重采
-        set_phase_state(bvid, "danmaku", "format", "v2")
-        set_phase_state(bvid, "danmaku", "done", "1")
-        print("[Main] 弹幕为空，终止分析")
-        timer.summary()   # 早退也输出计时
-        return
+        print("[Main] 当前无弹幕，继续采集和分析评论")
 
     # 阶段2.5: 刷屏检测（本地，提前到解析前驱动选人）
     spam_results = timer.run("阶段2.5 刷屏检测", phase_spam, bvid, sender_groups, danmaku_list)
@@ -951,16 +991,20 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     # 的「TA 在本视频的评论」随之带出标注）
     comment_problems = timer.run("阶段3.5 问题评论检测", phase_comment_cringe, comments, video_info)
     if comment_problems is not None:
-        # 检测实际跑过即回写（含零命中——回写空集清掉库内可能过时的旧标注）；
-        # 返回 None（未配置 Key/检测失败）则完全不动 problem 列
+        # 只回写成功覆盖范围，成功空批次清旧标注，失败和截断批次保持原样。
         try:
-            update_comment_problems(bvid, {rpid: v["category"] for rpid, v in comment_problems.items()})
+            update_comment_problems(bvid, comment_problems,
+                                    judged_rpids=getattr(comment_problems, "judged_rpids", None))
         except Exception as e:
             print(f"    警告: 问题评论回写失败（{e}），web 端评论标注将缺失")
         for c in comments:
             v = comment_problems.get(c.get("rpid"))
             if v:
                 c["problem"] = v["category"]
+                c["problem_severity"] = v.get("severity", 1)
+            elif c.get("rpid") in getattr(comment_problems, "judged_rpids", comment_problems):
+                c["problem"] = ""
+                c["problem_severity"] = 0
 
     # 阶段4: UID解析（兴趣分驱动选人）
     resolved = timer.run("阶段4 UID解析", phase_resolve, bvid, sender_groups, comment_uid_map, pool,
@@ -981,7 +1025,9 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     # cmt:{uid} 并入 resolved（danmaku_count=0，身份置信度"高"），并落 senders 表让
     # web 端画像/跨视频足迹可见；已在解析名单中的 UID 跳过（避免同人双画像）
     existing_uids = {info["uid"] for info in resolved.values() if info.get("uid")}
-    cmt_authors = select_problem_comment_authors(comments, comment_problems)
+    current_verdicts = {c["rpid"]: {"category": c["problem"], "severity": c.get("problem_severity") or 1}
+                        for c in comments if c.get("problem")}
+    cmt_authors = select_problem_comment_authors(comments, current_verdicts)
     cmt_added = 0
     for uid, st in cmt_authors.items():
         if uid in existing_uids:
@@ -1003,12 +1049,12 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
                               max_users=max_users, force=force, cache_only=skip_collect)
 
     # 阶段6: 画像分析（评论IP属地/本视频评论/问题弹幕在此贯通进画像）
-    profiles = timer.run("阶段6 画像分析", phase_analyze, bvid, resolved, spam_results, user_data_map,
+    profiles = timer.run("阶段6 画像分析", phase_analyze, resolved, spam_results, user_data_map,
                          sender_groups, comment_location_map, uid_comments, video_info)
 
     # 阶段7: LLM 重点深掘（结果在 phase 内直接注入 profile；LLM_DEEP_ENABLED 可整段关闭）
     if LLM_DEEP_ENABLED:
-        timer.run("阶段7 LLM深掘", phase_ai_analysis, bvid, video_info, profiles)
+        timer.run("阶段7 LLM深掘", phase_ai_analysis, video_info, profiles)
     else:
         print("\n[Phase 7] 跳过 (config.py 中 LLM_DEEP_ENABLED=False)")
 
@@ -1129,7 +1175,7 @@ def main():
                         help="跳过阶段5用户采集的网络请求：只用库内已采数据（未采用户本轮不出画像），"
                              "适合不想再打接口时刷新报告；与 --force 同用会因缓存被清而无画像可用")
     parser.add_argument("--port", type=int, default=None, metavar="PORT",
-                        help="Web 报告端口（默认 8001；等价于设置 PROFILER_PORT，"
+                        help="Web 报告端口（默认 8000；等价于设置 PROFILER_PORT，"
                              "但 Windows 的 cmd/PowerShell 上参数写法才不会踩坑）")
     args = parser.parse_args()
 

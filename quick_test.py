@@ -4,12 +4,17 @@
 """
 import sys, os
 import argparse
+from pathlib import Path
+from datetime import datetime
+import webbrowser
+import re
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 # 强制行缓冲：输出被重定向/管道时也能实时看到进度（默认块缓冲会长时间无输出）
-sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
 
-from config import LLM_API_KEY, DATA_DIR
+from config import LLM_API_KEY, DATA_DIR, WEB_AUTOSTART
 from auth import get_auth_client
 from api_client import RiskControlError
 from combo_pool import build_pool
@@ -22,7 +27,8 @@ from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from llm_analyzer import LLMAnalyzer
 from storage import init_db, save_video_info, load_video_info
-from web_autostart import maybe_launch_web
+from report import REPORT_CSS, esc, generate_user_card
+from exporter import export_csv, export_json
 
 # 冒烟采样上限：不跑全量视频，只取少量数据验证流水线
 QUICK_DANMAKU_LIMIT = 100   # 弹幕只取实时池前 100 条（跳过历史快照合并）
@@ -67,6 +73,8 @@ def main():
                         help="分析刷屏得分最高的前N个发送者 (默认 10)")
     args = parser.parse_args()
     bvid = args.bvid
+    if not re.fullmatch(r"BV[A-Za-z0-9]+", bvid):
+        parser.error("BV号格式不合法")
     top_n = max(1, args.top)  # 夹紧下限：--top 0/负数无意义
 
     # 全程日志双写到 data/quick_test.log（后台/重定向运行时也能回看进度）
@@ -199,8 +207,25 @@ def main():
 
     # 静态 HTML 报告已被 web.py 交互式报告完全替换
     print(f"\n✅ 分析完成: {len(profiles)} 人生成画像")
-    # 自动启动 web.py 并打开报告页（冒烟场景不阻塞结束：失败只打印 URL 降级）
-    maybe_launch_web(bvid)
+    # 采样结果独立导出，避免 Web 读到全量库的旧结果，也不写全量检查点。
+    directory = Path(DATA_DIR) / "quick_reports"
+    directory.mkdir(parents=True, exist_ok=True)
+    prefix = directory / f"quick_{bvid}_{datetime.now():%Y%m%d_%H%M%S_%f}"
+    export_csv(profiles, str(prefix.with_suffix(".csv")))
+    export_json(dict(video_info, quick_sample=True), profiles, str(prefix.with_suffix(".json")))
+    html_path = prefix.with_suffix(".html")
+    cards = "".join(generate_user_card(p) for p in profiles)
+    html_path.write_text(f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+        <title>采样分析报告</title><style>{REPORT_CSS}</style><div class="container">
+        <div class="header"><h1>{esc(video_info.get("title", bvid))}</h1>
+        <p>快速采样报告：{len(danmaku_list)} 条弹幕、{len(comments)} 条评论、{len(profiles)} 份画像。</p>
+        <p>此报告仅包含本轮采样结果。</p></div>{cards}</div></html>''', encoding="utf-8")
+    print(f"采样报告: {html_path}")
+    if WEB_AUTOSTART:
+        try:
+            webbrowser.open(html_path.resolve().as_uri())
+        except Exception as e:
+            print(f"打开采样报告失败（{e}），请手动打开上述文件")
 
 
 if __name__ == "__main__":

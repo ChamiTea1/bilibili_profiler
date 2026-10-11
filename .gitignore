@@ -23,6 +23,7 @@ data/crc_tmp_*.bin
 
 # 报告输出
 data/reports/
+data/quick_reports/
 data/web.log
 data/web_*.pid
 

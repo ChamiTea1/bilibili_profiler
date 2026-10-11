@@ -10,6 +10,13 @@ from danmaku_history import _read_varint, _skip_field, _take_bytes  # 复用历�
 from uid_resolver import calc_crc32
 
 
+class DanmakuCollectionError(RuntimeError):
+    """视频信息可用但实时池全部失败，携带信息供主流程降级和重试。"""
+    def __init__(self, video_info: dict):
+        super().__init__("所有分P实时弹幕采集失败，保留未完成状态待重试")
+        self.video_info = video_info
+
+
 def get_video_info(bvid: str, client: BiliAPIClient) -> dict:
     """获取视频基础信息"""
     data = client.get(VIDEO_INFO_URL, params={"bvid": bvid})
@@ -118,8 +125,9 @@ def fetch_all_danmaku(video_info: dict, client: BiliAPIClient) -> list[dict]:
     if failed_pages:
         print(f"[Danmaku] 警告：共 {len(failed_pages)}/{len(pages)} 页采集失败"
               f"（失败分P: {failed_pages}），弹幕数据可能不完整")
+    video_info["realtime_failed_pages"] = failed_pages
     if len(failed_pages) == len(pages) and pages:
-        print("[Danmaku] 【严重警告】所有分P弹幕均采集失败，返回空弹幕列表！")
+        raise DanmakuCollectionError(video_info)
 
     return all_danmaku
 

@@ -45,23 +45,14 @@ def _cringe(*items):
 def _item(c, cat, sev):
     return {"content": c, "category": cat, "severity": sev, "reason": "r"}
 
-def _save_user(uid, name, profile):
-    """建 users 行 + 落 video_profiles 画像。
-
-    画像按 (bvid, uid) 存 video_profiles——同一 UID 在不同视频的问题弹幕/评论不可共用，
-    users.profile_json 仅为旧库兼容列（save_user_data 不再落画像）。
-    """
-    storage.save_user_data(uid, name, 3, {}, None)
-    storage.save_video_profile(BV, uid, profile)
-
 # 101：问题弹幕（严重度3，高置信度）→ cringe 标准入选
 storage.save_sender(BV, "h101", 101, "高", "评论区验证", 10, ["滚", "垃圾"],
                     "低", 0.0)
-_save_user(101, "u101", _profile(
+storage.save_user_data(101, "u101", 3, {}, _profile(
     101, cringe=_cringe(_item("滚", "人身攻击", 3), _item("垃圾", "人身攻击", 2))))
 # 102：问题弹幕但全部内容被标记误报 → 不入选；部分标记仍入选
 storage.save_sender(BV, "h102", 102, "高", "评论区验证", 5, ["x1", "x2"], "低", 0.0)
-_save_user(102, "u102", _profile(
+storage.save_user_data(102, "u102", 3, {}, _profile(
     102, cringe=_cringe(_item("x1", "引战阴阳", 2), _item("x2", "引战阴阳", 2))))
 # 103：高/中风险刷屏（spam 标准）
 storage.save_sender(BV, "h103", 103, "高", "评论区验证", 30, ["刷"] * 30, "高", 9.5)
@@ -72,7 +63,7 @@ storage.toggle_false_positive(BV, "spam", "h104")
 storage.save_sender(BV, "h105", None, "", "", 20, ["?"], "高", 8.0)
 # 106：低置信度（CRC32 反查）+ 问题弹幕 → 默认排除，include_lowconf 才纳入
 storage.save_sender(BV, "h106", 106, "低", "CRC32破解", 8, ["骂"], "低", 0.0)
-_save_user(106, "u106", _profile(
+storage.save_user_data(106, "u106", 3, {}, _profile(
     106, cringe=_cringe(_item("骂", "人身攻击", 3))))
 # 107/108：问题评论作者（评论区明文 UID，无 senders 行）；108 的评论被标记误报
 storage.save_comments(BV, [
@@ -136,9 +127,8 @@ print("=== 6. 跨视频合并屏蔽榜（惯犯优先）===")
 BV2 = "BVblk000002"
 storage.save_video_info(BV2, {"bvid": BV2, "title": "t2", "cid": 2})
 storage.save_sender(BV2, "g101", 101, "高", "评论区验证", 7, ["骂人"], "低", 0.0)
-# 本地架构：画像按 (bvid,uid) 存 video_profiles，save_user_data 不再落 profile_json
-storage.save_video_profile(BV2, 101, _profile(
-    101, cringe=_cringe(_item("骂人", "人身攻击", 2))))
+storage.save_user_data(101, "u101", 3, {}, _profile(
+    101, cringe=_cringe(_item("骂人", "人身攻击", 2))), bvid=BV2)
 storage.save_sender(BV2, "g109", 109, "高", "评论区验证", 25, ["冲"] * 25, "高", 8.0)
 rc = webmod._build_cross_blocklist({"cringe", "spam"}, 2, 200)
 cross_uids = [int(e["filter"]) for e in rc["entries"]]

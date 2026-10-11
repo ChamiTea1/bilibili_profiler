@@ -34,7 +34,7 @@ python web.py --stop [--port 9000]   # 停止后台 web 服务并释放端口（
                                      # pidfile: data/web_{端口}.pid，防 PID 复用误杀
 ```
 
-注意：`run.py`/`quick_test.py` 分析完毕会自动启动 web.py 并打开报告页（`config.py` 中 `WEB_AUTOSTART=False` 关闭；批量模式不自动启动）。
+注意：`run.py` 分析完毕会自动启动 web.py 并打开报告页；`quick_test.py` 将采样画像独立导出至 `data/quick_reports/`（HTML/JSON/CSV）并打开采样 HTML（`config.py` 中 `WEB_AUTOSTART=False` 关闭；批量模式不自动启动）。
 
 首次运行会提示用 B站 APP 扫码登录；Cookie 自动保存到 `data/cookie.json` 并复用。
 
@@ -60,17 +60,17 @@ src/
 ├── uid_resolver.py      # mid_hash 破解：评论/充电名单/互动弹幕/视频元信息（main.build_video_meta_uid_map）/全局库交叉验证 + MITM 反查碰撞消歧
 ├── crc_rainbow.py       # MITM 中间相遇 CRC32 反查（10万条内存小表，覆盖全部 ≤10 位 UID；惰性建表加双检锁线程安全，预计算 adv5 表，约 49ms/hash）
 ├── spam_detector.py     # 刷屏检测：只标记风险等级（高/中/低），绝不删除弹幕数据；四规则组合计分（最高分+每多触发一条加成 SPAM_COMBO_BONUS）、高频爆发按滑动窗口口径、全池 P95 相对离群补强、群体复读事件检测（detect_repeat_events：同内容 60s 窗内 ≥5 人 ≥8 条的接龙/队列，全视频维度；**双时间轴**——视频内时间轴按分P 分别开窗（接龙发生在同一画面，观众可横跨数月，是主形态），发送时间轴抓真实时间短窗集中刷屏，两轴各自达标才写进结果；内容先按 `_content_key` 归一化合并写法变体——全半角/空白/首尾标点/连续重复字符（？？？→？、666→6、哈哈哈→哈，非 ASCII 字母才折叠以免 good→god），变体并入同一事件后人数取并集、条数求和，事件带 variants/variant_count 供 tooltip）、分布自检（P50/P90/P95 供阈值校准）
-├── cringe_detector.py   # LLM 问题弹幕检测（八类判定+发送者聚合+llm_cache缓存，key 带口径版本号 v4，批次响应先解析校验成功才落缓存）+ 问题评论检测（同口径，按内容缓存判定、回映 rpid 回写 comments.problem，未配置 LLM_API_KEY 自动跳过；致命 4xx 直接上抛由 phase 层降级，瞬态错误同厂商短退避，整轮重试 LLM_RETRY_BUDGET_SECONDS=1800s 熔断）
+├── cringe_detector.py   # LLM 问题弹幕检测（八类判定+发送者聚合+llm_cache缓存，key 带口径版本号 v5，批次响应先解析校验成功才落缓存）+ 问题评论检测（同口径，按内容缓存判定、回映 rpid 回写 comments.problem，未配置 LLM_API_KEY 自动跳过；致命 4xx 直接上抛由 phase 层降级，瞬态错误同厂商短退避，整轮重试 LLM_RETRY_BUDGET_SECONDS=1800s 熔断）
 ├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等；采集全程走账号×IP 组合池（combo_pool，鸭子类型透明接管：多号并行分片（每账号一子池、限速按号独立、线程↔分片绑定、吞吐≈账号数倍）、风控换号+切节点重试，冷却锁外等待，IP 池故障自动降级直连并定时重探恢复）；单用户日志行缓冲、完成时原子输出，多线程不交错）
 ├── profile_analyzer.py  # 规则式画像分析与标签生成
-├── llm_analyzer.py      # LLMAnalyzer：重点深掘（兴趣分 top K 单人单调用+llm_cache缓存，OpenAI client 初始化时复用、单次调用超时 LLM_DEEP_TIMEOUT=120s；结果注入 profile 并由阶段7回写 users.profile_json（web 报告读库展示，不落库则报告页不可见）；全员粗筛已砍，未配置 Key 自动跳过）
+├── llm_analyzer.py      # LLMAnalyzer：重点深掘（兴趣分 top K 单人单调用+llm_cache缓存，OpenAI client 初始化时复用、单次调用超时 LLM_DEEP_TIMEOUT=120s；结果注入 profile 并由阶段7回写 video_profiles（bvid+uid 隔离）（web 报告读库展示，不落库则报告页不可见）；全员粗筛已砍，未配置 Key 自动跳过）
 ├── up_analyzer.py       # UP 主词云懒加载（fetch_up_wordcloud：单请求+immediate 免限速轻量路径；采集阶段只存全部关注名单，被关注 UP 主的投稿词云在悬停 chip 时经 /api/up/<uid>/wordcloud 懒加载，`up:{uid}` 缓存；web 启动时后台热身鉴权威胁，前端视口内 chip 慢速队列预热+在途去重）
 ├── report.py            # 报告渲染函数库（用户卡片/问题弹幕榜/图表统计/基础CSS，被 web.py 复用）
 ├── exporter.py          # CSV/JSON 数据导出（report_{BV号}_{时间} 前缀，Web 报告页提供下载链接）
 └── storage.py           # SQLite 持久化（data/profiler.db，get_db 统一 WAL + busy_timeout=10000 + synchronous=NORMAL），支撑断点续采与 LLM 结果缓存（llm_cache 表、danmaku 全量弹幕表（含 mode/color/pool/dmid/page 属性列）、comments 评论表（含 uname 昵称、parent_rpid 回复树、problem 问题标注、location IP属地）、false_positive 误报标记表（kind: dm=弹幕内容/cmt=评论rpid/spam=发送者mid_hash，展示层扣除聚合）、phase_state 阶段检查点表（弹幕历史 last_date/fetched_dates/failed_dates/truncated、评论游标，中断续采））
 ```
 
-数据流：`run.py` → `main.run_analysis(bvid, force, max_users)`，全阶段断点续采（任意位置 Ctrl+C/崩溃后重跑可续）：弹幕逐日增量落库+phase_state 检查点（danmaku 表 last_date/fetched_dates/failed_dates/truncated/done，历史快照中断后逐日续采、失败日记账优先补采；多分P 视频逐分P 各一套检查点（分P 1 原键名、其余 :pN），各P 独立续采互不影响；月份/日期降序遍历、上限耗尽保留最新日期；done=1 后重跑仍滚动补采最近 HISTORY_RECENT_REFRESH_DAYS=3 天，dmid 幂等去重；仅时间窗完整无失败才写 done）、评论逐页落库+游标检查点（comments 表 mode/page/offset/done/truncated，wbi/legacy 双路径续页，模式切换页码归零、截断不写 done；done=1 后重跑按时间序增量刷新新评论，上限 COMMENT_REFRESH_MAX_PAGES=10 页）、LLM 判定批次级缓存（llm_cache 批次 key=稳定前缀`cringe:{bvid}:版本`/`cmt:{bvid}:版本`@batch:模型:内容指纹，先解析校验成功才落缓存、坏响应进重试链，已完成批次重跑零调用）、senders 逐条落库、users 每人落库；非 --force 重跑时各阶段按库内数据存在性独立跳过（完整判据：done=1 或本功能前的旧版完整落库），`--force` 清除该视频全部缓存与检查点强制重采（llm_cache 中仅清该视频的问题弹幕/问题评论判定缓存 `cringe:{bvid}:*` 与 `cmt:{bvid}:*`，深掘缓存 `deep:{uid}:*` 跨视频复用、保留）。全局映射库 `global_uid_map` 跨视频沉淀可靠 mid_hash→UID 映射（仅评论/充电/互动/元信息等明文来源可沉淀，纯 CRC32 破解结果不沉淀防误归因跨视频放大；冲突覆盖按来源优先级，明文>破解），解析率随使用次数累积提升。
+数据流：`run.py` → `main.run_analysis(bvid, force, max_users)`，全阶段断点续采（任意位置 Ctrl+C/崩溃后重跑可续）：弹幕逐日增量落库+phase_state 检查点（danmaku 表 last_date/fetched_dates/failed_dates/truncated/done，历史快照中断后逐日续采、失败日记账优先补采；多分P 视频逐分P 各一套检查点（分P 1 原键名、其余 :pN），各P 独立续采互不影响；月份/日期降序遍历、上限耗尽保留最新日期；done=1 后重跑仍滚动补采最近 HISTORY_RECENT_REFRESH_DAYS=3 天，dmid 幂等去重；仅时间窗完整无失败才写 done）、评论逐页落库+游标检查点（comments 表 mode/page/offset/done/truncated，wbi/legacy 双路径续页，模式切换页码归零、截断不写 done；done=1 后重跑按时间序增量刷新新评论，上限 COMMENT_REFRESH_MAX_PAGES=10 页）、LLM 判定批次级缓存（llm_cache 批次 key=稳定前缀`cringe:{bvid}:版本`/`cmt:{bvid}:版本`@batch:v2:模型:内容指纹（缓存批内下标，命中后平移），先解析校验成功才落缓存、坏响应进重试链，已完成批次重跑零调用）、senders 逐条落库、users 每人落库；非 --force 重跑时各阶段按库内数据存在性独立跳过（完整判据：done=1 或本功能前的旧版完整落库），`--force` 清除该视频全部缓存与检查点强制重采（llm_cache 中仅清该视频的问题弹幕/问题评论判定缓存 `cringe:{bvid}:*` 与 `cmt:{bvid}:*`，深掘缓存 `deep:{uid}:*` 跨视频复用、保留）。全局映射库 `global_uid_map` 跨视频沉淀可靠 mid_hash→UID 映射（仅评论/充电/互动/元信息等明文来源可沉淀，纯 CRC32 破解结果不沉淀防误归因跨视频放大；冲突覆盖按来源优先级，明文>破解），解析率随使用次数累积提升。
 
 ## 开发约定
 
@@ -85,7 +85,7 @@ src/
 项目**没有单元测试框架**（无 pytest/unittest 目录）。改动后按"从便宜到贵"三层验证：
 
 ```bash
-# 1) 离线回归（94 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
+# 1) 离线回归（158 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
 python tests/run_all.py            # 主回归 + 评论路径 + 弹幕/评论判定聚合 + 多分P 口径（密度轴/历史采集/样本标注）
 python tests/run_all.py --lint     # 附带 pyflakes（需 pip install pyflakes）
 
@@ -104,3 +104,6 @@ python quick_test.py [BV号] [--top N]
 - LLM 配置走环境变量覆盖：`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` / `LLM_MAX_TOKENS`，优先用环境变量而非改 `config.py` 里的硬编码 Key。三厂商（`LLM_PROVIDER` 选主用：默认 `deepseek`、`glm` 智谱（`GLM_API_KEY` / `GLM_BASE_URL` / `GLM_MODEL`，免费档限流激进、判定偏触发快乐，末位兜底；5.x 恒思考勿用）、`mimo` 小米 MiMo（`MIMO_*`，默认 mimo-v2.5）；备用厂商按 mimo→glm→deepseek 序自动取下一个 key 非空的），llm_cache key 含模型名，各厂商缓存互不污染可 A/B 对比；**判定批次（问题弹幕/问题评论共用 _judge_batches）按厂商自动关闭/压低思考**（deepseek 与 GLM-4.x 用 thinking:disabled、GLM-5.x 恒思考压 low，推理 token 不计费且不占 max_tokens 预算），深掘保留默认思考档；判定批次失败会自动换备用厂商（`LLM_FALLBACK`）兜底重试；仍失败则整轮等待重试（60s×轮次递增、封顶 300s，总耗时超 LLM_RETRY_BUDGET_SECONDS=1800s 熔断放弃剩余批次并告警；认证失败/模型不存在等致命 4xx 直接报错降级，厂商内容审核拦截（如 GLM 1301）按批次跳过不中止整轮，不死循环）。
 - Cookie 等于账号登录态，泄露即等于账号被盗，处理 `data/` 目录文件时保持谨慎。
 - 机场订阅链接（config.py SUB_URLS / 环境变量）与 data/mihomo_runtime/config.yaml 含凭证，均不入库、不打印（mihomo stop 时自动删除该文件）；内置核心二进制在 data/ 或 vendor/（gitignore），自动下载强制官方 SHA256 校验。注意 config.py 中既有明文 Key 建议尽快轮换并改用环境变量注入。
+## 画像存储与纠偏
+
+`users` 仅共享基础采集缓存；报告画像从 `video_profiles(bvid, uid)` 读取，写画像和深掘结果必须传入所属 bvid。`data_revision` 的触发器修订号负责外部写入后的页面缓存失效。旧的多视频共享画像读取时由本视频证据重建，不传播归属不明的 AI 文本。评论页数据和游标经 `save_comments(..., checkpoint=...)` 原子提交；LLM 评论结果携带 `judged_rpids`，只替换成功范围，失败和截断范围保留。`comments.problem_severity` 持久化严重度，误报扣除后的评论风险及屏蔽导出以本视频评论表为准。历史月份失败使用 `failed_months` 持久化，重试时先将待补日期挂入 `failed_dates` 再清月份标记。

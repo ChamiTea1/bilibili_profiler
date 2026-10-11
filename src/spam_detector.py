@@ -387,7 +387,7 @@ def _content_key(content: str) -> str:
     return _REPEAT_RUN_RE.sub(r"\1", s).lower()
 
 
-def _peak_window(items: list[tuple[float, str]], window_seconds: int) -> tuple:
+def _peak_window(items: list[tuple[float, str]], window_seconds: int, min_senders: int = 0, min_total: int = 0) -> tuple:
     """滑动窗口求峰值，返回 (不同发送者数, 窗口内条数, 窗口起, 窗口止)。
 
     items: [(时间, mid_hash)]（内部自行排序；窗口为 [t, t+window_seconds] 闭区间口径）"""
@@ -405,7 +405,8 @@ def _peak_window(items: list[tuple[float, str]], window_seconds: int) -> tuple:
             if senders[mh_l] <= 0:
                 del senders[mh_l]
             left += 1
-        if (len(senders), right - left + 1) > (best[0], best[1]):
+        if (len(senders) >= min_senders and right - left + 1 >= min_total
+                and (len(senders), right - left + 1) > (best[0], best[1])):
             best = (len(senders), right - left + 1, items[left][0], t_r)
     return best
 
@@ -459,7 +460,7 @@ def detect_repeat_events(rows: list[dict],
         try:
             send_peak = _peak_window(
                 [(float(r.get("timestamp") or 0), r.get("mid_hash") or "") for r in items
-                 if r.get("timestamp")], window_seconds)
+                 if r.get("timestamp")], window_seconds, min_senders, min_total)
         except (TypeError, ValueError):
             pass
         # 2) 视频内时间轴：按分P 分别求峰，取各分P 中最强的一处
@@ -472,7 +473,7 @@ def detect_repeat_events(rows: list[dict],
             except (TypeError, ValueError):
                 continue
         for pg, its in by_page.items():
-            peak = _peak_window(its, window_seconds)
+            peak = _peak_window(its, window_seconds, min_senders, min_total)
             if video is None or (peak[0], peak[1]) > (video[0][0], video[0][1]):
                 video = (peak, pg)
         video_ok = video is not None and _ok(video[0])

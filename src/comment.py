@@ -196,6 +196,7 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
     # 只有"整页无新 rpid"才是真的重复页。续采时从库重建（此前运行已落库的评论也算
     # "见过"），否则续采首页无法识别为重复页、子评论也会被重复补采
     seen_rpids = set()
+    seen_this_run = set()
     if bvid and (resume_offset or resume_page):
         with closing(get_db()) as conn:
             seen_rpids = {row["rpid"] for row in conn.execute(
@@ -236,13 +237,15 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
         if not replies:
             break
 
-        # 真重复页检测：整页 rpid 都已见过才终止（next_offset 重复不代表内容重复，实测确认）；
+        # 本轮重复页终止；数据库已有页可能是旧版中断重放，仍须继续推进游标。
         # rpid 缺失的脏行回退 r.get("id")，仍无则视为新行——否则多条缺 rpid 的行会
         # 在 seen_rpids 里塌缩成同一个 None 而被误判成"真重复页"提前终止翻页
         new_replies = [r for r in replies if _rpid_of(r) not in seen_rpids]
-        if not new_replies:
-            print(f"[Comment] wbi/main 第{page}页无新评论（真重复页），终止翻页")
+        if not new_replies and all(_rpid_of(r) in seen_this_run for r in replies):
+            print(f"[Comment] wbi/main 第{page}页重复本轮已采页面，终止翻页")
+            natural_end = False
             break
+        seen_this_run.update(x for x in (_rpid_of(r) for r in replies) if x)
         seen_rpids.update(x for x in (_rpid_of(r) for r in new_replies) if x)
 
         # 翻页：cursor.pagination_reply.next_offset 为不透明游标字符串，is_end 终止
@@ -253,10 +256,9 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
         all_comments.extend(page_comments)
         if bvid:
             # 整页采完（含子评论补采）才落库+推进检查点：页内中断重跑会整页重采（UNIQUE 去重兜底）
-            save_comments(bvid, page_comments)
-            set_phase_state(bvid, "comment", "mode", "wbi")
-            set_phase_state(bvid, "comment", "page", str(page))
-            set_phase_state(bvid, "comment", "offset", next_offset or offset)
+            save_comments(bvid, page_comments, checkpoint={"mode": "wbi", "page": page,
+                "offset": next_offset or offset, "done": "1" if cursor.get("is_end", False) or not next_offset else "0",
+                "truncated": "0"})
         print(f"[Comment] 第 {page}/{max_pages} 页: +{len(new_replies)} 条主评论（累计 {len(all_comments)} 条含子评论）")
 
         if cursor.get("is_end", False) or not next_offset:
@@ -324,10 +326,9 @@ def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int,
         cursor = page_data.get("cursor") or {}
         next_page = cursor.get("next", 0)
         if bvid:
-            save_comments(bvid, page_comments)
-            set_phase_state(bvid, "comment", "mode", "legacy")
-            set_phase_state(bvid, "comment", "page", str(page))
-            set_phase_state(bvid, "comment", "offset", str(next_page))
+            save_comments(bvid, page_comments, checkpoint={"mode": "legacy", "page": page,
+                "offset": next_page, "done": "1" if cursor.get("is_end", False) or not next_page else "0",
+                "truncated": "0"})
         print(f"[Comment] 旧接口第 {page}/{max_pages} 页: +{len(replies)} 条主评论（累计 {len(all_comments)} 条含子评论）")
 
         if cursor.get("is_end", False) or not next_page:
@@ -356,8 +357,8 @@ def refresh_comments(oid: int, client: BiliAPIClient, bvid: str,
 
     主采集按热度序（mode=3），新评论在热度序里位置不定，无法判定增量边界；
     故刷新改用时间倒序（mode=2）从最新往回翻，整页都是已入库 rpid 即停。
-    新主评论照常补采子评论；已见主评论轻量回写（ON CONFLICT 更新
-    like/reply_count/uname/location，顺带刷新旧评论热度，不重复补采子评论）。
+    新主评论照常补采子评论；已见主楼保存新预览，有回复缺口时补采，
+    同时回写 like/reply_count/uname/location，刷新旧评论热度。
     任何失败只告警、保留已刷新部分；不写任何检查点（done 保持 1）。
     返回本轮新增主评论数。"""
     with closing(get_db()) as conn:
@@ -393,8 +394,22 @@ def refresh_comments(oid: int, client: BiliAPIClient, bvid: str,
                 save_comments(bvid, page_comments)
                 seen_rpids.update(x for x in (_rpid_of(r) for r in new_replies) if x)
                 new_total += len(new_replies)
-            # 已见主评论轻量回写：刷新 like/reply_count 等（高回复榜热度不再停在首采快照）
-            stale = [c for c in (_parse_comment(r, is_sub=False) for r in stale_src) if c]
+            with closing(get_db()) as conn:
+                sub_counts = {r["root_rpid"]: r["n"] for r in conn.execute(
+                    "SELECT root_rpid, COUNT(*) AS n FROM comments WHERE bvid=? AND is_sub=1 GROUP BY root_rpid",
+                    (bvid,))}
+            growing = [r for r in stale_src if int(r.get("rcount") or 0) > sub_counts.get(_rpid_of(r), 0)]
+            steady = [r for r in stale_src if r not in growing]
+            stale = _collect_page(growing, oid, client, executor=ex) if growing else []
+            for r in steady:
+                c = _parse_comment(r, is_sub=False)
+                if c:
+                    stale.append(c)
+                for sub in r.get("replies") or []:
+                    c = _parse_comment(sub, is_sub=True)
+                    if c:
+                        c["root_rpid"] = _rpid_of(r)
+                        stale.append(c)
             if stale:
                 save_comments(bvid, stale)
             print(f"[Comment] 增量刷新第 {page}/{max_pages} 页: +{len(new_replies)} 条新主评论")

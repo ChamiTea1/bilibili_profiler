@@ -913,7 +913,7 @@ function loadDanmaku() {
                 // uid 只接受整数（服务端已归一为 int）：非整数一律不渲染跳转链接，
                 // 避免被污染的值突破内联 JS 上下文（纵深防御）
                 const uidNum = Number(row.uid);
-                const sender = Number.isInteger(uidNum)
+                const sender = row.uid != null && row.uid !== "" && Number.isInteger(uidNum) && uidNum > 0
                     ? '<a onclick="gotoUser(' + uidNum + ')">' + escHtml(row.name || uidNum) + '</a><br><span class="dm-time">UID:' + uidNum + '</span>'
                     : (row.name
                         // 遮蔽态（uid 被服务端遮蔽为非整数字符串）：不渲染跳转链接，但遮蔽昵称 row.name 仍展示（过 escHtml，防御不放松）

@@ -360,7 +360,7 @@ class BiliAPIClient:
                 else:
                     return {"code": -1, "message": f"请求异常: {e}"}
             except requests.HTTPError as e:
-                status = e.response.status_code if e.response else 0
+                status = e.response.status_code if e.response is not None else 0
                 if status == 412:
                     self._penalize_throttle("触发风控HTTP412")
                     if self.raise_on_risk:
@@ -441,7 +441,7 @@ class BiliAPIClient:
                 else:
                     return {"code": -1, "message": f"请求异常: {e}"}
             except requests.HTTPError as e:
-                status = e.response.status_code if e.response else 0
+                status = e.response.status_code if e.response is not None else 0
                 if status == 412:
                     self._penalize_throttle("触发风控HTTP412(post)")
                     if self.raise_on_risk:

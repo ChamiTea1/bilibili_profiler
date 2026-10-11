@@ -25,15 +25,15 @@ from openai import OpenAI
 from config import (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, LLM_CONCURRENCY,
                     LLM_FALLBACK, CRINGE_BATCH_SIZE, COMMENT_CRINGE_BATCH_SIZE,
                     COMMENT_CRINGE_MAX_ITEMS, LLM_RETRY_BUDGET_SECONDS,
-                    LLM_TRANSIENT_RETRIES, LLM_BATCH_THINKING)
+                    LLM_TRANSIENT_RETRIES, LLM_BATCH_THINKING, LLM_DEEP_TIMEOUT)
 from storage import load_llm_cache, save_llm_cache
 
 # 问题弹幕类别（prompt 与聚合均引用，勿散落硬编码字符串）
 PROBLEM_CATEGORIES = ["中二抒情", "尬夸捧杀", "引战阴阳", "人身攻击", "恶意剧透", "广告引流", "键政敏感", "批评吐槽"]
 
 # 判定缓存口径版本号：判定口径或缓存结构变更时 bump，旧缓存自动失效（旧孤儿键不清理）
-_DM_CACHE_VERSION = "v4"    # 问题弹幕（v4：批次缓存 key 改稳定前缀，不再嵌整段 digest）
-_CMT_CACHE_VERSION = "v4"   # 问题评论（v4：整段缓存值由 {rpid:verdict} 改 {content:verdict}，修复续采新增同内容评论漏标）
+_DM_CACHE_VERSION = "v5"    # 批内下标缓存；整段指纹覆盖发送者归属
+_CMT_CACHE_VERSION = "v5"   # 批内下标缓存；回写附带成功判定范围
 _PEAK_CACHE_VERSION = "v1"  # 弹幕高能点标注（密度时间轴峰值时段的爆发原因）
 
 # 高能点爆发原因类别（web 密度时间轴峰值标注；prompt 与校验共用）
@@ -146,6 +146,19 @@ def _parse_verdicts(raw_text: str) -> list[dict] | None:
     return [v for v in data if isinstance(v, dict) and "i" in v]
 
 
+class BatchVerdicts(list):
+    """附带成功覆盖范围，成功空批次与请求失败可明确区分。"""
+    def __init__(self, values, judged_indices):
+        super().__init__(values)
+        self.judged_indices = set(judged_indices)
+
+
+class CommentVerdicts(dict):
+    def __init__(self, values=(), judged_rpids=()):
+        super().__init__(values)
+        self.judged_rpids = set(judged_rpids)
+
+
 def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                    prompt_builder, label: str, cache_prefix: str = "") -> tuple[list[dict], int, int]:
     """并发执行 LLM 判定批次，返回 (原始verdicts, 失败批次数, 总批次数)。
@@ -176,7 +189,7 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
             with clients_lock:              # 双检：并发首用时只建一个 client
                 if pi not in clients:
                     key, base, _, _ = providers[pi]
-                    clients[pi] = OpenAI(api_key=key, base_url=base)
+                    clients[pi] = OpenAI(api_key=key, base_url=base, max_retries=0)
         return clients[pi]
 
     batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
@@ -192,18 +205,18 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
         if remaining <= 0:
             return False
         time.sleep(min(sec, remaining))
-        return True
+        return time.monotonic() < deadline
 
     # 注意：key 固定嵌主用厂商的 LLM_MODEL——备用厂商兜底产出的判定也会存进该命名空间
     # （跨厂商略有混样，换取中断重跑时的缓存命中率；判定口径以内容为准，与厂商基本无关，可接受）
-    # 指纹必须保序（不 sorted）：缓存负载是顺序敏感的全局下标（bi*batch_size+批内位置），
+    # 指纹必须保序（不 sorted）：缓存负载使用批内下标，读回时平移到当前全局位置，
     # 若指纹做成顺序无关的内容集合，条目在批次窗口内重排（弹幕次数/评论点赞漂移会改变
     # 批内排序）而集合不变时，旧缓存的判定会按下标静默错标到另一条内容上（张冠李戴），
     # 且 failed==0 时错标结果还会以"新结果"身份固化进整段缓存。
     def batch_cache_key(bi: int) -> str:
-        digest = hashlib.sha256("\n".join(
-            it["content"] for it in batches[bi]).encode("utf-8")).hexdigest()[:16]
-        return f"{cache_prefix}@batch:{LLM_MODEL}:{digest}"
+        digest = hashlib.sha256(json.dumps([it["content"] for it in batches[bi]],
+            ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+        return f"{cache_prefix}@batch:v2:{LLM_MODEL}:{digest}"
 
     def work(bi: int) -> str:
         bkey = batch_cache_key(bi) if cache_prefix else ""
@@ -212,7 +225,10 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
             if cached:      # None 与空串均视为未命中
                 if _parse_verdicts(cached) is not None:
                     print(f"[{label}] 批次 {bi + 1} 命中批次缓存，跳过 LLM 请求")
-                    return cached
+                    local = _parse_verdicts(cached)
+                    return json.dumps([dict(v, i=v["i"] + bi * batch_size) for v in local
+                        if isinstance(v["i"], int) and not isinstance(v["i"], bool)
+                        and 0 <= v["i"] < len(batches[bi])], ensure_ascii=False)
                 print(f"[{label}] 批次 {bi + 1} 缓存内容损坏（无法解析），重新判定")
         prompt = prompt_builder(batches[bi], bi * batch_size, video_info)
         last_err = None
@@ -224,9 +240,13 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
             transient_retries = 0
             for retry in range(3):      # 限速退避：429 时等一会再试，最多 2 次重试
                 try:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise _BudgetExhausted("调用前预算已耗尽")
                     extra = _batch_thinking_extra(providers[pi][1], model)
                     resp = client_of(pi).chat.completions.create(
                         model=model,
+                        timeout=min(LLM_DEEP_TIMEOUT, remaining),
                         messages=[{"role": "user", "content": prompt}],
                         max_tokens=LLM_MAX_TOKENS,
                         temperature=0.3,  # 判定类任务低温，减少格式漂移
@@ -238,8 +258,14 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
                         raise _UnparseableResponse(
                             f"响应无法解析为 JSON 数组（前100字符: {raw[:100]!r}）")
                     if bkey:
-                        save_llm_cache(bkey, raw)
+                        lo = bi * batch_size
+                        local = [dict(v, i=v["i"] - lo) for v in _parse_verdicts(raw)
+                                 if isinstance(v["i"], int) and not isinstance(v["i"], bool)
+                                 and lo <= v["i"] < lo + len(batches[bi])]
+                        save_llm_cache(bkey, json.dumps(local, ensure_ascii=False))
                     return raw
+                except _BudgetExhausted:
+                    raise
                 except openai.RateLimitError as e:
                     last_err = e
                     if retry == 2:
@@ -346,7 +372,8 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
         pending = run_pass(pending)
         round_no += 1
     flat_verdicts = [v for bi in sorted(verdicts) for v in verdicts[bi]]
-    return flat_verdicts, len(pending) + len(final_failed), total
+    covered = [i for bi in verdicts for i in range(bi * batch_size, bi * batch_size + len(batches[bi]))]
+    return BatchVerdicts(flat_verdicts, covered), len(pending) + len(final_failed), total
 
 
 def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dict],
@@ -379,7 +406,8 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
         # 确定性排序：同内容集合无论输入次序都产生相同 digest（count 降序 + 内容字典序决胜）
         hash_items = sorted(items, key=lambda x: (-x["count"], x["content"]))
         digest = hashlib.sha256(
-            json.dumps(hash_items, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            json.dumps([hash_items, {h: sorted(g.get("contents", [])) for h, g in sender_groups.items()}],
+                       ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
         cache_key = f"cringe:{bvid}:{_DM_CACHE_VERSION}:{LLM_MODEL}:{digest}"
         cached = load_llm_cache(cache_key)
@@ -490,9 +518,9 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
     """
     if not LLM_API_KEY:
         print("[问题评论] 未配置 LLM_API_KEY，跳过问题评论检测")
-        return {}
+        return CommentVerdicts()
     if not comments:
-        return {}
+        return CommentVerdicts()
 
     # 按内容去重（刷屏复制粘贴的评论只判定一次），内容 → rpid 集合用于回映
     content_rpids: dict[str, list[int]] = {}
@@ -515,7 +543,7 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
     # 失效；纯字典序让批次组成与点赞漂移解耦（只有截断边界变化才改变批次集合）
     items.sort(key=lambda x: x["content"])
     if not items:
-        return {}
+        return CommentVerdicts()
 
     # 判定结果缓存：同一视频去重内容集合未变 → 直接复用（重跑零 LLM 调用）
     bvid = video_info.get("bvid", "")
@@ -538,7 +566,8 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
                     for rpid in content_rpids.get(content, []):
                         results[rpid] = verdict
                 print(f"[问题评论] 缓存命中（{len(content_verdicts)} 条问题内容，回标 {len(results)} 条评论），跳过 LLM 判定")
-                return results
+                return CommentVerdicts(results, [rpid for it in items
+                    for rpid in content_rpids[it["content"]]])
             except (json.JSONDecodeError, ValueError, TypeError):
                 print("[问题评论] 警告: 缓存内容损坏，重新判定")
 
@@ -571,7 +600,10 @@ def detect_problem_comments(comments: list[dict], video_info: dict) -> dict[int,
             print(f"[问题评论] 警告: {failed}/{total} 批失败，结果不完整，不写整段缓存（重跑可补齐）")
 
     print(f"[问题评论] 检测完成: {len(results)} 条问题评论")
-    return results
+    covered = getattr(raw_verdicts, "judged_indices", range(len(items)) if failed == 0 else
+                      {v["i"] for v in raw_verdicts if isinstance(v.get("i"), int)})
+    return CommentVerdicts(results, [rpid for i in covered if 0 <= i < len(items)
+                                    for rpid in content_rpids[items[i]["content"]]])
 
 
 # ========== 弹幕高能点标注（web 密度时间轴峰值时段的爆发原因） ==========

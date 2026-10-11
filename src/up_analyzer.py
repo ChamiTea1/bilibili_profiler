@@ -23,13 +23,15 @@ def fetch_up_wordcloud(uid: int, client: BiliAPIClient) -> dict:
     immediate 交互式免限速通道（悬停是单次交互，不属批量采集）——
     对比旧的名片+投稿双请求路径，出词延迟从「2 次限速+2 次网络」降到 1 次网络。
     UP 主昵称从投稿列表响应顺带取（vlist[0].author），名片接口不再调。
-    返回 {"name": str, "word_freq": {词: 次}}；失败返回空词频。"""
+    返回 {"name": str, "word_freq": {词: 次}}；失败抛出异常，由调用方降级且不缓存。"""
     result = {"name": "", "word_freq": {}}
     try:
         data = client.get(USER_VIDEOS_LEGACY_URL, params={
             "mid": uid, "ps": 50, "pn": 1,
             "order": "pubdate", "order_avoided": "true",
         }, immediate=True)
+        if data.get("code") != 0:
+            raise RuntimeError(f"投稿接口失败，错误码 {data.get('code')}")
         if data.get("code") == 0:
             vlist = data["data"]["list"]["vlist"]
             if vlist:
@@ -41,4 +43,5 @@ def fetch_up_wordcloud(uid: int, client: BiliAPIClient) -> dict:
             result["word_freq"] = wf
     except Exception as e:
         print(f"  [UP] 警告: 词云轻量采集异常（UID:{uid}）: {e}")
+        raise
     return result

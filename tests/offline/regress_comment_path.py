@@ -65,7 +65,7 @@ out3 = C._fetch_comments_wbi(1, c3, 100, bvid="BVC3")
 kv3 = {r["key"]: r["value"] for r in storage.get_db().execute(
     "SELECT key, value FROM phase_state WHERE bvid='BVC3' AND phase='comment'")}
 check("中途异常保留第 1 页", len(out3) == 1, "(得到 %d 条)" % len(out3))
-check("未写 done（可续采）", kv3.get("done") is None, "done=%s" % kv3.get("done"))
+check("未写 done（可续采）", kv3.get("done") != "1", "done=%s" % kv3.get("done"))
 
 print("=== 4. fetch_comments 端到端：wbi 首页失败自动降级 legacy ===")
 class FallbackClient:
