@@ -23,6 +23,10 @@ from config import PROXY_NODE_DEAD_TTL
 _SESSION = requests.Session()
 _SESSION.trust_env = False
 
+# 同一核心的不同账号选择组共享控制锁和死名单，故障信息不会在分片间丢失。
+_STATES = {}
+_STATES_LOCK = threading.Lock()
+
 # 组内伪节点/内置策略名，不进入轮换
 _PSEUDO = {"DIRECT", "REJECT", "PASS", "GLOBAL", "COMPATIBLE"}
 
@@ -58,8 +62,10 @@ class ClashCtl:
         self.group = group          # 为空时首次读组自动挑选第一个非 GLOBAL 的 Selector 组
         self._nodes: list[str] = []
         self._region_cursor: dict[str, int] = {}   # 各地区内部轮换位置
-        self._dead: dict[str, tuple[float, bool]] = {}   # 死名单：节点名 → (截止时刻, 是否手动标记)
-        self._lock = threading.Lock()   # 节点轮换串行化：多号并行分片共享同一控制器
+        with _STATES_LOCK:
+            state = _STATES.setdefault((self.api_url, secret),
+                                       (threading.RLock(), {}))
+        self._lock, self._dead = state
 
     def mark_dead(self, name: str, ttl: float = PROXY_NODE_DEAD_TTL):
         """手动标记节点为死（代理故障时由组合池即时上报，不等下一轮健康检查）。
@@ -110,6 +116,10 @@ class ClashCtl:
     def _fetch_group(self) -> dict:
         """读节点组信息；group 为空时自动挑选第一个非 GLOBAL、含节点的 Selector 组。
         返回 {"name", "all", "now"}；请求异常向上抛（由调用方静默降级）。"""
+        with self._lock:
+            return self._fetch_group_locked()
+
+    def _fetch_group_locked(self) -> dict:
         r = _SESSION.get(f"{self.api_url}/proxies", headers=self._headers(), timeout=5)
         r.raise_for_status()
         body = r.json()
@@ -118,8 +128,7 @@ class ClashCtl:
         proxies = body.get("proxies") if isinstance(body, dict) else None
         if not isinstance(proxies, dict):
             return {"name": "", "all": [], "now": ""}
-        # 顺带消费健康检查结果更新死名单（本方法可能被锁内/锁外调用，
-        # _dead 只做 setdefault/pop 的 GIL 原子操作，不重复取锁防死锁）
+        # 同核心共享 RLock，健康检查和手动故障上报不会相互覆盖。
         self._update_dead_from_history(proxies)
         if self.group:
             g = proxies.get(self.group)
@@ -137,8 +146,11 @@ class ClashCtl:
     def list_nodes(self) -> list[str]:
         """组内可轮换节点（过滤伪节点 + 死节点名单）；失败返回 []。
 
-        死节点全灭时回退返回未过滤列表（健康检查/手动标记都可能误判，
-        宁可轮换到死节点浪费一次请求，也不提前放弃整个 IP 池）"""
+        死节点全灭时返回空列表，待 TTL 到期后再探测，避免重复撞同一批坏出口。"""
+        with self._lock:
+            return self._list_nodes_locked()
+
+    def _list_nodes_locked(self) -> list[str]:
         try:
             g = self._fetch_group()
         except requests.RequestException:
@@ -148,7 +160,7 @@ class ClashCtl:
         if 0 < len(filtered) < len(alive):
             print(f"[Clash] 节点池 {len(alive)} 个，剔除当前不通 {len(alive) - len(filtered)} 个"
                   f"（健康检查/故障上报，TTL {PROXY_NODE_DEAD_TTL}s 后允许复活）")
-        return filtered or alive
+        return filtered
 
     def refresh_nodes(self) -> list[str]:
         """刷新并缓存节点列表"""
@@ -162,13 +174,13 @@ class ClashCtl:
         except requests.RequestException:
             return None
 
-    def pick_next_node(self) -> str | None:
+    def pick_next_node(self, exclude=()) -> str | None:
         """组内轮换推进，**跨地区跳跃**：同机场同地区节点常共享出口 IP，
         顺序轮换等于白换，故优先切到不同地区的节点（地区内再轮询）。
         节点为空、或单节点组（唯一节点即当前节点）无节点可换时返回 None"""
         with self._lock:
-            if not self._nodes:
-                self.refresh_nodes()
+            # 每次重新消费健康检查和手动死名单；缓存仅用于展示，不决定存活状态。
+            self.refresh_nodes()
             if not self._nodes:
                 return None
             cur = self.current_node()
@@ -183,13 +195,30 @@ class ClashCtl:
             else:
                 ordered = regions
             for region in ordered:
-                candidates = [n for n in self._nodes if _region_of(n) == region and n != cur]
+                candidates = [n for n in self._nodes
+                              if _region_of(n) == region and n != cur and n not in exclude]
                 if not candidates:
                     continue
                 pos = self._region_cursor.get(region, 0) % len(candidates)
                 self._region_cursor[region] = pos + 1
                 return candidates[pos]
             return None
+
+    def rotate_node(self, exclude=()) -> str | None:
+        """选节点与提交选择放在同一控制锁内，失败不报告已切换。"""
+        with self._lock:
+            nxt = self.pick_next_node(exclude=exclude)
+            return nxt if nxt and self.switch_node(nxt) else None
+
+    def reload_config(self, path: str) -> bool:
+        """仅供本项目内置核心添加账号入口；外部核心不调用此接口。"""
+        try:
+            with self._lock:
+                r = _SESSION.put(f"{self.api_url}/configs", headers=self._headers(),
+                                 json={"path": path, "force": True}, timeout=10)
+                return r.status_code in (200, 204)
+        except requests.RequestException:
+            return False
 
     def switch_node(self, name: str) -> bool:
         """切换节点组选择（换出口 IP）；失败返回 False"""

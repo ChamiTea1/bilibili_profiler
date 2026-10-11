@@ -115,11 +115,15 @@ python login.py alt3
 ```
 建议配置多个小号，可以显著提高采集速度；
 
-`run.py` 建组合池时自动发现并入池；用户深度采集阶段按账号分片并行（限速按号独立，N 号≈N 倍吞吐），触发风控时换号（+换IP）重试，触发风控的号不剔除、保留在轮询池。
+`run.py` 建组合池时自动发现账号；用户深度采集阶段按账号分片并行，每个账号保留独立 Cookie 和限速。实际公网 IP 相同的入口共享请求间隔与冷却，吞吐取决于有效出口数量和目标接口状况。触发风控时保留出口、降速并冷却，串行阶段可换下一账号尝试；代理连接故障才切节点。
 
-可选 IP 池（风控时换"新号+新IP"继续采集，长冷却仅作最后手段；不配也能正常运行）：
-- 已有运行中的 Clash/ShellCrash：程序自动探测本机控制器（9090/9999/9097），零配置直接用；
-- 没有梯子工具：在 config.py 或环境变量配置 `SUB_URLS`（支持多个机场订阅，逗号分隔），程序自动下载/拉起内置 mihomo 核心（只监听 127.0.0.1 随机端口，不影响其它应用）。
+可选 IP 池（不配也能正常运行）：
+
+- 配置 `SUB_URLS`（多个订阅以逗号分隔）后，内置 mihomo 为每个账号创建独立本机端口和选择组，重复建池复用绑定；切某个账号的节点会清理其旧连接池，不改其他账号的选择。新增账号可热加载，既有端口保持不变。
+- 显式设置 `CLASH_ENABLED=1` 时优先使用外部核心；否则有订阅时优先内置核心，再自动探测本机控制器（9090/9999/9097）。外部共享端口采用静态出口，程序不会切换其全局节点。
+- 外部核心已有独立 `listeners` 时，可用 `CLASH_ACCOUNT_ROUTES` JSON 指定每个账号的 `proxy_url` 和 `group`（必须各自独立，并覆盖所有账号）。例如：`{"主号":{"proxy_url":"http://127.0.0.1:17890","group":"profiler-main"},"alt1":{"proxy_url":"http://127.0.0.1:17891","group":"profiler-alt1"}}`。账号名须与登录文件对应；外部配置由用户维护，程序不重写其配置。
+- 默认通过 `https://api.ipify.org` 探测实际出口，首次尽量去重、每 1800 秒复查；`PROXY_IP_CHECK_URL` 可替换为自己的纯文本 IP 接口，置空禁用。探测走统一客户端限速，失败不判死节点；未知出口保守共享限速。通用 IP 探测不能证明目标站按同一路径出站，外部独立入口应显式绑定所属选择组。
+- 启动日志显示账号数、代理绑定数与实测不同 IP 数；`pool.proxy_status()` 提供请求成功/风控/代理故障/业务异常计数和最近 200 次调用耗时 P95，不含订阅或控制器凭证。主池与分片共享降级、重探状态，故障只影响对应入口。统计与调度在本进程内生效。
 
 批量模式（`python run.py --batch videos.txt`）逐个视频分析，**不会自动启动 web 服务**（避免逐视频弹浏览器）；跑完自行 `python web.py` 即可在首页看到全部视频。中途 Ctrl+C 只会跳过后续视频，已完成的仍保存在库里。
 
@@ -184,7 +188,9 @@ python login.py alt3
 | 配置项 | 作用 | 默认 |
 |---|---|---|
 | `LLM_API_KEY` / `LLM_MODEL` / `LLM_PROVIDER` | AI 判定与深掘；**留空则自动跳过全部 LLM 阶段** | 空 / `deepseek-v4-flash` / `deepseek`（可选 `glm` `mimo`） |
-| `SUB_URLS` | 机场订阅（逗号分隔多个），内置 IP 池的节点来源 | 空（不启 IP 池） |
+| `SUB_URLS` | 订阅（逗号分隔多个），内置核心为每账号创建独立入口 | 空 |
+| `CLASH_ACCOUNT_ROUTES` | 外部核心各账号的独立端口/选择组 JSON | 空（共享静态入口） |
+| `PROXY_IP_CHECK_URL` | 纯文本公网 IP 探测服务；置空禁用 | `https://api.ipify.org` |
 | `WEB_AUTOSTART` | 分析完是否自动起 web 服务并打开浏览器 | `True` |
 | `REQUEST_DELAY` / `REQUEST_DELAY_LONG` | 基础 / 高风险接口的请求间隔区间（秒） | `(0.8, 1.6)` / `(2.0, 4.0)` |
 | `MAX_COMMENT_PAGES` | 评论主楼最多翻页数（每页约 20 条） | `100` |
@@ -209,9 +215,10 @@ src/
 ├── web_autostart.py     # 分析完毕自动启动 web.py 并打开报告页（WEB_AUTOSTART 开关）
 ├── auth.py              # 扫码登录、Cookie 保存/加载/校验/自动刷新、小号池发现
 ├── api_client.py        # HTTP 封装：区间随机限速 + 自适应降速 + 重试退避 + 风控冷却 + WBI 签名
-├── combo_pool.py        # 账号×IP 组合池：风控换"新号+新IP"重试，冷却锁外等待，IP 池故障降级直连
+├── combo_pool.py        # 账号组合池：稳定入口绑定，风控冷却，分片共享出口状态
+├── proxy_pool.py        # 实际 IP 统一限速/冷却、出口健康与 P95、连接故障切换/降级/恢复
 ├── clash_ctl.py         # Clash/mihomo 控制器封装（列节点 / 切节点换出口 IP，失败静默降级）
-├── proxy_core.py        # 内置 mihomo 核心生命周期（订阅→本地随机端口；锁定版本 + 官方 SHA256 校验）
+├── proxy_core.py        # 内置 mihomo：每账号独立入口和选择组，热增账号；锁定版本 + SHA256 校验
 ├── danmaku.py           # 实时弹幕 XML 解析、按发送者聚合、互动弹幕明文 mid
 ├── danmaku_history.py   # 历史弹幕逐日快照采集（手写 protobuf 解析、失败日记账、按分P 断点续采）
 ├── comment.py           # 评论区采集（wbi/main 游标 + 楼中楼补采 + IP 属地）、UID 收割、增量刷新
@@ -338,7 +345,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ### 7. 工程现状
 
 - 项目**没有单元测试框架**，端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（196 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
+- 现有离线检查手段：**`python tests/run_all.py`**（232 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。代理改动可额外运行 `python tests/offline/regress_proxy_pool.py --mihomo`，用已有核心和本机临时 HTTPS 服务验证真实路由，不访问外网。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
 
 ## 免责声明
 
@@ -395,7 +402,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 项目没有单元测试框架，验证分三层，从便宜到贵：
 
 ```bash
-# 1) 离线回归：196 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
+# 1) 离线回归：232 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
 python tests/run_all.py            # 跑全部离线回归并汇总
 python tests/run_all.py --lint     # 附带 pyflakes 静态检查（需先 pip install pyflakes）
 python tests/offline/regress_core.py   # 也可单独跑某一个脚本
@@ -413,7 +420,9 @@ python run.py <BV号>                     # 完整流水线
 
 | 脚本 | 项数 | 覆盖 |
 |---|---|---|
-| `tests/offline/regress_core.py` | 19 | 历史弹幕断点续采（中断后必须补齐、失败日挂账、不误写 done）、**月份索引失败不得误标完成**、线程池收尾、`post()` 重试请求体、**刷屏相似度抽样须还原全量口径**、**组合池风控账本按 job 隔离**、限速预算熔断、画像渲染容错等 |
+| `tests/offline/regress_proxy_pool.py` | 37 | 账号端口/选择组隔离、真实 IP 去重、共享出口限速/冷却、原子选节点、死名单、故障归因、连接池清理、共享降级/恢复、热加载暂停、请求重试预算、凭证权限断言；`--mihomo` 可额外验证 5 项真实核心本机路由/HTTPS 隧道/热加载/凭证清理 |
+| `tests/offline/regress_comprehensive_fixes.py` | 31 | 全库审查修复定点验证：画像按视频隔离与旧库重建、评论事务回滚与检查点补齐、历史月份失败重试、LLM 缓存下标平移、CLI 深掘触发页面缓存失效等 |
+| `tests/offline/regress_core.py` | 18 | 历史弹幕断点续采（中断后必须补齐、失败日挂账、不误写 done）、**月份索引失败不得误标完成**、线程池收尾、`post()` 重试请求体、**刷屏相似度抽样须还原全量口径**、限速预算熔断、画像渲染容错等 |
 | `tests/offline/regress_comment_path.py` | 10 | wbi/legacy 翻页与降级、请求异常保留已采、真重复页检测、缺 rpid 脏行、刷新计数 |
 | `tests/offline/regress_judge_danmaku.py` | 4 | 问题弹幕判定必须被采纳并归到正确发送者（防"解析了却没采纳"） |
 | `tests/offline/regress_judge_comment.py` | 3 | 问题评论判定必须回映到正确 rpid |
@@ -425,7 +434,8 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_multipart_pages.py` | 14 | 历史弹幕按分P 采集与检查点隔离（分P 1 键名不变）、画像样本「P{n} mm:ss」与排序、旧画像渲染期回填、弹幕浏览器首次出现按 (分P, 时间) |
 | `tests/offline/regress_port_config.py` | 5 | 端口解析优先级（`--port` > `PROFILER_PORT` > 8001）、非法/越界回退、两个入口的 `--help` 都暴露 `--port`（Windows 换端口可用性） |
 | `tests/offline/regress_review_fixes.py` | 10 | 全库审查修复定点验证：批量模式不被 SystemExit 击穿、LLM 批次缓存保序指纹、CancelledError 不穿透降级链、历史弹幕达上限后滚动补采不冻结、`shard_pools` 继承代理恢复链等 |
-| `tests/offline/regress_blocklist.py` | 11 | B站屏蔽列表导出：三标准选人、误报扣除、低置信度默认排除、严重度排序截断、条目口径（type=2）、路由下载与 404/400 口径 |
+| `tests/offline/regress_blocklist.py` | 17 | B站屏蔽列表导出：三标准选人、误报扣除、低置信度默认排除、严重度排序截断、条目口径（type=2）、路由下载与 404/400 口径、跨视频合并榜的命中视频数排序 |
+| `tests/offline/regress_density_peaks.py` | 7 | 弹幕高能点 AI 标注：峰值窗口口径、缓存复用、LLM 不可用时降级不影响主流程 |
 | `tests/offline/regress_env_proxy.py` | 6 | 环境代理（http_proxy/https_proxy/all_proxy）不得劫持**本机**调用：本机假控制器 + 代理指向死端口，验证 `clash_ctl` 与自动打开报告页的探测仍能打通（Python 的 `no_proxy` 不认 `127.*`） |
 | `tests/offline/regress_cli_switches.py` | 5 | `--skip-deep`：与 `LLM_DEEP_ENABLED` 取与的真值表、参数确实透传到 `run_analysis`/`run_batch`、`--help` 可见（防"加了参数没接线"） |
 | `tests/offline/regress_llm_proxy.py` | 6 | LLM 客户端不继承环境代理：裸 SDK 在 `all_proxy=socks://` 下必失败（前提校验），`llm_client.make_client` 必须照常调通（判定批次 thinking 参数路径一并验证） |

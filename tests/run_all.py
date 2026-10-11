@@ -39,6 +39,7 @@ def pick_python() -> str:
 
 PY = pick_python()
 SCRIPTS = [
+    "tests/offline/regress_proxy_pool.py",      # 账号出口隔离、共享 IP 限速与故障降级
     "tests/offline/regress_comprehensive_fixes.py", # 全库审查：存储隔离、事务、缓存、失败覆盖和界面
     "tests/offline/regress_core.py",            # 主回归 13 项
     "tests/offline/regress_comment_path.py",    # 评论采集路径 10 项

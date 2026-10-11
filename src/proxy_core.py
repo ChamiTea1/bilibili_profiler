@@ -4,8 +4,8 @@
 给 SUB_URLS 一个或多个机场订阅链接即可获得 IP 池。核心只监听 127.0.0.1
 随机端口，系统与其它应用流量不经过它。订阅链接是凭证：不落日志、不进仓库。
 
-注意（架构约束）：内置核心为单 mixed-port + 单 select 组，IP 维度是全局单点——
-所有账号共享同一出口 IP，切节点对整个进程全局生效（多号并行分片同样受影响）。
+每个账号使用独立 mixed listener 和 select 组，端口在进程内稳定复用。
+切换某个账号的节点不会修改其他账号的选择组。
 
 供应链安全：自动下载锁定固定版本（_MIHOMO_VERSION），下载后按内置的官方
 sha256 表（_KNOWN_SHA256）校验，不匹配拒绝执行并删除文件；下载顺序为
@@ -19,6 +19,7 @@ import os
 import platform
 import secrets
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -187,8 +188,7 @@ def ensure_binary(allow_download: bool = True) -> str | None:
 class ProxyCore:
     """内置 mihomo 核心：start() 成功返回就绪的 ClashCtl，失败返回 None（静默降级）
 
-    注意：单 mixed-port + 单 select 组，IP 维度全局单点——进程内所有账号
-    共享同一出口 IP，切节点全局生效（含多号并行分片）。
+    单核心管理多个账号入口；新增账号可热加载，已有入口端口保持不变。
     """
 
     @staticmethod
@@ -210,7 +210,7 @@ class ProxyCore:
 
         return {"preexec_fn": _set_pdeathsig}
 
-    def __init__(self, sub_urls: list[str], group: str = "profiler"):
+    def __init__(self, sub_urls: list[str], group: str = "profiler", account_names=None):
         self._raw_sub_urls = list(sub_urls)   # 原始入参，供 get_core 单例做参数比对
         # 剔除会生成非法 yaml 的链接（含双引号/反斜杠/换行；双引号标量中 \ 是转义符），
         # 避免静默失效；警告只打印序号，凭证不落日志
@@ -234,13 +234,99 @@ class ProxyCore:
         while self.api_port == self.mix_port:   # 理论上可撞，守卫一下
             self.api_port = _free_port()
         self.secret = secrets.token_hex(8)
+        # 不同分析进程/测试实例各自拥有配置和 provider 缓存，避免互相覆写凭证文件。
+        self._runtime_dir = os.path.join(_RUNTIME_DIR, f"{os.getpid()}-{self.secret[:8]}")
         self._proc: subprocess.Popen | None = None
         self._start_lock = threading.Lock()   # start() 串行化：并发建池不会拉起多个核心
         self._atexit_registered = False       # atexit.register 只注册一次，避免叠加调用
+        self._listeners = {}
+        self.generation = 0
+        self._add_accounts(account_names or ["主号"])
+
+    def _add_accounts(self, names):
+        """账号名只用于稳定散列，不直接拼接进 YAML。"""
+        used = {self.api_port, *(port for port, _ in self._listeners.values())}
+        for name in dict.fromkeys(names):
+            if name in self._listeners:
+                continue
+            port = self.mix_port if not self._listeners else _free_port()
+            while port in used:
+                port = _free_port()
+            used.add(port)
+            suffix = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+            self._listeners[name] = (port, f"{self.group}-account-{suffix}")
+
+    def account_routes(self) -> dict:
+        """返回各账号独立的控制器和代理 URL，凭证只保留在对象中。"""
+        return {name: (ClashCtl(f"http://127.0.0.1:{self.api_port}", self.secret, group),
+                       f"http://127.0.0.1:{port}")
+                for name, (port, group) in self._listeners.items()}
+
+    def ensure_accounts(self, names) -> bool:
+        """热增入口不重启核心；热加载失败时回滚配置，已有账号继续使用原入口。"""
+        with self._start_lock:
+            names = list(names)
+            if all(name in self._listeners for name in names):
+                return True
+            old = dict(self._listeners)
+            self._add_accounts(names)
+            if self._proc is None or self._proc.poll() is not None:
+                return True
+            from proxy_pool import pause_core_routes
+            with pause_core_routes(f"http://127.0.0.1:{self.api_port}", self.secret) as states:
+                return self._reload_accounts(old, states)
+
+    def _reload_accounts(self, old, states):
+        routes = self.account_routes()
+        selected = {name: routes[name][0].current_node() for name in old}
+        path = os.path.join(self._runtime_dir, "config.yaml")
+        ctl = next(iter(routes.values()))[0]
+        attempted = False
+        try:
+            self._write_config(path)
+            attempted = True
+            if not ctl.reload_config(path):
+                raise OSError("热加载失败")
+            for name, node in selected.items():
+                if node and not routes[name][0].switch_node(node):
+                    raise OSError("恢复账号选择失败")
+            return True
+        except OSError:
+            self._listeners = old
+            try:
+                self._write_config(path)
+                # 请求超时也可能已在核心中应用，回写旧配置并恢复选择。
+                if attempted:
+                    ctl.reload_config(path)
+                    for name, node in selected.items():
+                        if node:
+                            routes[name][0].switch_node(node)
+            except OSError:
+                pass
+            print("[ProxyCore] 添加账号入口失败，保留既有入口，新账号本轮降级直连")
+            return False
+        finally:
+            if attempted:
+                self.generation += 1
+                for state in states:
+                    state.sync_generation(self.generation)
+
+    def _write_config(self, path):
+        """以 0600 临时文件原子替换，避免热加载读到半份含凭证配置。"""
+        tmp = path + ".tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(self._gen_config())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
 
     def _gen_config(self) -> str:
         """生成最小 yaml（字符串模板，项目无 pyyaml 依赖）；每订阅一个 provider，
-        select 组 use 引用全部 provider（多订阅节点汇入同一轮换组）"""
+        每账号 select 组引用全部 provider，入口直接绑定所属账号组。"""
         providers = "\n".join(
             f'  sub{i}:\n'
             f'    type: http\n'
@@ -254,8 +340,20 @@ class ProxyCore:
             f'      interval: 600'
             for i, u in enumerate(self.sub_urls))
         uses = ", ".join(f"sub{i}" for i in range(len(self.sub_urls)))
+        listeners = "\n".join(
+            f'  - name: "in-{group}"\n'
+            f'    type: mixed\n'
+            f'    listen: 127.0.0.1\n'
+            f'    port: {port}\n'
+            f'    proxy: "{group}"'
+            for port, group in self._listeners.values())
+        groups = "\n".join(
+            f'  - name: "{group}"\n'
+            f'    type: select\n'
+            f'    use: [{uses}]'
+            for _, group in self._listeners.values())
+        first_group = next(iter(self._listeners.values()))[1]
         return (
-            f"mixed-port: {self.mix_port}\n"
             # 显式禁 LAN + 只绑回环：把"只监听 127.0.0.1"从依赖上游默认值变成显式承诺
             f"allow-lan: false\n"
             f"bind-address: 127.0.0.1\n"
@@ -269,12 +367,10 @@ class ProxyCore:
             f"    - 223.5.5.5\n"
             f"    - 119.29.29.29\n"
             f"proxy-providers:\n{providers}\n"
-            f"proxy-groups:\n"
-            f'  - name: "{self.group}"\n'
-            f"    type: select\n"
-            f"    use: [{uses}]\n"
+            f"listeners:\n{listeners}\n"
+            f"proxy-groups:\n{groups}\n"
             f"rules:\n"
-            f'  - "MATCH,{self.group}"\n'
+            f'  - "MATCH,{first_group}"\n'
         )
 
     def start(self, allow_download: bool = True) -> ClashCtl | None:
@@ -287,8 +383,8 @@ class ProxyCore:
         with self._start_lock:
             if self._proc is not None:
                 if self._proc.poll() is None:
-                    print(f"[ProxyCore] 内置核心已在运行（混合端口 127.0.0.1:{self.mix_port}），复用")
-                    return ClashCtl(f"http://127.0.0.1:{self.api_port}", self.secret, self.group)
+                    print(f"[ProxyCore] 内置核心已在运行，复用 {len(self._listeners)} 个账号入口")
+                    return next(iter(self.account_routes().values()))[0]
                 self._proc = None       # 进程已死，按重新拉起处理（崩溃自愈）
             if not self.sub_urls:
                 print("[ProxyCore] 无可用订阅链接（全部被剔除或未配置），禁用内置核心")
@@ -298,8 +394,8 @@ class ProxyCore:
                 print("[ProxyCore] 未找到 mihomo 二进制（可设 MIHOMO_PATH 或放置到 vendor/），禁用内置核心")
                 return None
             try:
-                os.makedirs(_RUNTIME_DIR, exist_ok=True)
-                cfg_path = os.path.join(_RUNTIME_DIR, "config.yaml")
+                os.makedirs(self._runtime_dir, mode=0o700, exist_ok=True)
+                cfg_path = os.path.join(self._runtime_dir, "config.yaml")
                 # 上次进程被 SIGKILL 时 atexit 不会执行，含订阅凭证的 config.yaml
                 # 可能残留磁盘：写新配置前先清残留（含订阅凭证的文件不该在核心
                 # 未运行时躺在磁盘上）
@@ -307,17 +403,13 @@ class ProxyCore:
                     os.remove(cfg_path)
                 except OSError:
                     pass
-                # os.open 带 0o600 创建：消除"先写后 chmod"的权限窗口（含订阅凭证）
-                fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(self._gen_config())
-                os.chmod(cfg_path, 0o600)   # 文件已存在时 os.open 的 mode 不生效，补收紧
+                self._write_config(cfg_path)
             except OSError as e:
                 print(f"[ProxyCore] 配置写入失败: {e}，禁用内置核心")
                 return None
             try:
                 self._proc = subprocess.Popen(
-                    [bin_path, "-d", _RUNTIME_DIR, "-f", cfg_path],
+                    [bin_path, "-d", self._runtime_dir, "-f", cfg_path],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     **self._pdeathsig_kwargs())
             except OSError as e:
@@ -327,7 +419,7 @@ class ProxyCore:
             if not self._atexit_registered:
                 atexit.register(self.stop)
                 self._atexit_registered = True
-            ctl = ClashCtl(f"http://127.0.0.1:{self.api_port}", self.secret, self.group)
+            ctl = next(iter(self.account_routes().values()))[0]
             for _ in range(60):
                 if self._proc.poll() is not None:
                     print(f"[ProxyCore] 核心进程退出（code={self._proc.returncode}），禁用内置核心")
@@ -335,7 +427,8 @@ class ProxyCore:
                     return None
                 nodes = ctl.refresh_nodes() if ctl.available() else []
                 if nodes:
-                    print(f"[ProxyCore] 内置核心就绪: {len(nodes)} 个节点（混合端口 127.0.0.1:{self.mix_port}）")
+                    self.generation += 1
+                    print(f"[ProxyCore] 内置核心就绪: {len(nodes)} 个可用节点，{len(self._listeners)} 个独立账号入口")
                     return ctl
                 time.sleep(1)
             print("[ProxyCore] 核心就绪超时（订阅拉取失败？），禁用内置核心")
@@ -358,10 +451,8 @@ class ProxyCore:
                     proc.wait(timeout=5)    # kill 后回收，避免僵尸进程
                 except subprocess.TimeoutExpired:
                     pass
-        try:
-            os.remove(os.path.join(_RUNTIME_DIR, "config.yaml"))
-        except OSError:
-            pass
+        # provider 缓存也含节点凭证，只清本实例创建的目录，不影响其他核心。
+        shutil.rmtree(self._runtime_dir, ignore_errors=True)
 
     def stop(self):
         """终止核心子进程（atexit 注册；幂等）；与 start() 同锁消除竞态"""
@@ -373,7 +464,7 @@ _CORE_INSTANCE: ProxyCore | None = None
 _CORE_LOCK = threading.Lock()
 
 
-def get_core(sub_urls: list[str], group: str = "profiler") -> ProxyCore:
+def get_core(sub_urls: list[str], group: str = "profiler", account_names=None) -> ProxyCore:
     """模块级单例入口：同一进程只持有一个内置核心实例（配合 start() 幂等复用，
     web.py 多次重新生成 job 反复 build_pool 不会累积拉起多个 mihomo 子进程）。
     参数与既有实例不同则打警告并复用旧实例（同一进程内配置一般不会变，重建反而泄漏旧核心）。
@@ -381,7 +472,10 @@ def get_core(sub_urls: list[str], group: str = "profiler") -> ProxyCore:
     global _CORE_INSTANCE
     with _CORE_LOCK:
         if _CORE_INSTANCE is None:
-            _CORE_INSTANCE = ProxyCore(sub_urls, group=group)
+            _CORE_INSTANCE = ProxyCore(sub_urls, group=group, account_names=account_names)
         elif _CORE_INSTANCE._raw_sub_urls != list(sub_urls) or _CORE_INSTANCE.group != group:
             print("[ProxyCore] 警告：内置核心已按先前参数创建，本次参数不同，复用既有实例")
-    return _CORE_INSTANCE
+        core = _CORE_INSTANCE
+    if account_names:
+        core.ensure_accounts(account_names)
+    return core

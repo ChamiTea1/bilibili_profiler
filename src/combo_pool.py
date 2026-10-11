@@ -1,109 +1,36 @@
-"""账号×IP 组合池：风控时换"新号+新IP"重试，长冷却为最后手段
+"""账号组合池：账号入口稳定绑定，风控冷却，代理连接故障才切节点。
 
-ComboPool 鸭子类型模拟 BiliAPIClient（get/post/get_raw/get_cookies_dict/update_cookies），
-各采集阶段/函数零签名改动：原来的 client 实参直接换成 pool 即可。
-每个请求经 run() 包装——风控时 rotate()（下一账号+切节点）后原请求重试，
-翻页游标保留在采集函数内部，断点天然不丢。
-
-降级链（任何一层坏了退到下一层，流水线不中断）：
-  账号×IP 组合轮换 → IP 池故障摘代理 → 账号轮转+直连 → 整圈风控 600s 长冷却
-  → 连续 MAX_RISK_ROUNDS 圈仍失败抛 RiskControlError（阶段层按失败降级跳过本单元）
-
-注意（架构约束）：内置核心为单 mixed-port 单 select 组，IP 维度全局单点——
-所有账号共享同一出口 IP，切节点全局生效（shard 分片间同样如此）。
+主池与分片共享 ProxyRoute；同一实际 IP 共用限速和冷却，不把账号数当成
+有效出口数。内置核心每账号一端口/一选择组，外部共享入口不自动切全局节点。
 """
-import random
+import json
+import os
 import threading
-import time
-from contextlib import contextmanager
-from contextvars import ContextVar
-from typing import Optional
+from urllib.parse import urlparse
 
-from config import (CLASH_API_URL, CLASH_ENABLED, CLASH_GROUP, CLASH_PROXY_URL,
-                    CLASH_SECRET, MAX_RISK_ROUNDS, NAV_URL, RISK_COOLDOWN, SUB_URLS,
-                    PROXY_RETRY_AFTER, SINGLE_ACCOUNT_RISK_COOLDOWN)
-from api_client import ProxyConnError, RiskControlError
-
-_PROXY_FAIL_STRIP_THRESHOLD = 3   # 代理连续连接失败多少次后判定 IP 池不可用、摘代理转直连
-# 摘代理恢复重探间隔与单账号冷却基准已迁移至
-# config.PROXY_RETRY_AFTER / config.SINGLE_ACCOUNT_RISK_COOLDOWN
-
-_MAX_LEDGERS = 32   # 每 owner 风控账本上限：超限时淘汰最旧的（None=共享账本与当前 owner 保留）
-
-# 当前「使用方」标识：由调用方（如 web.py 的后台 job）用 pool_owner() 上下文绑定。
-# 风控账本（整圈判定/连续圈数）按 owner 隔离，账号轮换、冷却、代理状态仍全局共享。
-_POOL_OWNER: ContextVar[Optional[str]] = ContextVar("profiler_pool_owner", default=None)
-
-
-@contextmanager
-def pool_owner(name: str):
-    """绑定当前线程/协程的池使用方（如 job_id），供风控账本按使用方隔离。
-
-    未绑定时使用共享账本（None），行为与单使用方场景一致（CLI 主流程即如此）。
-    """
-    token = _POOL_OWNER.set(name)
-    try:
-        yield
-    finally:
-        _POOL_OWNER.reset(token)
-
-
-class _Ledger:
-    """单个使用方的风控账本：本圈各账号是否已触发风控 + 已连续整圈风控圈数。
-
-    必须与「账号轮换 _idx」「长冷却 _cooldown_until」区分：后者是账号/IP 层面的
-    全局事实（IP 池为单点，切节点与冷却对所有使用方同时生效），共享才正确；
-    而账本回答的是「本使用方是否已被风控逼完整一圈」，属使用方私有进度，
-    若共享则会被并发的其它使用方互相清零/累加而失真。
-    """
-    __slots__ = ("marks", "rounds")
-
-    def __init__(self, n_accounts: int):
-        self.marks = [False] * n_accounts
-        self.rounds = 0
-
-    def reset(self, n_accounts: int):
-        self.marks = [False] * n_accounts
-        self.rounds = 0
+import config
+from api_client import RiskControlError
+from proxy_pool import RetryProxyError, get_route, risk_cooldown
 
 
 class ComboPool:
-    """账号×IP 组合池。
+    """鸭子类型模拟 BiliAPIClient，保留各采集模块的调用签名。"""
 
-    线程模型：池状态迁移（_idx/风控账本/代理故障计数/冷却截止时刻）由
-    self._lock 保护；fn(client) 的实际请求执行不放在锁内——请求本身不序列化，
-    成员 client 自身已带 RLock（BiliAPIClient 限速锁）。整圈风控的长冷却只记录
-    冷却截止时刻（锁内读写 _cooldown_until），实际等待移出锁外统一执行，
-    避免冷却期其他线程在同一把锁上串行阻塞并继续撞风控。
-
-    多使用方并发（web.py 同时跑多个不同 bvid 的后台 job，共享同一单例池）：
-    账号轮换/冷却/代理降级是 IP 层面的全局状态，共享是预期行为；风控账本则按
-    pool_owner() 绑定的使用方隔离，避免 A job 的风控进度被 B job 的一次成功清零
-    （会导致 A 永远凑不满 MAX_RISK_ROUNDS、反复长冷却而不放弃）或被 B 的风控
-    累加而提前放弃。
-    """
-
-    def __init__(self, accounts: list, clash=None, proxy_url: str | None = None):
-        # 副作用：池成员的 raise_on_risk 被永久置 True（风控改抛信号由本池接管），
-        # 入池后的 client 不应再被裸用走 api_client 旧冷却路径。
-        self._accounts = list(accounts)     # [(名字, BiliAPIClient)]，[0] 恒为主号
-        self._clash = clash                 # ClashCtl 或 None（无 IP 池）
-        self._proxy_url = proxy_url
+    def __init__(self, accounts, clash=None, proxy_url=None, routes=None):
+        self._accounts = list(accounts)
+        if not self._accounts:
+            raise ValueError("账号池不能为空")
         self._idx = 0
-        # 风控账本按使用方隔离：None = 未绑定使用方时的共享账本
-        self._ledgers: dict[Optional[str], _Ledger] = {None: _Ledger(len(self._accounts))}
-        self._proxy_fail_streak = 0
-        self._cooldown_until = 0.0          # 全局冷却截止时刻（时间戳），0 表示无冷却
-        self._proxy_backup = None           # 摘代理降级时备份 (proxy_url, clash) 供恢复
-        self._proxy_strip_ts = 0.0          # 摘代理时刻（距上次恢复尝试的计时起点）
         self._lock = threading.Lock()
-        self._restore_lock = threading.Lock()   # 代理恢复自检串行化（_maybe_restore_proxy）
-        for _, c in self._accounts:
-            c.raise_on_risk = True          # 池成员风控改抛信号，由本池接管
-            if proxy_url:
-                c.set_proxy(proxy_url)
+        if routes is None:
+            # 兼容外部调用构造单入口池；共享入口不修改外部应用的选择组。
+            key = ("external-shared", proxy_url) if proxy_url else ("direct",)
+            shared = get_route(key, proxy_url, clash, managed=False)
+            routes = {name: shared for name, _ in self._accounts}
+        self._routes = routes
+        for name, client in self._accounts:
+            self._routes[name].attach(client)
 
-    # ---- 鸭子类型：模拟 BiliAPIClient ----
     def get(self, url, params=None, headers=None, **kw):
         return self.run(lambda c: c.get(url, params=params, headers=headers, **kw), desc=url[-40:])
 
@@ -113,286 +40,138 @@ class ComboPool:
     def get_raw(self, url, params=None, **kw):
         return self.run(lambda c: c.get_raw(url, params=params, **kw), desc=url[-40:])
 
-    def get_cookies_dict(self) -> dict:
-        # user_collector.get_user_space_info 等会直接取当前账号 Cookie；锁内读 _idx
-        with self._lock:
-            client = self._accounts[self._idx][1]
-        return client.get_cookies_dict()
-
-    def update_cookies(self, cookies):
-        # 登录路径不进池；仅为鸭子类型完整性防御；锁内读 _idx
-        with self._lock:
-            client = self._accounts[self._idx][1]
-        client.update_cookies(cookies)
-
     @property
     def current(self):
         with self._lock:
             return self._accounts[self._idx]
 
-    def rotate(self, reason: str = ""):
-        """换下一账号（纯内存操作，锁内调用）；节点切换由 run() 在锁外经 _switch_node 补做。
+    def get_cookies_dict(self):
+        return self.current[1].get_cookies_dict()
 
-        仅在 run() 持锁路径调用，自身不再取锁。
-        Clash 控制器调用是网络 I/O（每次最长约 5s 超时），若在池锁内做节点切换，
-        共享该池的分片线程会在取锁处停摆 10-15s，抵消多号并行吞吐——账号轮换留
-        锁内、切节点移锁外。
-        """
-        self._idx = (self._idx + 1) % len(self._accounts)
-        print(f"[Pool] {reason} → 换号[{self._accounts[self._idx][0]}]")
+    def update_cookies(self, cookies):
+        self.current[1].update_cookies(cookies)
 
-    def _switch_node(self, reason: str = ""):
-        """切下一 Clash 节点（网络 I/O，必须在池锁外调用；失败仅记日志保持当前 IP）"""
-        clash = self._clash
-        if not clash:
-            return
-        nxt = clash.pick_next_node()
-        if nxt and clash.switch_node(nxt):
-            print(f"[Pool] {reason} → 切节点[{nxt}]")
-            return
-        print(f"[Pool] {reason} → 切节点失败，保持当前 IP")
-
-    def _cooldown_seconds(self) -> float:
-        """风控长冷却基准时长：单账号子池换号无意义（冷却只是等风控消退），
-        缩短至 SINGLE_ACCOUNT_RISK_COOLDOWN；多账号池保持 RISK_COOLDOWN"""
-        return SINGLE_ACCOUNT_RISK_COOLDOWN if len(self._accounts) == 1 else RISK_COOLDOWN
-
-    def _wait_cooldown(self):
-        """全局冷却等待（锁外执行）：锁内只读写截止时刻，实际 sleep 不持锁，
-        冷却期其他线程不会被锁串行阻塞着继续撞风控"""
+    def run(self, fn, desc=""):
+        # 重试预算属于本次请求，其他线程的成功不能重置它。
+        risk_marks, rounds = set(), 0
         while True:
             with self._lock:
-                remaining = self._cooldown_until - time.time()
-                if remaining <= 0:
-                    self._cooldown_until = 0.0
-                    return
-            print(f"[Pool] 全局冷却中，等待 {remaining:.0f} 秒...")
-            time.sleep(remaining)
-
-    def _maybe_restore_proxy(self):
-        """摘代理降级满 PROXY_RETRY_AFTER 秒后，下次请求前重跑代理自检，
-        成功则恢复代理与 clash 控制器（自检走网络，挂回/摘掉在锁内，自检本身锁外）。
-
-        _restore_lock 非阻塞串行化：多线程同时到期时只允许一个线程跑自检，
-        其余直接跳过本次（等下一次调用再判），避免并发重复自检与状态挂回竞态。"""
-        if not self._restore_lock.acquire(blocking=False):
-            return
-        try:
-            with self._lock:
-                if self._proxy_backup is None or self._proxy_url is not None:
-                    return
-                if time.time() - self._proxy_strip_ts < PROXY_RETRY_AFTER:
-                    return
-                # 本次尝试无论成败都重新计时（_strip_proxy 会刷新 _proxy_strip_ts），
-                # 避免每次请求都打自检
-                proxy_url, clash = self._proxy_backup
-                self._proxy_url = proxy_url
-                self._clash = clash
-                self._proxy_fail_streak = 0
-                for _, c in self._accounts:
-                    c.set_proxy(proxy_url)
-            print("[Pool] 摘代理已满重试间隔，重跑代理自检尝试恢复...")
-            if _proxy_selfcheck(self, max_tries=3):
-                with self._lock:
-                    self._proxy_backup = None
-                    self._proxy_strip_ts = 0.0
-                print("[Pool] 代理自检通过，已恢复代理出口与节点控制器")
-                return
-            print("[Pool] 代理自检仍未通过，维持直连降级")
-            with self._lock:
-                self._strip_proxy()
-        finally:
-            self._restore_lock.release()
-
-    def _ledger(self, owner) -> _Ledger:
-        """取当前使用方的风控账本（调用方须持 self._lock）。
-
-        账本按 owner 隔离：并发使用方各自记各自的「整圈风控」进度，互不清零/累加。
-        超限淘汰最旧的账本（保留 None 共享账本与当前 owner），避免长期运行累积。
-        """
-        led = self._ledgers.get(owner)
-        if led is None:
-            led = self._ledgers[owner] = _Ledger(len(self._accounts))
-            if len(self._ledgers) > _MAX_LEDGERS:
-                for k in list(self._ledgers):
-                    if k is not None and k != owner:
-                        self._ledgers.pop(k, None)
-                        if len(self._ledgers) <= _MAX_LEDGERS:
-                            break
-        return led
-
-    def run(self, fn, desc: str = ""):
-        """执行 fn(client)；风控→rotate 重试；整圈风控→长冷却；冷却 MAX_RISK_ROUNDS 圈仍败→抛"""
-        owner = _POOL_OWNER.get()
-        while True:
-            self._wait_cooldown()       # 锁外统一等待：未到冷却截止时刻先等
-            self._maybe_restore_proxy() # 摘代理降级到期则尝试恢复代理
-            with self._lock:
-                idx = self._idx         # 锁内快照账号，锁外执行 fn
+                idx = self._idx
                 name, client = self._accounts[idx]
+            route = self._routes[name]
             try:
-                result = fn(client)     # 实际请求不持锁：请求本身不序列化
-            except ProxyConnError as e:
-                with self._lock:
-                    if self._proxy_url is None:
-                        raise   # 已转直连仍报代理错误属异常，直接上抛
-                    self._proxy_fail_streak += 1
-                    streak = self._proxy_fail_streak
-                    if streak >= _PROXY_FAIL_STRIP_THRESHOLD:
-                        print(f"[Pool] 代理连续 {streak} 次连接失败，判定 IP 池不可用，摘代理转直连: {e}")
-                        self._strip_proxy()
-                        # 代理故障不消耗风控圈：原地重试（已转直连）
-                        continue
-                # 未达摘代理阈值：死节点记账 + 切下一节点。
-                # Clash 调用是网络 I/O（每次最长约 5s），放锁外防分片线程取锁停摆
-                clash = self._clash
-                if clash:
-                    cur = clash.current_node()
-                    if cur:
-                        clash.mark_dead(cur)   # 故障即记死名单（即时反应，不等 600s 一轮的健康检查）
-                    nxt = clash.pick_next_node()
-                    if nxt and clash.switch_node(nxt):
-                        print(f"[Pool] 代理连接失败，已切换节点 → {nxt}（第 {streak} 次）")
-                        continue
-                print(f"[Pool] 代理连接失败（第 {streak} 次，无法切节点）: {e}")
+                result = route.execute(client, fn, risk_cooldown(len(self._accounts) == 1))
+            except RetryProxyError:
                 continue
             except RiskControlError as e:
                 with self._lock:
-                    led = self._ledger(owner)
-                    led.marks[idx] = True       # 风控标记打在快照账号上
-                    print(f"[Pool] 账号[{name}] 触发风控（{str(e)[:60]}）")
-                    if all(led.marks):
-                        led.rounds += 1
-                        if led.rounds >= MAX_RISK_ROUNDS:
+                    risk_marks.add(idx)
+                    if len(risk_marks) == len(self._accounts):
+                        rounds += 1
+                        risk_marks.clear()
+                        if rounds >= config.MAX_RISK_ROUNDS:
                             raise RiskControlError(
-                                f"{desc} 连续 {led.rounds} 圈全账号风控，放弃本单元") from e
-                        wait = self._cooldown_seconds() + random.uniform(0, 60)
-                        print(f"[Pool] 全部账号均触发风控，长冷却 {wait:.0f} 秒"
-                              f"（最后手段，第 {led.rounds}/{MAX_RISK_ROUNDS} 圈）...")
-                        # 锁内只记录冷却截止时刻，实际等待移出锁外（见 _wait_cooldown）
-                        self._cooldown_until = time.time() + wait
-                        led.marks = [False] * len(self._accounts)
-                    self.rotate(f"风控({desc})")
-                # 切节点是 Clash 网络调用：放锁外（同上，防分片线程取锁停摆 10-15s）
-                self._switch_node(f"风控({desc})")
+                                f"{desc} 连续 {rounds} 圈账号风控，放弃本单元") from e
+                    self._idx = (idx + 1) % len(self._accounts)
+                print(f"[Pool] 账号[{name}] 触发风控，出口已进入冷却，切换下一账号尝试")
                 continue
-            # 业务成功：清零风控圈与代理故障计数（一次霉运不污染后续单元）
-            with self._lock:
-                self._ledger(owner).reset(len(self._accounts))
-                self._proxy_fail_streak = 0
             return result
 
-    def _strip_proxy(self):
-        """摘掉池内全部账号的代理，转直连（IP 池故障降级）。
+    def shard_pools(self):
+        """分片只分账号，出口状态与主池共用，降级/重探不会在分片间失联。"""
+        return [ComboPool([(name, client)], routes={name: self._routes[name]})
+                for name, client in self._accounts]
 
-        由 run() 持锁路径或 build_pool 建池期（尚未共享）调用，自身不再取锁。
-        降级时备份 (proxy_url, clash) 并记录时刻：PROXY_RETRY_AFTER 秒后由
-        _maybe_restore_proxy 重跑自检，通过则恢复代理与节点控制器。
-        """
-        if self._proxy_url is not None:
-            self._proxy_backup = (self._proxy_url, self._clash)
-        self._proxy_url = None
-        self._clash = None
-        self._proxy_strip_ts = time.time()
-        for _, c in self._accounts:
-            c.set_proxy(None)
-
-    def shard_pools(self) -> list["ComboPool"]:
-        """按账号分片：每账号一个独立子池（共享 clash/IP 池），供多线程并行采集。
-
-        限速是 per-client 实例的，N 个账号并行 ≈ N 倍吞吐。子池风控轮换只切节点
-        不换号（其它号正被别的分片占用），整圈风控的长冷却兜底逻辑照旧。
-        共享 clash 的切节点对所有分片同时生效（mixed 端口全局路由），属预期。
-        子池构造走 __new__ 跳过 __init__：raise_on_risk/set_proxy 副作用已由主池施加。
-        """
-        pools = []
-        for name, client in self._accounts:
-            p = ComboPool.__new__(ComboPool)
-            p._accounts = [(name, client)]
-            p._clash = self._clash
-            p._proxy_url = self._proxy_url
-            p._idx = 0
-            p._ledgers = {None: _Ledger(1)}     # 子池单账号，账本独立（不并入主池使用方账本）
-            p._proxy_fail_streak = 0
-            p._cooldown_until = 0.0
-            # 继承主池的摘代理降级状态：主池若在阶段1-4 已摘代理（_proxy_backup 待恢复），
-            # 不继承的话子池 _proxy_backup=None，_maybe_restore_proxy 永久短路——
-            # 600s 重探恢复链断裂，本进程内永久直连。子池各自独立恢复自检（串行于
-            # _restore_lock），多子池重复自检有界（每次间隔 PROXY_RETRY_AFTER）
-            p._proxy_backup = self._proxy_backup
-            p._proxy_strip_ts = self._proxy_strip_ts
-            p._lock = threading.Lock()
-            p._restore_lock = threading.Lock()
-            pools.append(p)
-        return pools
+    def proxy_status(self):
+        """出口诊断不包含订阅、控制器密钥或带认证的代理 URL。"""
+        return {name: self._routes[name].snapshot() for name, _ in self._accounts}
 
 
-def _discover_ip_pool():
-    """IP 池来源自动发现：外部控制器（显式配置优先，再探测本机常见端口）→ SUB_URLS 内置核心 → 无"""
+def _external_routes(accounts, api):
     from clash_ctl import ClashCtl
-    candidates = [CLASH_API_URL] if CLASH_ENABLED else []
-    candidates += ["http://127.0.0.1:9090", "http://127.0.0.1:9999", "http://127.0.0.1:9097"]
-    seen = set()
-    for api in candidates:
-        if api in seen:
-            continue
-        seen.add(api)
-        ctl = ClashCtl(api, CLASH_SECRET if api == CLASH_API_URL else "", CLASH_GROUP)
-        # 先 available 再 refresh：控制器不通就不必刷新节点列表
-        if ctl.available() and (nodes := ctl.refresh_nodes()):
-            print(f"[Pool] 发现外部 Clash 控制器 {api}（组 {ctl.group}，{len(nodes)} 节点）")
-            return ctl, CLASH_PROXY_URL
-    if SUB_URLS:
-        from proxy_core import get_core
-        # 单例：web.py 重新生成 job 反复建池时复用同一内置核心，不累积拉起子进程
-        core = get_core(SUB_URLS, group=CLASH_GROUP or "profiler")
-        ctl = core.start()
-        if ctl:
-            return ctl, f"http://127.0.0.1:{core.mix_port}"
-        print("[Pool] 内置核心启动失败，禁用 IP 池")
-    return None, None
-
-
-def _proxy_selfcheck(pool: ComboPool, max_tries: int = 5) -> bool:
-    """启动自检：经代理发一次轻量请求（NAV）；当前节点死亡则切下一个重试，
-    连续 max_tries 次仍不通才由调用方摘代理转直连（订阅里常混有死节点）"""
-    _, client = pool.current
-    for attempt in range(max_tries):
+    secret = config.CLASH_SECRET if api == config.CLASH_API_URL else ""
+    ctl = ClashCtl(api, secret, config.CLASH_GROUP)
+    if not ctl.available():
+        return None
+    raw = os.environ.get("CLASH_ACCOUNT_ROUTES", getattr(config, "CLASH_ACCOUNT_ROUTES", ""))
+    if raw:
         try:
-            data = client.get(NAV_URL, timeout=8)
-            if isinstance(data, dict) and "code" in data:
-                return True
-        except RiskControlError:
-            return True     # 账号风控说明代理链路是通的，不应摘代理
-        except Exception:
-            pass
-        if pool._clash and attempt < max_tries - 1:
-            cur = pool._clash.current_node()
-            if cur:
-                pool._clash.mark_dead(cur)      # 自检不通的节点直接进死名单，轮换不再选中
-            nxt = pool._clash.pick_next_node()
-            if nxt and pool._clash.switch_node(nxt):
-                print(f"[Pool] 自检节点不通，切换到 [{nxt}] 重试")
-            else:
-                break       # 无节点可切，提前结束
-    return False
+            mapping = json.loads(raw) if isinstance(raw, str) else raw
+            entries = []
+            for name, _ in accounts:
+                entry = mapping[name]
+                url, group = entry["proxy_url"], entry["group"]
+                if not isinstance(url, str) or not isinstance(group, str) or not group:
+                    raise ValueError("账号入口配置格式错误")
+                parsed = urlparse(url)
+                if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+                        or not parsed.port or not isinstance(group, str) or not group):
+                    raise ValueError("入口必须为本机 HTTP 代理和非空选择组")
+                entries.append((name, url, group))
+            if len({urlparse(url).port for _, url, _ in entries}) != len(entries) or len({g for _, _, g in entries}) != len(entries):
+                raise ValueError("账号入口和选择组必须各自独立")
+            routes = {}
+            for name, url, group in entries:
+                account_ctl = ClashCtl(api, secret, group)
+                if not account_ctl.refresh_nodes():
+                    raise ValueError("账号选择组无可用节点")
+                routes[name] = get_route((api, secret, group, url), url, account_ctl, managed=True)
+            print(f"[Pool] 外部核心独立账号入口: {len(routes)} 个")
+            return routes
+        except (ValueError, TypeError, KeyError):
+            print("[Pool] 外部账号入口配置无效，回退共享静态入口；不会修改外部全局选择组")
+    if not ctl.refresh_nodes():
+        return None
+    shared = get_route(("external-shared", config.CLASH_PROXY_URL),
+                       config.CLASH_PROXY_URL, ctl, managed=False)
+    print("[Pool] 使用外部共享静态入口；同一出口统一限速，不自动切换全局节点")
+    return {name: shared for name, _ in accounts}
 
 
-def build_pool(main_client) -> ComboPool:
-    """登录完成后构建组合池：主号+小号池 + IP 池自动发现；代理自检失败自动摘代理降级。
+def _discover_ip_pool(accounts):
+    """显式外部配置优先；订阅存在时优先内置隔离核心，再探测外部共享入口。"""
+    if config.CLASH_ENABLED:
+        routes = _external_routes(accounts, config.CLASH_API_URL)
+        if routes:
+            return routes
+    if config.SUB_URLS:
+        from proxy_core import get_core
+        core = get_core(config.SUB_URLS, group=config.CLASH_GROUP or "profiler",
+                        account_names=[name for name, _ in accounts])
+        if core.start():
+            bindings = core.account_routes()
+            routes = {}
+            for name, _ in accounts:
+                if name not in bindings:
+                    routes[name] = get_route(("direct",))
+                    continue
+                ctl, url = bindings[name]
+                routes[name] = get_route((ctl.api_url, ctl.secret, ctl.group, url),
+                                         url, ctl, managed=True)
+                routes[name].sync_generation(core.generation)
+            return routes
+        print("[Pool] 内置核心不可用，尝试外部共享入口或直连")
+    for api in dict.fromkeys(["http://127.0.0.1:9090", "http://127.0.0.1:9999", "http://127.0.0.1:9097"]):
+        if config.CLASH_ENABLED and api == config.CLASH_API_URL:
+            continue
+        routes = _external_routes(accounts, api)
+        if routes:
+            return routes
+    direct = get_route(("direct",))
+    return {name: direct for name, _ in accounts}
 
-    副作用：main_client.raise_on_risk 被永久置 True（风控改抛信号由池接管），
-    建池后该 client 不应再被裸用走 api_client 旧冷却路径。
-    """
-    from auth import load_extra_clients   # 延迟导入避免循环依赖
+
+def build_pool(main_client):
+    """主号与小号绑定稳定入口，首次按真实 IP 去重，自检失败按入口降级。"""
+    from auth import load_extra_clients
     accounts = [("主号", main_client)] + load_extra_clients()
-    if len(accounts) > 1:
-        names = "、".join(n for n, _ in accounts[1:])
-        print(f"[Pool] 小号池: {len(accounts) - 1} 个可用（{names}），采集阶段多号并行分片，风控时换号+切节点")
-
-    clash, proxy_url = _discover_ip_pool()
-    pool = ComboPool(accounts, clash=clash, proxy_url=proxy_url)
-    if proxy_url and not _proxy_selfcheck(pool):
-        print("[Pool] 代理自检失败，摘代理转直连（仅账号轮转）")
-        pool._strip_proxy()
+    routes = _discover_ip_pool(accounts)
+    pool = ComboPool(accounts, routes=routes)
+    for name, client in accounts:
+        routes[name].prepare(client)
+    status = pool.proxy_status()
+    measured = {s["ip"] for s in status.values() if s["proxy_active"] and s["ip"]}
+    active = sum(s["proxy_active"] for s in status.values())
+    print(f"[Pool] {len(accounts)} 个账号，{active} 个代理绑定，实测 {len(measured)} 个不同出口 IP"
+          "（相同或未知出口共享限速；风控遵守冷却）")
     return pool

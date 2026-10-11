@@ -8,7 +8,7 @@
     ① 【替换这里①】LLM_API_KEY —— 你的大模型 API Key
        不填也能跑：问题弹幕/问题评论判定与 AI 深掘会自动跳过，采集/破解/画像/报告全部可用。
     ② 【替换这里②】SUB_URLS   —— 你的机场订阅链接
-       不填也能跑：不走代理、直连，其余功能完全照常（只是少了对风控换 IP 的能力）。
+       不填也能跑：无外部代理时直连，其余功能照常，仍遵守限速与风控冷却。
 
 其余常量都有合理默认值，不用动。src/config.py 已被 .gitignore 排除，不会被提交。
 
@@ -83,9 +83,10 @@ ADAPTIVE_THROTTLE_DECAY = 0.99   # 每次业务成功请求后倍率衰减（约
 
 # ========== IP 池（外部 Clash / 内置 mihomo 核心） ==========
 # 三档来源自动择优（都不配置则降级直连，程序照常运行）：
-#   1. 外部控制器自动探测：本机已有运行中的 Clash/ShellCrash（9090/9999/9097）即直接接管；
-#   2. SUB_URLS 内置核心：填机场订阅链接后自动下载/拉起内置 mihomo 核心（仅监听 127.0.0.1 随机端口）；
-#   3. 都不可用 → 无 IP 池，账号轮转 + 长冷却兜底直连。
+#   1. CLASH_ENABLED=1：显式使用外部核心（独立入口需配置 CLASH_ACCOUNT_ROUTES）；
+#   2. SUB_URLS 内置核心：每个账号独立本机端口/选择组，优先于自动探测外部核心；
+#   3. 自动探测外部 Clash/ShellCrash（9090/9999/9097）：只使用静态入口，不切全局节点；
+#   4. 都不可用 → 直连，账号共用出口限速与冷却。
 #
 # 【替换这里②】机场订阅链接（可选。属凭证，勿提交、勿打印、勿截图）：
 #   把下面这行 os.environ.get("SUB_URLS", "") 的**第二个参数**（现在是两个紧挨的空引号 ""）
@@ -114,7 +115,19 @@ CLASH_API_URL = os.environ.get("CLASH_API_URL", "http://127.0.0.1:9090")
 CLASH_SECRET = os.environ.get("CLASH_SECRET", "")
 CLASH_GROUP = os.environ.get("CLASH_GROUP", "")            # 轮换节点组名（内置核心默认 profiler）
 CLASH_PROXY_URL = os.environ.get("CLASH_PROXY_URL", "http://127.0.0.1:7890")
-# 单任务单元允许的兜底冷却圈数（整圈账号全风控 → 长冷却为最后手段）
+# 外部核心已有独立 listeners 时可填写 JSON：各账号 proxy_url/选择组必须分别独立。
+# 例如 {"主号":{"proxy_url":"http://127.0.0.1:17890","group":"profiler-main"},
+#       "alt1":{"proxy_url":"http://127.0.0.1:17891","group":"profiler-alt1"}}
+CLASH_ACCOUNT_ROUTES = os.environ.get("CLASH_ACCOUNT_ROUTES", "")
+# 实际出口探测走 BiliAPIClient，失败保守共享限速；置空可禁用（此时未知出口统一限速）。
+PROXY_IP_CHECK_URL = os.environ.get("PROXY_IP_CHECK_URL", "https://api.ipify.org")
+PROXY_IP_CHECK_INTERVAL = 1800     # 同一入口公网 IP 复查间隔秒数
+PROXY_IP_CHECK_TIMEOUT = 8         # 公网 IP 探测超时秒数
+PROXY_IP_CHECK_ATTEMPTS = 1        # 单次公网 IP 探测请求次数，避免辅助服务故障长时间阻塞
+PROXY_STARTUP_MAX_TRIES = 3        # 首次去重及恢复自检的尝试上限
+PROXY_FAIL_STRIP_THRESHOLD = 3     # 连续代理连接故障达到此值后降级直连
+PROXY_METRICS_WINDOW = 200         # 出口调用耗时 P95 的滑动样本数
+# 单任务单元允许的风控圈数；风控保留原节点并进入出口冷却，不自动跨地区跳转。
 MAX_RISK_ROUNDS = 3
 
 # ========== 破解配置 ==========

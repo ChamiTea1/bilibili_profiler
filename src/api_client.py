@@ -65,6 +65,7 @@ class BiliAPIClient:
         self._lock = threading.RLock()
         # immediate 交互请求的独立串行锁：不与批量限速锁共用（见 _request_immediate）
         self._immediate_lock = threading.Lock()
+        self._egress_gate = None           # 组合池注入：相同实际 IP 共享限速与冷却
         self._wbi_key = None
         self._wbi_key_date = None  # WBI 密钥缓存日期，img_key/sub_key 全站统一、每日更替
         self._wbi_key_fail_ts = 0.0  # WBI 密钥获取失败时刻（负缓存，60s 内不再重打 NAV）
@@ -235,7 +236,7 @@ class BiliAPIClient:
             self._sleep_if_needed(url)
             # setdefault：调用方显式传 timeout（如 _get_wbi_key 的 timeout=10）时保留，避免关键字冲突
             kwargs.setdefault("timeout", 15)
-            return self.session.request(method, url, **kwargs)
+            return self._send_request(method, url, **kwargs)
 
     def _request_immediate(self, method: str, url: str, **kwargs) -> requests.Response:
         """交互式单次请求通道：跳过随机限速间隔（人点一下不属批量行为），但
@@ -252,6 +253,16 @@ class BiliAPIClient:
             time.sleep(remaining)
         with self._immediate_lock:
             kwargs.setdefault("timeout", 15)
+            return self._send_request(method, url, **kwargs)
+
+    def _send_request(self, method, url, **kwargs):
+        """出口限速覆盖重试、WBI/凭证嵌套请求和交互通道，不只约束最外层调用。"""
+        gate = self._egress_gate
+        if gate is None:
+            return self.session.request(method, url, **kwargs)
+        lo, hi = REQUEST_DELAY_LONG if self._is_risk_api(url) else REQUEST_DELAY
+        with gate.request(random.uniform(lo, hi) * self._throttle):
+            self._last_request_time = time.time()
             return self.session.request(method, url, **kwargs)
 
     def get(self, url: str, params: dict = None, headers: dict = None, immediate: bool = False, **kwargs) -> dict:
@@ -466,15 +477,17 @@ class BiliAPIClient:
                     return {"code": -1, "message": f"HTTP错误 {status}"}
         return {"code": -1, "message": "重试次数耗尽"}
 
-    def get_raw(self, url: str, params: dict = None, **kwargs) -> requests.Response:
+    def get_raw(self, url: str, params: dict = None, *, max_attempts: int | None = None,
+                **kwargs) -> requests.Response:
         """带重试的原始响应请求（弹幕 XML 等非 JSON 接口）
 
         重试 MAX_RETRY 次（指数退避+抖动），耗尽后 raise 最后一个异常，由调用方兜底。
         例外：raise_on_risk 模式遇 HTTP 412 抛 RiskControlError；
         任何模式遇代理连接失败抛 ProxyConnError（IP 池故障，立即上报不重试）。
         """
+        attempts = MAX_RETRY if max_attempts is None else max(1, min(MAX_RETRY, max_attempts))
         last_exc = None
-        for attempt in range(MAX_RETRY):
+        for attempt in range(attempts):
             try:
                 resp = self._request_locked("GET", url, params=params, **kwargs)
                 resp.raise_for_status()
@@ -490,7 +503,7 @@ class BiliAPIClient:
                     self._penalize_throttle("触发风控HTTP412(raw)")
                     raise RiskControlError("HTTP 412 风控拦截(raw)") from e
                 last_exc = e
-                if attempt < MAX_RETRY - 1:
+                if attempt < attempts - 1:
                     wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
                     time.sleep(wait)
             except (requests.exceptions.SSLError,
@@ -499,16 +512,32 @@ class BiliAPIClient:
                 if self._proxy_active:
                     raise ProxyConnError(str(e)) from e
                 last_exc = e
-                if attempt < MAX_RETRY - 1:
+                if attempt < attempts - 1:
                     wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
                     time.sleep(wait)
         raise last_exc
 
     def set_proxy(self, url: str | None):
         """设置/清除代理（None 或空串 = 直连）；带认证的代理地址直接内嵌 user:pass@host:port"""
-        with self._lock:
-            self.session.proxies = {"http": url, "https": url} if url else {}
+        with self._immediate_lock, self._lock:
+            proxies = {"http": url, "https": url} if url else {}
+            if self.session.proxies != proxies:
+                self._close_connections()
+                self.session.proxies = proxies
             self._proxy_active = bool(url)
+
+    def _close_connections(self):
+        for adapter in self.session.adapters.values():
+            adapter.close()
+
+    def reset_connections(self):
+        """清除旧代理隧道，保留 Cookie、请求头和 WBI 状态；切组后必须调用。"""
+        with self._immediate_lock, self._lock:
+            self._close_connections()
+
+    def set_egress_gate(self, gate):
+        with self._lock:
+            self._egress_gate = gate
 
     def update_cookies(self, cookies: dict):
         with self._lock:

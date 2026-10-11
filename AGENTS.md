@@ -49,9 +49,10 @@ src/
 ├── web_autostart.py     # 分析完毕自动启动 web.py 并打开报告页（maybe_launch_web，WEB_AUTOSTART 开关）
 ├── config.py            # 全部配置常量：API 端点、限速/重试、采集翻页上限、LLM 配置（含 API Key，已被 .gitignore 排除）
 ├── api_client.py        # BiliAPIClient：HTTP 封装（线程安全限速（区间内随机：基础0.8–1.6s/高风险2–4s）、自适应降速（触发风控×1.5、成功缓慢回落）、重试退避、-412及重签无效的-352/-403风控全局冷却（仅 WBI 端点走重签）、Cookie、WBI签名（密钥获取失败 60s 负缓存）、bili_ticket/buvid3（失败 300s 后可重试）；post() 与 get() 同风控语义；get(immediate=True) 为交互式单次请求免限速通道——仅报告页悬停词云用，风控冷却仍生效）
-├── clash_ctl.py         # Clash/mihomo 控制器封装（列节点/切节点换出口 IP，跨地区跳跃轮换，失败静默降级；死节点名单：健康检查历史判死 + 代理故障即时上报 mark_dead，TTL 复活，全灭回退不过滤）
-├── proxy_core.py        # 内置 mihomo 核心生命周期（SUB_URLS 多订阅→127.0.0.1 随机端口代理+控制器，零安装；自动下载锁定版本且经官方 SHA256 校验不匹配拒绝执行、github.com 直连优先；PDEATHSIG 防孤儿驻留，stop 时清理含凭证 config.yaml）
-├── combo_pool.py        # 账号×IP 组合池（鸭子类型模拟 BiliAPIClient；风控换"新号+新IP"重试，冷却按截止时刻锁外等待（单账号池冷却缩至 SINGLE_ACCOUNT_RISK_COOLDOWN=120s），IP 池故障摘代理降级直连、每 PROXY_RETRY_AFTER=600s 重探恢复；注意内置核心为单 mixed-port 单 select 组，IP 维度全局单点：所有账号共享同一出口 IP；风控「整圈」账本按使用方（`pool_owner()`，web job 即 job_id）隔离，账号轮换与长冷却仍是全局状态）
+├── clash_ctl.py         # Clash/mihomo 控制器：同核心共享死名单和控制锁，每次选节点刷新存活状态，选节点/提交选择原子化；TTL 复活，全灭不绕过死名单
+├── proxy_core.py        # 内置 mihomo：每账号独立 mixed listener/选择组，新增账号热加载（先暂停在途请求、恢复旧选择、失效连接后放行）；端口稳定复用，版本/SHA256 校验、PDEATHSIG；每实例私有运行目录，stop 清配置与 provider 凭证缓存
+├── proxy_pool.py        # 稳定账号出口：主池/分片共享降级与恢复状态，连接故障按请求开始节点归因，切节点后清连接池；实测公网 IP 去重、相同或未知出口共享限速/冷却；请求结果计数与滑动 P95，调度在本进程内生效
+├── combo_pool.py        # 账号组合池：风控保留原节点并冷却，串行阶段可换账号，代理连接故障才切节点；单次请求独立重试预算；显式外部配置→有订阅时内置隔离核心→外部自动探测→直连，外部共享入口不修改全局选择组
 ├── auth.py              # 扫码登录、Cookie 保存/加载/校验/自动刷新、小号池发现（data/cookies/*.json → load_extra_clients，失效自动尝试刷新）
 ├── danmaku.py           # 实时弹幕 XML 解析，按 mid_hash 聚合发送者
 ├── danmaku_history.py   # 历史弹幕采集（逐日弹幕池快照，protobuf wire 手写解析+0x0A 特征校验防错误页误判；失败日记账 failed_dates 优先补采、截断写 truncated、done=1 后重跑滚动补采最近 3 天；每日快照为独立请求无游标链，组合池多号分片时按账号并发采多天，落库/检查点推进在主线程串行；多分P 视频按分P 各采一份（page 参数落库标记 + 检查点键 :pN 隔离，分P 1 沿用原键名故既有报告不重采））
@@ -60,7 +61,7 @@ src/
 ├── crc_rainbow.py       # MITM 中间相遇 CRC32 反查（10万条内存小表，覆盖全部 ≤10 位 UID；惰性建表加双检锁线程安全，预计算 adv5 表，约 49ms/hash）
 ├── spam_detector.py     # 刷屏检测：只标记风险等级（高/中/低），绝不删除弹幕数据；四规则组合计分（最高分+每多触发一条加成 SPAM_COMBO_BONUS）、高频爆发按滑动窗口口径、全池 P95 相对离群补强、群体复读事件检测（detect_repeat_events：同内容 60s 窗内 ≥5 人 ≥8 条的接龙/队列，全视频维度；**双时间轴**——视频内时间轴按分P 分别开窗（接龙发生在同一画面，观众可横跨数月，是主形态），发送时间轴抓真实时间短窗集中刷屏，两轴各自达标才写进结果；内容先按 `_content_key` 归一化合并写法变体——全半角/空白/首尾标点/连续重复字符（？？？→？、666→6、哈哈哈→哈，非 ASCII 字母才折叠以免 good→god），变体并入同一事件后人数取并集、条数求和，事件带 variants/variant_count 供 tooltip）、分布自检（P50/P90/P95 供阈值校准）
 ├── cringe_detector.py   # LLM 问题弹幕检测（八类判定+发送者聚合+llm_cache缓存，key 带口径版本号 v5，批次响应先解析校验成功才落缓存）+ 问题评论检测（同口径，按内容缓存判定、回映 rpid 回写 comments.problem，未配置 LLM_API_KEY 自动跳过；致命 4xx 直接上抛由 phase 层降级，瞬态错误同厂商短退避，整轮重试 LLM_RETRY_BUDGET_SECONDS=1800s 熔断）
-├── user_collector.py    # 四维度用户数据采集（主页/动态/关注/收藏等；采集全程走账号×IP 组合池（combo_pool，鸭子类型透明接管：多号并行分片（每账号一子池、限速按号独立、线程↔分片绑定、吞吐≈账号数倍）、风控换号+切节点重试，冷却锁外等待，IP 池故障自动降级直连并定时重探恢复）；单用户日志行缓冲、完成时原子输出，多线程不交错）
+├── user_collector.py    # 四维度用户数据采集：采集走组合池、多号按账号分片，吞吐受有效出口数与目标接口状况约束；风控降速/冷却，连接故障按入口降级/重探；单用户日志完成时原子输出
 ├── profile_analyzer.py  # 规则式画像分析与标签生成
 ├── llm_analyzer.py      # LLMAnalyzer：重点深掘（兴趣分 top K 单人单调用+llm_cache缓存，OpenAI client 初始化时复用、单次调用超时 LLM_DEEP_TIMEOUT=120s；结果注入 profile 并由阶段7回写 video_profiles（bvid+uid 隔离）（web 报告读库展示，不落库则报告页不可见）；全员粗筛已砍，未配置 Key 自动跳过）
 ├── llm_client.py        # make_client()：统一的 OpenAI 兼容客户端构造，显式声明 httpx trust_env（默认不继承环境代理——all_proxy=socks:// 会让 httpx 直接抛 ValueError 导致所有 LLM 调用秒失败；开关 LLM_TRUST_ENV_PROXY）
@@ -87,9 +88,10 @@ src/
 项目**没有单元测试框架**（无 pytest/unittest 目录）。改动后按"从便宜到贵"三层验证：
 
 ```bash
-# 1) 离线回归（196 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
+# 1) 离线回归（232 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
 python tests/run_all.py            # 主回归 + 评论路径 + 弹幕/评论判定聚合 + 多分P 口径（密度轴/历史采集/样本标注）
 python tests/run_all.py --lint     # 附带 pyflakes（需 pip install pyflakes）
+python tests/offline/regress_proxy_pool.py --mihomo  # 可选 5 项真实核心本机测试（已有 mihomo/openssl，不下载、不访问外网）
 
 # 2) 静态检查（抓未定义名/语法类回归，比运行时踩 NameError 便宜得多）
 python -m pyflakes src/*.py web.py run.py quick_test.py login.py

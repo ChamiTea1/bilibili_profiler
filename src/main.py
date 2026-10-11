@@ -619,8 +619,8 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
     cache_only=True（--skip-collect）：只读库内已采数据，完全不发起网络请求——阶段5
     请求量最大（每人约 21 个请求）、最易触发风控；未采用户本轮不生成画像，去掉参数重跑即续采。
 
-    组合池（ComboPool）：每个请求由池透明接管——风控自动换"新号+新IP"重试，
-    长冷却为池内兜底；兜底耗尽抛 RiskControlError，本 uid 按失败跳过（流水线不中断）。"""
+    组合池（ComboPool）：每个请求由池透明接管，风控保留节点并进入出口冷却，
+    代理连接故障才切节点；预算耗尽抛 RiskControlError，本 uid 按失败跳过。"""
     print("\n[Phase 5/6] 深度采集用户信息...")
 
     # 筛选需要采集的用户（有UID且置信度 acceptable）
@@ -946,8 +946,8 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     # 阶段1: 登录
     client = timer.run("阶段1 登录", phase_login)
 
-    # 账号×IP 组合池：主号+小号轮转，风控换"新号+新IP"重试，长冷却兜底；
-    # IP 池自动发现（外部控制器探测 → SUB_URLS 内置核心），故障自动降级直连
+    # 账号组合池：稳定入口绑定，风控冷却，连接故障才切节点/按入口降级。
+    # 显式外部配置优先，有订阅时优先内置隔离核心，再探测外部静态入口。
     pool = timer.run("阶段1+ 建组合池", build_pool, client)
 
     # --force: 登录成功后清除该视频的全部缓存，后续阶段全部重新采集
