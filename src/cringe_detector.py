@@ -26,6 +26,7 @@ from config import (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, LLM_CO
                     LLM_FALLBACK, CRINGE_BATCH_SIZE, COMMENT_CRINGE_BATCH_SIZE,
                     COMMENT_CRINGE_MAX_ITEMS, LLM_RETRY_BUDGET_SECONDS,
                     LLM_TRANSIENT_RETRIES, LLM_BATCH_THINKING, LLM_DEEP_TIMEOUT)
+from llm_client import make_client   # 统一处理环境代理（默认不继承，见该模块 docstring）
 from storage import load_llm_cache, save_llm_cache
 
 # 问题弹幕类别（prompt 与聚合均引用，勿散落硬编码字符串）
@@ -189,7 +190,7 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
             with clients_lock:              # 双检：并发首用时只建一个 client
                 if pi not in clients:
                     key, base, _, _ = providers[pi]
-                    clients[pi] = OpenAI(api_key=key, base_url=base, max_retries=0)
+                    clients[pi] = make_client(key, base, max_retries=0)
         return clients[pi]
 
     batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
@@ -656,7 +657,7 @@ def detect_density_peaks(bvid: str, peaks: list[dict], video_info: dict) -> dict
 {chr(10).join(lines)}"""
 
     try:
-        client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+        client = make_client(LLM_API_KEY, LLM_BASE_URL)
         extra = _batch_thinking_extra(LLM_BASE_URL, LLM_MODEL)   # 标注类任务同判定口径关思考
         resp = client.chat.completions.create(
             model=LLM_MODEL,

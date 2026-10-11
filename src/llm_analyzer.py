@@ -9,10 +9,10 @@ import json
 import time
 
 import openai
-from openai import OpenAI
 from config import (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, LLM_DEEP_TOP_K,
                     LLM_FALLBACK, LLM_DEEP_TIMEOUT)
 from storage import load_llm_cache, save_llm_cache
+from llm_client import make_client   # 统一处理环境代理（默认不继承）
 
 # 深掘结果缓存口径版本号（prompt/证据包结构变更时递增，使旧缓存自动失效）
 _DEEP_CACHE_VERSION = "v2"
@@ -31,10 +31,10 @@ class LLMAnalyzer:
         self.max_tokens = LLM_MAX_TOKENS
         # OpenAI client 复用（一次创建全程复用，避免每用户重建 TCP/TLS 连接）；
         # 备用厂商第二套（LLM_FALLBACK，key 为空则不建），主用失败重试时切换
-        self.clients = [OpenAI(api_key=self.api_key, base_url=self.base_url)]
+        self.clients = [make_client(self.api_key, self.base_url)]
         self.models = [self.model]
         if LLM_FALLBACK[0]:
-            self.clients.append(OpenAI(api_key=LLM_FALLBACK[0], base_url=LLM_FALLBACK[1]))
+            self.clients.append(make_client(LLM_FALLBACK[0], LLM_FALLBACK[1]))
             self.models.append(LLM_FALLBACK[2])
 
     def _build_evidence(self, p: dict, video_info: dict) -> dict:

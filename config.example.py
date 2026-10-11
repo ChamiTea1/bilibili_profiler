@@ -281,6 +281,12 @@ UID_HARVEST_MAX_PAGES = 500        # 评论 UID 收割（纯翻页取 uid 建 CR
 PROXY_NODE_DEAD_TTL = 660          # 节点死名单 TTL（秒，略大于订阅健康检查间隔 600s，到期允许复活重试）
 COMMENT_REFRESH_MAX_PAGES = 10     # 评论增量刷新（done=1 重跑）按时间序回翻的页数上限
 LLM_BATCH_THINKING = os.environ.get("LLM_BATCH_THINKING", "off")  # 判定批次思考强度：off(关)/low(低档)/default(厂商原生)
+LLM_TRUST_ENV_PROXY = os.environ.get("LLM_TRUST_ENV_PROXY", "") == "1"
+                                   # LLM 客户端是否继承环境代理（默认 False）：
+                                   # 代理客户端常把 all_proxy=socks://... 写进 shell，
+                                   # 而 httpx 无 socks 支持时会直接抛 ValueError，
+                                   # 导致所有 LLM 调用秒失败；三家内置厂商均境内直连可达，
+                                   # 故默认不继承。确需经代理访问厂商时置 1 或设同名环境变量。
 
 # 长图导出：尺寸、质量与资源上限
 LONG_IMAGE_WIDTH = 1080           # 长图基准宽度（像素），高度按区块内容自适应

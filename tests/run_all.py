@@ -40,7 +40,7 @@ def pick_python() -> str:
 PY = pick_python()
 SCRIPTS = [
     "tests/offline/regress_comprehensive_fixes.py", # 全库审查：存储隔离、事务、缓存、失败覆盖和界面
-    "tests/offline/regress_core.py",            # 主回归 14 项
+    "tests/offline/regress_core.py",            # 主回归 13 项
     "tests/offline/regress_comment_path.py",    # 评论采集路径 10 项
     "tests/offline/regress_judge_danmaku.py",   # 问题弹幕判定聚合 4 项
     "tests/offline/regress_judge_comment.py",   # 问题评论判定聚合 3 项
@@ -54,6 +54,10 @@ SCRIPTS = [
     "tests/offline/regress_review_fixes.py",    # 本轮 code review 修复定点验证 10 项
     "tests/offline/regress_blocklist.py",       # B站屏蔽列表导出（选人/误报/低置信度/路由/跨视频）17 项
     "tests/offline/regress_density_peaks.py",   # 弹幕高能点 AI 标注（峰值/缓存/降级）7 项
+    "tests/offline/regress_long_image.py",      # 分享长图导出（payload/渲染护栏/路由/遮蔽）12 项
+    "tests/offline/regress_web_stop.py",        # --stop 兜底与 pidfile 归属 8 项
+    "tests/offline/regress_env_proxy.py",       # 环境代理不得劫持本机调用 6 项
+    "tests/offline/regress_llm_proxy.py",       # LLM 客户端不继承环境代理 5 项
 ]
 SUMMARY_RE = re.compile(r"(\d+) 项通过,\s*(\d+) 项失败")
 

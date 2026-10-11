@@ -3,6 +3,12 @@
 所有失败静默降级（返回 False/[]/None），不抛给上层——IP 池不可用时由 ComboPool 走降级链。
 注意：直连控制器（requests 裸调用），不走 BiliAPIClient（无 B 站限速语义）。
 线程安全：多号并行分片采集时多个池共享同一控制器，节点轮换由锁串行化。
+
+**必须禁用环境代理**：控制器永远在本机（127.0.0.1），而很多代理客户端会把
+http_proxy/https_proxy/all_proxy 写进 shell。此时 requests 默认会把这些本地调用
+也送进代理 → 收到 502/超时 → 表现为「内置核心就绪轮询 60 次全失败、IP 池建不起来、
+启动阶段像卡死」。注意 Python 的 no_proxy 只支持后缀匹配，用户写 127.* 并不生效，
+所以这里不能指望环境变量，只能硬关 trust_env。
 """
 import re
 import threading
@@ -12,6 +18,10 @@ from urllib.parse import urlparse
 import requests
 
 from config import PROXY_NODE_DEAD_TTL
+
+# 控制器请求一律不走环境代理（见模块 docstring；本地回环调用被代理劫持会让建池卡死）
+_SESSION = requests.Session()
+_SESSION.trust_env = False
 
 # 组内伪节点/内置策略名，不进入轮换
 _PSEUDO = {"DIRECT", "REJECT", "PASS", "GLOBAL", "COMPATIBLE"}
@@ -92,7 +102,7 @@ class ClashCtl:
     def available(self) -> bool:
         """控制器连通性自检"""
         try:
-            r = requests.get(f"{self.api_url}/proxies", headers=self._headers(), timeout=3)
+            r = _SESSION.get(f"{self.api_url}/proxies", headers=self._headers(), timeout=3)
             return r.status_code == 200
         except requests.RequestException:
             return False
@@ -100,7 +110,7 @@ class ClashCtl:
     def _fetch_group(self) -> dict:
         """读节点组信息；group 为空时自动挑选第一个非 GLOBAL、含节点的 Selector 组。
         返回 {"name", "all", "now"}；请求异常向上抛（由调用方静默降级）。"""
-        r = requests.get(f"{self.api_url}/proxies", headers=self._headers(), timeout=5)
+        r = _SESSION.get(f"{self.api_url}/proxies", headers=self._headers(), timeout=5)
         r.raise_for_status()
         body = r.json()
         # 防御非预期 JSON 结构（如返回 list/str）：不做 isinstance 检查会让
@@ -190,7 +200,7 @@ class ClashCtl:
                 g = self._fetch_group()
                 if not g["name"]:
                     return False
-                r = requests.put(
+                r = _SESSION.put(
                     f"{self.api_url}/proxies/{requests.utils.quote(g['name'], safe='')}",
                     headers=self._headers(), json={"name": name}, timeout=5)
                 if r.status_code in (200, 204):

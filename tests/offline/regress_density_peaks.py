@@ -26,6 +26,7 @@ def check(name, cond, extra=""):
 
 
 import cringe_detector as cd
+import llm_client as lc   # 假客户端注入点
 import web as webmod
 
 BV = "BVpeak000001"
@@ -61,7 +62,7 @@ class FakeOpenAI:
 
 cd.LLM_API_KEY = "offline-test-key"
 cd.LLM_FALLBACK = ("", "", "", "")
-cd.OpenAI = FakeOpenAI
+lc.OpenAI = FakeOpenAI
 webmod.LLM_API_KEY = "offline-test-key"   # web 侧开关（_annotate_density_peaks 的零成本路径判定）
 
 print("=== 1. 峰值检测 + LLM 标注 + 挂载 ===")
@@ -92,14 +93,14 @@ check("弹幕量变化 → 指纹失效重新标注", CNT["n"] == n1 + 1,
       "(调用 %d 次)" % (CNT["n"] - n1))
 
 print("=== 3. 降级路径 ===")
-saved = cd.OpenAI
+saved = lc.OpenAI
 
 class FakeBoom:
     def __init__(self, **kw):
         self.chat = type("Chat", (), {"completions": type("C", (), {
             "create": staticmethod(lambda **kw: (_ for _ in ()).throw(RuntimeError("模拟故障")))})()})()
 
-cd.OpenAI = FakeBoom
+lc.OpenAI = FakeBoom
 BV2 = "BVpeak000002"
 storage.save_video_info(BV2, {"bvid": BV2, "title": "t2", "cid": 2, "duration": DUR})
 storage.append_danmaku(BV2, [_dm(50 + i * 0.5, "吵架%d" % i, 5000 + i) for i in range(15)], set())
@@ -107,7 +108,7 @@ d_fail = webmod._danmaku_density(BV2, DUR, {})
 d_fail = webmod._annotate_density_peaks(BV2, d_fail, {})
 check("LLM 失败静默降级（无标注、不抛异常）",
       not d_fail["pages"][0].get("peaks"), "(peaks %s)" % d_fail["pages"][0].get("peaks"))
-cd.OpenAI = saved
+lc.OpenAI = saved
 saved_key = webmod.LLM_API_KEY
 webmod.LLM_API_KEY = ""
 d_nokey = webmod._danmaku_density(BV, DUR, {})

@@ -31,6 +31,7 @@ import web
 import main
 import comment
 import cringe_detector as cd
+import llm_client as lc   # 假客户端注入点
 import danmaku_history as dh
 import danmaku
 import api_client
@@ -278,7 +279,7 @@ builder = lambda batch, start, vi: json.dumps({"batch": batch, "start": start})
 def shifted_batch():
     FakeOpenAI.calls = []
     batch = [{"content": "普通评论"}, {"content": "坏评论"}]
-    with patch.object(cd, "OpenAI", FakeOpenAI), patch.object(cd, "LLM_CONCURRENCY", 1), \
+    with patch.object(lc, "OpenAI", FakeOpenAI), patch.object(cd, "LLM_CONCURRENCY", 1), \
          patch.object(cd, "LLM_FALLBACK", ("", "", "", "")):
         first = cd._judge_batches(batch, 2, {}, builder, "测试", "review-shift")
         shifted = cd._judge_batches([{"content": "新增甲"}, {"content": "新增乙"}] + batch,
@@ -566,7 +567,7 @@ def llm_budget():
             raise RuntimeError("模拟服务故障")
     def sleep(seconds):
         clock["now"] += seconds
-    with patch.object(cd, "OpenAI", SlowOpenAI), patch.object(cd, "LLM_CONCURRENCY", 1), \
+    with patch.object(lc, "OpenAI", SlowOpenAI), patch.object(cd, "LLM_CONCURRENCY", 1), \
          patch.object(cd, "LLM_RETRY_BUDGET_SECONDS", 1), \
          patch.object(cd.time, "monotonic", lambda: clock["now"]), patch.object(cd.time, "sleep", sleep), \
          patch.object(cd, "LLM_FALLBACK", ("", "", "", "")):

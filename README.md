@@ -151,7 +151,7 @@ python login.py alt3
 | 复核低置信度身份 | **低置信度**：集中列出 CRC32 反查得到的、存在碰撞风险的解析结果，便于人工判断是否误识别 |
 | 纠正 LLM 误判 | 问题弹幕/问题评论条目右侧的「**误报**」按钮：标记后立即从统计与用户疑似分中扣除，可撤销，跨重跑保留 |
 | 脱敏后展示/截图 | 首页或报告页的「隐藏信息」开关：昵称只留末字、UID 只留前三位（全局生效） |
-| 存档或分享 | 浏览器 `Ctrl+P` 打印成 PDF（已配打印样式）；标签页与筛选状态都写在 URL 里，复制链接即可还原现场 |
+| 存档或分享 | 概览操作条「**🖼 导出长图**」：把数据总览/问题弹幕榜/争执焦点/问题评论榜/群体复读/用户画像渲染成一张竖版 PNG，便于转发；跟随「隐藏信息」开关遮蔽昵称。也可浏览器 `Ctrl+P` 打印成 PDF（已配打印样式）；标签页与筛选状态都写在 URL 里，复制链接即可还原现场 |
 | 重跑 / 删除某个视频 | 报告页概览操作条：🔄 重新生成（后台跑完整流水线）/ 🗑 删除报告（清空该视频全部数据与导出文件） |
 
 ## 断点续采机制
@@ -188,6 +188,7 @@ python login.py alt3
 | `HISTORY_MULTIPAGE_ENABLED` / `HISTORY_MULTIPAGE_MAX_PAGES` | 分P视频是否/最多采前几个分P 的历史弹幕 | `True` / `4` |
 | `ANALYZE_USERS_FLOOR` / `_RATIO` / `MAX_ANALYZE_USERS_HARD_CAP` | 定员上限：保底 / 按发送者比例 / 封顶 | `300` / `0.05` / `1000` |
 | `LLM_DEEP_TOP_K` | AI 深掘人数（兴趣分 top K） | `20` |
+| `LLM_TRUST_ENV_PROXY` | LLM 客户端是否继承 shell 里的代理（**默认不继承**；代理写入 `all_proxy=socks://` 时可致 LLM 调用全部秒失败） | `False` |
 | `--port`（命令行） / `PROFILER_PORT`（环境变量） | Web 服务端口（**命令行优先**；Windows 上建议用 `--port`） | `8001` |
 
 > ⚠️ 调低 `REQUEST_DELAY` 会显著提高触发 B站风控的概率，不建议；其余取值影响的是耗时与覆盖度，可按需调整。
@@ -264,6 +265,9 @@ Cookie 里带 `_refresh_token` 时会自动续期；若没有它（或刷新失�
 **报告页打不开 / 提示端口被占用？**
 换端口：`python web.py --port 9000`（Windows 的 cmd/PowerShell 不支持 `PROFILER_PORT=9000 python web.py` 这种 bash 写法，请用 `--port`；环境变量仍可用，写法见「快速开始」）；停掉占用端口的旧实例：`python web.py --stop --port 9000`（不带 `--port` 则针对 8001；它按 pidfile 校验确实是本项目的 web.py 才动手，不会误杀别的进程）。
 
+**启动时卡在「小号池」那一行不动（几分钟没输出）？**
+先看终端里有没有代理环境变量（`env | grep -i proxy`）。代理客户端常会写入 `http_proxy/https_proxy/all_proxy`，而 Python 的 `no_proxy` **只做后缀匹配**——写 `127.*` 并不生效，本机回环调用会被送进代理并收到 502。本工具已对本机调用强制绕过环境代理（`clash_ctl` 的控制器请求、自动打开报告页的探测），若你用的是旧版本，可临时用 `env -u http_proxy -u https_proxy -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY python run.py <BV号>` 跳过；也可设 `WEB_AUTOSTART=False`、`CLASH_ENABLED=0` 减少无关环节。
+
 **为什么这么慢 / 一直在冷却？**
 B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风险接口 2–4 秒），热门视频必然是小时级。可以：① `--max-users 50` 限制分析人数；② 配小号池（`python login.py alt1`）与 IP 池（`SUB_URLS`）提升吞吐；③ 中途 Ctrl+C，重跑会从检查点续采、不重复已采数据。
 
@@ -330,7 +334,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ### 7. 工程现状
 
 - 项目**没有单元测试框架**，端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（158 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
+- 现有离线检查手段：**`python tests/run_all.py`**（190 项离线回归，秒级、无需网络与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查（抓未定义名这类回归）。改动后建议再跑一次真实冒烟（`quick_test.py` 或 `run.py`）。
 
 ## 免责声明
 
@@ -387,7 +391,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 项目没有单元测试框架，验证分三层，从便宜到贵：
 
 ```bash
-# 1) 离线回归：158 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
+# 1) 离线回归：190 项检查，秒级完成，不联网、不用 Cookie、不消耗 LLM 额度（隔离临时库，不碰 data/profiler.db）
 python tests/run_all.py            # 跑全部离线回归并汇总
 python tests/run_all.py --lint     # 附带 pyflakes 静态检查（需先 pip install pyflakes）
 python tests/offline/regress_core.py   # 也可单独跑某一个脚本
@@ -418,6 +422,10 @@ python run.py <BV号>                     # 完整流水线
 | `tests/offline/regress_port_config.py` | 5 | 端口解析优先级（`--port` > `PROFILER_PORT` > 8001）、非法/越界回退、两个入口的 `--help` 都暴露 `--port`（Windows 换端口可用性） |
 | `tests/offline/regress_review_fixes.py` | 10 | 全库审查修复定点验证：批量模式不被 SystemExit 击穿、LLM 批次缓存保序指纹、CancelledError 不穿透降级链、历史弹幕达上限后滚动补采不冻结、`shard_pools` 继承代理恢复链等 |
 | `tests/offline/regress_blocklist.py` | 11 | B站屏蔽列表导出：三标准选人、误报扣除、低置信度默认排除、严重度排序截断、条目口径（type=2）、路由下载与 404/400 口径 |
+| `tests/offline/regress_env_proxy.py` | 6 | 环境代理（http_proxy/https_proxy/all_proxy）不得劫持**本机**调用：本机假控制器 + 代理指向死端口，验证 `clash_ctl` 与自动打开报告页的探测仍能打通（Python 的 `no_proxy` 不认 `127.*`） |
+| `tests/offline/regress_llm_proxy.py` | 6 | LLM 客户端不继承环境代理：裸 SDK 在 `all_proxy=socks://` 下必失败（前提校验），`llm_client.make_client` 必须照常调通（判定批次 thinking 参数路径一并验证） |
+| `tests/offline/regress_web_stop.py` | 8 | `--stop` 兜底（pidfile 缺失/失效时按监听端口反查 ss/lsof/netstat）与 pidfile 归属守卫（老实例退出不再误删新实例记录）、身份校验不误杀无关进程 |
+| `tests/offline/regress_long_image.py` | 12 | 分享长图：payload 装配与截断、渲染尺寸/像素护栏、路由确实接线、跟随「隐藏信息」开关遮蔽（该用例曾抓出 `_apply_danmaku_fp` 返回值误用导致画像整段消失）） |
 
 `tests/run_all.py` 会自动挑选带依赖的解释器（当前解释器 → 仓库 `.venv`），从任意目录运行均可，失败时退出码非 0，可直接接 CI。
 

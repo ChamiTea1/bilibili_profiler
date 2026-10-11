@@ -53,6 +53,7 @@ check("登录失败中止批量（后续视频不再空转）", calls == ["BVfai
 
 print("=== 2. 批次缓存指纹保序（防下标张冠李戴）===")
 import cringe_detector as cd
+import llm_client as lc   # 假客户端注入点
 CNT = {"n": 0}
 class _Comp:
     def create(self, **kw):
@@ -62,7 +63,7 @@ class _Comp:
 class FakeOpenAI:
     def __init__(self, **kw):
         self.chat = type("Chat", (), {"completions": _Comp()})()
-cd.OpenAI = FakeOpenAI
+lc.OpenAI = FakeOpenAI
 cd.LLM_FALLBACK = ("", "", "", "")
 cd.LLM_CONCURRENCY = 1
 PROMPT = lambda b, s, v: "p"
@@ -89,7 +90,7 @@ class _CompHallu:
 class FakeOpenAI2:
     def __init__(self, **kw):
         self.chat = type("Chat", (), {"completions": _CompHallu()})()
-cd.OpenAI = FakeOpenAI2
+lc.OpenAI = FakeOpenAI2
 # 单批覆盖全部 3 条（合法区间 [0,3)）：i=5 属跨批幻觉下标，应被过滤；i=1 保留
 verdicts, failed, total = cd._judge_batches(
     [{"content": "x"}, {"content": "y"}, {"content": "z"}], 3, vi, PROMPT, "测试")
@@ -106,7 +107,7 @@ class _CompFatal:
 class FakeOpenAI3:
     def __init__(self, **kw):
         self.chat = type("Chat", (), {"completions": _CompFatal()})()
-cd.OpenAI = FakeOpenAI3
+lc.OpenAI = FakeOpenAI3
 raised = None
 try:
     cd._judge_batches([{"content": "a"}, {"content": "b"}], 1, vi, PROMPT, "测试")

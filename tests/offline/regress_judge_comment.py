@@ -18,6 +18,7 @@ import storage, config
 storage.DB_PATH = os.path.join(TMP, "t.db"); config.DB_PATH = storage.DB_PATH
 storage.init_db()
 import cringe_detector as cd
+import llm_client as lc   # 假客户端注入点
 
 ok = fail = 0
 def check(name, cond, extra=""):
@@ -41,7 +42,7 @@ class FakeOpenAI:
 
 cd.LLM_API_KEY = "offline-test-key"   # 判定入口在 Key 为空时会直接跳过，离线用例注入占位值
 cd.LLM_FALLBACK = ("", "", "", "")     # 只走主用厂商（假客户端）
-cd.OpenAI = FakeOpenAI
+lc.OpenAI = FakeOpenAI
 cd.COMMENT_CRINGE_BATCH_SIZE = 2
 cd.LLM_CONCURRENCY = 1
 

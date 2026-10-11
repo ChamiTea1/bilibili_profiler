@@ -17,6 +17,11 @@ import webbrowser
 
 from config import WEB_AUTOSTART, DATA_DIR
 
+# 本机探测必须绕开环境代理：代理客户端常把 http_proxy 写进 shell，而 Python 的
+# no_proxy 不支持 127.* 这类通配（只做后缀匹配），否则本地探测会被送进代理、
+# 拿到 502 而误判「服务没起来」。ProxyHandler({}) 显式声明无代理。
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 # bvid 合法性校验（拼 URL 前防御）
 _BVID_RE = re.compile(r"^BV[A-Za-z0-9]+$")
 
@@ -42,13 +47,14 @@ def maybe_launch_web(bvid: str):
         print(f"  运行 python web.py 后访问报告页: {url}")
         return
 
+
     # 1 秒超时探测：无服务时快速失败，不阻塞主流程收尾。
     # 探测 web.py 专有的弹幕 JSON API 并校验响应特征（含 rows/error 键的 JSON），
     # 非"任意 HTTP 200 即判就绪"——避免端口被其他服务占用时误判
     def _alive() -> bool:
         probe = f"http://127.0.0.1:{port}/api/video/{safe_bvid}/danmaku?page=1&page_size=50"
         try:
-            with urllib.request.urlopen(probe, timeout=1) as resp:
+            with _LOCAL_OPENER.open(probe, timeout=1) as resp:
                 payload = resp.read()
         except urllib.error.HTTPError as e:
             # 4xx/5xx 同样说明有 HTTP 服务在应答，仍需校验是否为 web.py 的 JSON 错误体

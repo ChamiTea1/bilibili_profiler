@@ -20,6 +20,7 @@ import sys
 import os
 import json
 import glob
+import io
 import re
 import argparse
 import atexit
@@ -1169,6 +1170,21 @@ def _variant_title(e: dict) -> str:
     return "\n".join(lines) or e.get("content", "")
 
 
+def _repeat_events_data(bvid: str) -> tuple[list, dict]:
+    """群体复读事件取数：返回 (events, 全池分布)。无弹幕时返回 ([], {})。
+
+    概览页区块与分享长图共用——两处口径必须一致，否则图上与页上数字对不上。"""
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT content, mid_hash, time, timestamp, page FROM danmaku WHERE bvid = ?",
+            (bvid,)).fetchall()
+    if not rows:
+        return [], {}
+    # sqlite3.Row 无 .get，转 dict 再喂给检测函数
+    dict_rows = [dict(r) for r in rows]
+    return detect_repeat_events(dict_rows), pool_distribution_from_rows(dict_rows)
+
+
 def _repeat_events_block(bvid: str) -> str:
     """概览页「群体复读事件」区块：全视频维度的接龙/+1 队列刷屏检测
     （spam_detector.detect_repeat_events：同一内容在 60s 窗口内被 ≥5 个不同发送者
@@ -1178,16 +1194,9 @@ def _repeat_events_block(bvid: str) -> str:
     可点跳转核验）+ **发送时间**（真实时间短窗集中刷屏）。底部附全池分布自检行
     （pool_distribution_from_rows：发送者数、弹幕数与重复率的 P50/P95），供阈值校准。
     无弹幕数据返回 ""（不渲染区块）。"""
-    with closing(get_db()) as conn:
-        rows = conn.execute(
-            "SELECT content, mid_hash, time, timestamp, page FROM danmaku WHERE bvid = ?",
-            (bvid,)).fetchall()
-    if not rows:
+    events, dist = _repeat_events_data(bvid)
+    if not events and not dist:
         return ""
-    # sqlite3.Row 无 .get，转 dict 再喂给检测函数
-    dict_rows = [dict(r) for r in rows]
-    events = detect_repeat_events(dict_rows)
-    dist = pool_distribution_from_rows(dict_rows)
     if events:
         trs = "".join(
             f'<tr><td title="{esc(_variant_title(e))}">{esc(_truncate(e["content"], 30))}'
@@ -2567,6 +2576,8 @@ def video_page(bvid: str):
                     导出含真实 UID，不受「隐藏信息」开关影响（屏蔽必须用真实 UID）。</p>
                 </div>
             </details>
+            <a class="filter-btn" href="/api/video/{esc(bvid)}/longimage" target="_blank" rel="noopener"
+               title="把本视频的精华内容渲染成一张竖版长图（数据总览/问题弹幕榜/争执焦点/问题评论榜/群体复读/用户画像），可直接保存转发；跟随「隐藏信息」开关遮蔽昵称">🖼 导出长图</a>
             <span id="reportJobStatus"></span>
         </div>
         {coverage_note}
@@ -3048,6 +3059,69 @@ def api_blocklist_cross():
     return resp
 
 
+@app.route("/api/video/<bvid>/longimage")
+@_db_guard
+def api_longimage(bvid: str):
+    """分享长图导出：把概览里最值得传播的内容渲染成一张竖版 PNG（Pillow 服务端出图）。
+
+    与网页报告同口径：**同一批取数函数**（_load_profiles / _attack_focus /
+    _problem_comment_board / _repeat_events_data / _danmaku_panel_stats）+ 误报扣除，
+    保证图上的数字与榜单跟页面上一致。
+
+    隐藏信息（mask Cookie）跟随网页开关：_load_profiles/_attack_focus/
+    _problem_comment_board 内部已按 _mask_on() 遮蔽昵称，故开启后导出的长图也是
+    遮蔽版（分享出去不泄露昵称）；关闭则与页面一致显示真实昵称。
+    单次渲染约 1 秒（两遍绘制），不落盘、不缓存：数据更新后立刻反映到下一次导出。"""
+    row = _load_video_row(bvid)
+    if row is None:
+        abort(404)
+    try:
+        video_info = json.loads(row["video_info_json"]) if row["video_info_json"] else {}
+    except Exception:
+        video_info = {}
+    profiles = _load_profiles(bvid)
+    if not profiles:
+        return jsonify({"error": "该视频暂无画像数据（或尚未解析出任何 UID），无法出图"}), 404
+    fp = load_false_positives(bvid)
+    fp_dm = {t for k, t in fp if k == "dm"}
+    fp_cmt = {t for k, t in fp if k == "cmt"}
+    # 注意：_apply_danmaku_fp 是**就地**扣除误报弹幕，返回的是"被扣除的误报内容列表"
+    # （供榜单底部撤销入口），不能拿返回值当 profiles——否则画像/榜单会整段消失
+    _apply_danmaku_fp(profiles, fp_dm)
+    profiles = sort_profiles_by_risk(profiles)
+    stats = generate_summary_stats(profiles)
+    chart = generate_chart_data(profiles)
+    # 问题弹幕类别分布与弹幕浏览器面板同源（cat_counts 只在 _danmaku_panel_stats 里算）
+    panel = _danmaku_panel_stats(bvid) or {}
+    chart["cat_counts"] = panel.get("categories", {})
+    # 问题弹幕榜单排序与 generate_cringe_board 同口径（最高严重度 → 命中条数）
+    cringe_entries = [p for p in profiles if (p.get("cringe") or {}).get("count", 0) >= 1]
+    cringe_entries.sort(key=lambda p: ((p.get("cringe") or {}).get("max_severity", 0),
+                                       (p.get("cringe") or {}).get("count", 0)), reverse=True)
+    attack = _attack_focus(bvid, fp_cmt)
+    problem_comments, _marked = _problem_comment_board(bvid, fp_cmt)
+    repeat_events, _dist = _repeat_events_data(bvid)
+    low_conf = _low_conf_tab_html(bvid)[1]
+    payload = build_payload(bvid, video_info, profiles, stats, chart, cringe_entries,
+                            attack, problem_comments, repeat_events, low_conf)
+    try:
+        img = render_long_image(payload)
+    except Exception as e:
+        # 出图失败不影响报告页：给前端一个可读错误，具体原因留在服务端日志
+        print(f"[Web] 分享长图渲染失败（{bvid}）: {e}")
+        return jsonify({"error": f"长图渲染失败: {e}"}), 500
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    data = buf.getvalue()
+    safe_name = re.sub(r"[^A-Za-z0-9_-]", "", bvid) or "video"
+    resp = Response(data, mimetype="image/png")
+    # inline：浏览器直接显示长图（右键/长按保存），不强制下载
+    resp.headers["Content-Disposition"] = f'inline; filename="longimage_{safe_name}.png"'
+    resp.headers["Cache-Control"] = "no-store"
+    print(f"[Web] 分享长图已生成（{bvid}）: {img.width}x{img.height}, {len(data) // 1024} KB")
+    return resp
+
+
 @app.route("/api/video/<bvid>/danmaku")
 def api_danmaku(bvid: str):
     """弹幕 JSON API（spec 4）。
@@ -3289,9 +3363,22 @@ def _write_pid(port: int):
         json.dump(record, f, ensure_ascii=False)
 
 
-def _clear_pid(port: int):
+def _clear_pid(port: int, force: bool = False):
+    """删除该端口的 pidfile。
+
+    默认**只删属于本进程的那条记录**：老实例退出时的 atexit / SIGTERM 处理器会无条件
+    删除文件，若此时新实例已写入自己的记录，就会把新实例的 pidfile 误删——端口被占
+    却再也停不掉。force=True 供 --stop 清理"已确认失效/已停止"的记录。"""
+    path = _pid_file(port)
+    if not force:
+        try:
+            with open(path, encoding="utf-8") as f:
+                if int(json.load(f).get("pid", -1)) != os.getpid():
+                    return
+        except (OSError, ValueError, TypeError):
+            return
     try:
-        os.remove(_pid_file(port))
+        os.remove(path)
     except OSError:
         pass
 
@@ -3324,27 +3411,95 @@ def _pid_is_webpy(pid: int, started: str | None = None, recorded_cwd: str = "") 
     return os.path.realpath(script) == os.path.realpath(__file__)
 
 
+def _parse_listener_pids(text: str, port: int = 0) -> list[int]:
+    """从 ss / lsof / netstat 输出解析"监听进程 PID"（纯函数，便于离线测试）。
+
+    - ss -ltnp:      ... users:(("python",pid=123,fd=3))
+    - lsof -ti:      每行一个 PID
+    - netstat -ano:  TCP  127.0.0.1:8000  0.0.0.0:0  LISTENING  123（按端口过滤，
+                     否则会把别的端口的监听进程也算进来）"""
+    pids: list[int] = []
+
+    def _add(p: int):
+        if p not in pids:
+            pids.append(p)
+
+    for m in re.finditer(r"pid=(\d+)", text or ""):
+        _add(int(m.group(1)))
+    if pids:
+        return pids
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s.isdigit():
+            _add(int(s))
+            continue
+        if re.search(r"LISTENING", s, re.IGNORECASE) and (not port or (":%d" % port) in s):
+            m = re.search(r"(\d+)\s*$", s)
+            if m:
+                _add(int(m.group(1)))
+    return pids
+
+
+def _listening_pids(port: int) -> list[int]:
+    """监听该端口的进程 PID（pidfile 缺失/失效时的兜底）。
+
+    依次尝试 ss（iproute2）→ lsof → netstat；都不可用返回 []。返回的 PID **必须**再用
+    _pid_is_webpy 验明是本项目 web.py 才允许 kill——不做"谁占端口杀谁"。"""
+    if sys.platform.startswith("win"):
+        cmds = [["netstat", "-ano", "-p", "TCP"]]
+    else:
+        cmds = [["ss", "-ltnpH", "sport = :%d" % port], ["ss", "-ltnp", "sport = :%d" % port],
+                ["lsof", "-ti", "tcp:%d" % port, "-sTCP:LISTEN"], ["netstat", "-ltnp"]]
+    for cmd in cmds:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0 and (proc.stdout or "").strip():
+            pids = _parse_listener_pids(proc.stdout, port)
+            if pids:
+                return pids
+    return []
+
+
 def _stop_server(port: int):
     """python web.py --stop：停止该端口的后台 web 服务并释放端口。
 
-    读 pidfile → 校验进程确为本项目 web.py（否则只清残留 pidfile）→ SIGTERM
-    优雅停止，1 秒内未退出则 SIGKILL 兜底；最后清理 pidfile。"""
+    先读 pidfile 并校验进程确为本项目 web.py（防 PID 复用误杀）；**pidfile 缺失、
+    内容失效或指向的进程已不在时，兜底按「谁在监听该端口」反查**，仍须验明是本项目
+    web.py 才动手——「端口被占用却停不掉」由此收敛（老实例退出误删 pidfile 是已知成因）。
+    停止策略：SIGTERM 优雅退出，1 秒内未退出则 SIGKILL 兜底；最后清理 pidfile。"""
     pid_path = _pid_file(port)
+    pid = None
+    started = None
+    recorded_cwd = ""
     try:
         with open(pid_path, encoding="utf-8") as f:
             record = json.load(f)
-            pid = int(record["pid"])
-            started = record["started"]
-            recorded_cwd = record.get("cwd", "")
-            if (not started or record["port"] != port
-                    or record["script"] != os.path.realpath(__file__)):
-                raise ValueError("服务身份不匹配")
+        pid = int(record["pid"])
+        started = record["started"]
+        recorded_cwd = record.get("cwd", "")
+        if (not started or record["port"] != port
+                or record["script"] != os.path.realpath(__file__)):
+            raise ValueError("服务身份不匹配")
     except (OSError, ValueError, KeyError, TypeError):
-        print(f"[Web] 未发现 {port} 端口的服务记录（{pid_path} 不存在），服务可能未在运行")
-        return
-    if not _pid_is_webpy(pid, started, recorded_cwd):
+        pid = None
+    if pid is not None and not _pid_is_webpy(pid, started, recorded_cwd):
         print(f"[Web] 记录中的进程 {pid} 已不存在或不是本项目的 web.py，清理残留 pidfile")
-        _clear_pid(port)
+        _clear_pid(port, force=True)
+        pid = None
+    if pid is None:
+        # 兜底：pidfile 缺失/被误删/记录过期时按监听端口反查（仍须是本项目的 web.py）。
+        # recorded_cwd 传本项目根目录：进程以相对路径启动时靠它解析脚本参数
+        _here = os.path.dirname(os.path.abspath(__file__))
+        for cand in _listening_pids(port):
+            if _pid_is_webpy(cand, None, _here):
+                print(f"[Web] pidfile 无有效记录，按监听端口反查到本项目的 web.py (pid={cand})")
+                pid = cand
+                break
+    if pid is None:
+        print(f"[Web] 未发现 {port} 端口的本项目 web.py（{pid_path} 无有效记录，"
+              f"当前也没有本项目的 web.py 在监听该端口）")
         return
     try:
         os.kill(pid, signal.SIGTERM)
@@ -3362,7 +3517,7 @@ def _stop_server(port: int):
         except (AttributeError, OSError):
             pass    # Windows 无 SIGKILL（os.kill 的 SIGTERM 即 TerminateProcess）
         time.sleep(0.1)
-    _clear_pid(port)
+    _clear_pid(port, force=True)   # 记录属于被停掉的进程，需强制清理
     print(f"[Web] 已停止 {port} 端口的 web 服务 (pid={pid})，端口已释放")
 
 

@@ -178,6 +178,7 @@ del os.environ["PROFILER_PORT"]
 
 print("=== 5. P1-10 单批退避受预算约束 ===")
 import cringe_detector as cd, httpx, openai
+import llm_client as lc   # 假客户端注入点：客户端统一由 llm_client 构造
 cd.LLM_RETRY_BUDGET_SECONDS = 3
 class FakeClient:
     class chat:
@@ -186,7 +187,7 @@ class FakeClient:
             def create(**kw):
                 raise openai.APIConnectionError(request=httpx.Request("POST", "http://x"))
     def __init__(s, **kw): pass
-cd.OpenAI = FakeClient
+lc.OpenAI = FakeClient
 cd.LLM_FALLBACK = ("", "", "", "")
 t0 = time.monotonic()
 verdicts, failed, total = cd._judge_batches([{"content": "hi"}], 1, {"title": "t", "bvid": "BV1"}, lambda b, s, v: "p", "测试")
