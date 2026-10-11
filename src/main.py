@@ -908,13 +908,23 @@ class PhaseTimer:
         print(f"[计时] 总耗时: {self._fmt(total)}")
 
 
+def _deep_enabled(skip_deep: bool = False) -> bool:
+    """阶段7（LLM 重点深掘）是否执行：全局开关与单次 --skip-deep 必须同时为真。
+
+    LLM_DEEP_ENABLED（config.py）是"永久关"；--skip-deep 是"这次不跑"——
+    两者取与，便于同一份配置下临时省 token/时间（深掘结果有 deep:{uid} 缓存，
+    下次开启只补没算过的人）。"""
+    return bool(LLM_DEEP_ENABLED) and not skip_deep
+
 def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, launch_web: bool = True,
-                 skip_collect: bool = False, port: int | None = None):
+                 skip_collect: bool = False, port: int | None = None, skip_deep: bool = False):
     """
     执行完整分析流程
 
     launch_web=False 供批量模式使用（避免逐视频开浏览器标签页）
     skip_collect=True（--skip-collect）：阶段5 只读库内已采数据、不发起采集请求
+    skip_deep=True（--skip-deep）：跳过阶段7 LLM 重点深掘（只少 ai_deep 文字画像，
+    其余判定/画像/报告照常；深掘结果有缓存，之后开启只补没算过的人）
     port（--port）：Web 报告端口；写入 PROFILER_PORT 环境变量，供 web_autostart
     拉起子进程与拼接报告页 URL 时读取（Windows 上用参数比设环境变量可靠）
     """
@@ -929,7 +939,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
         max_users = max(1, max_users)
 
     # --port：写入环境变量后，web_autostart.maybe_launch_web 拉起的 web.py 子进程
-    # （继承环境）与它拼接的报告页 URL 会一致地用该端口；未传则沿用现有环境/默认 8000
+    # （继承环境）与它拼接的报告页 URL 会一致地用该端口；未传则沿用现有环境/默认 8001
     if port is not None:
         os.environ["PROFILER_PORT"] = str(port)
 
@@ -1052,11 +1062,13 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     profiles = timer.run("阶段6 画像分析", phase_analyze, resolved, spam_results, user_data_map,
                          sender_groups, comment_location_map, uid_comments, video_info)
 
-    # 阶段7: LLM 重点深掘（结果在 phase 内直接注入 profile；LLM_DEEP_ENABLED 可整段关闭）
-    if LLM_DEEP_ENABLED:
+    # 阶段7: LLM 重点深掘（结果在 phase 内直接注入 profile）
+    # 跳过条件：config.LLM_DEEP_ENABLED=False（永久关）或本次 --skip-deep（临时关）
+    if _deep_enabled(skip_deep):
         timer.run("阶段7 LLM深掘", phase_ai_analysis, video_info, profiles)
     else:
-        print("\n[Phase 7] 跳过 (config.py 中 LLM_DEEP_ENABLED=False)")
+        why = "--skip-deep" if skip_deep else "config.py 中 LLM_DEEP_ENABLED=False"
+        print(f"\n[Phase 7] 跳过 LLM 深掘（{why}）；其余报告内容不受影响")
 
     # 静态单文件 HTML 报告已被交互式 Web 报告（web.py）完全替换，不再生成 .html
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1109,7 +1121,7 @@ def load_batch_bvids(path: str) -> list[str]:
 
 
 def run_batch(batch_file: str, force: bool = False, max_users: int | None = None,
-              skip_collect: bool = False, port: int | None = None):
+              skip_collect: bool = False, port: int | None = None, skip_deep: bool = False):
     """批量分析：逐个视频调用 run_analysis，单个失败只警告不中断，最后打印汇总"""
     bvids = load_batch_bvids(batch_file)
     if not bvids:
@@ -1131,7 +1143,7 @@ def run_batch(batch_file: str, force: bool = False, max_users: int | None = None
             continue
         try:
             run_analysis(bvid, force=force, max_users=max_users, launch_web=False,
-                         skip_collect=skip_collect, port=port)
+                         skip_collect=skip_collect, port=port, skip_deep=skip_deep)
             succeeded.append(bvid)
         except KeyboardInterrupt:
             # Ctrl+C 不再继续后续视频，但仍打印已完成的汇总
@@ -1174,15 +1186,18 @@ def main():
     parser.add_argument("--skip-collect", action="store_true",
                         help="跳过阶段5用户采集的网络请求：只用库内已采数据（未采用户本轮不出画像），"
                              "适合不想再打接口时刷新报告；与 --force 同用会因缓存被清而无画像可用")
+    parser.add_argument("--skip-deep", action="store_true",
+                        help="跳过阶段7 LLM 重点深掘（只少 ai_deep 文字画像，判定/画像/报告照常；"
+                             "深掘有缓存，之后重跑只补没算过的人）")
     parser.add_argument("--port", type=int, default=None, metavar="PORT",
-                        help="Web 报告端口（默认 8000；等价于设置 PROFILER_PORT，"
+                        help="Web 报告端口（默认 8001；等价于设置 PROFILER_PORT，"
                              "但 Windows 的 cmd/PowerShell 上参数写法才不会踩坑）")
     args = parser.parse_args()
 
     if args.batch:
         try:
             run_batch(args.batch, force=args.force, max_users=args.max_users,
-                      skip_collect=args.skip_collect, port=args.port)
+                      skip_collect=args.skip_collect, port=args.port, skip_deep=args.skip_deep)
         except OSError as e:
             print(f"错误: 批量清单文件不可读: {args.batch} ({e})")
             sys.exit(1)
@@ -1199,7 +1214,7 @@ def main():
 
     try:
         run_analysis(bvid, force=args.force, max_users=args.max_users,
-                     skip_collect=args.skip_collect, port=args.port)
+                     skip_collect=args.skip_collect, port=args.port, skip_deep=args.skip_deep)
     except RiskControlError as e:
         print(f"[Main] 风控兜底耗尽（{e}），本视频分析终止")
         raise SystemExit(1)

@@ -9,6 +9,7 @@
 从仓库任意目录均可运行：  python tests/offline/regress_long_image.py
 """
 import io
+import json
 import os
 import sys
 from pathlib import Path
@@ -90,13 +91,40 @@ check("争执焦点双榜与评论榜摘要装配",
 
 
 # ---------- 2) 渲染与护栏 ----------
-img = li.render_long_image(pl)
-buf = io.BytesIO(); img.save(buf, format="PNG")
-check("渲染输出为竖版图且宽度符合配置",
-      img.width == li.LONG_IMAGE_WIDTH and img.height > img.width,
-      "(%dx%d)" % (img.width, img.height))
-check("导出字节是合法 PNG", buf.getvalue()[:8] == b"\x89PNG\r\n\x1a\n" and len(buf.getvalue()) > 10_000,
-      "(%d KB)" % (len(buf.getvalue()) // 1024))
+# 无中文字体环境（如未装 fonts-noto-cjk 的 CI runner）：必须给出可读错误而不是崩溃。
+# 用缓存注入模拟，任何机器都能验证这条降级契约。
+_orig_font = li._FONT_CACHE.get("font")
+li._FONT_CACHE["font"] = (None, 0)
+no_font_err = None
+try:
+    li.render_long_image(pl)
+except RuntimeError as e:
+    no_font_err = str(e)
+finally:
+    if _orig_font is None:
+        li._FONT_CACHE.pop("font", None)
+    else:
+        li._FONT_CACHE["font"] = _orig_font
+check("无中文字体时给出可读错误（含安装提示）而非崩溃",
+      bool(no_font_err) and "字体" in no_font_err and "noto" in no_font_err.lower(),
+      "(%s)" % (no_font_err or "未报错")[:44])
+
+# 渲染类检查需要真实字体；无字体环境下明确跳过（CI 的 ubuntu 任务会装 fonts-noto-cjk）
+HAS_FONT = bool(li._find_font()[0])
+if not HAS_FONT:
+    print("  （跳过渲染类检查：本机没有可用的中文字体；"
+          "图形输出验证在装有 fonts-noto-cjk 的环境执行）")
+
+
+if HAS_FONT:   # 无字体环境在上面已单独验证降级契约，这里跳过渲染本身
+    img = li.render_long_image(pl)
+    buf = io.BytesIO(); img.save(buf, format="PNG")
+    check("渲染输出为竖版图且宽度符合配置",
+          img.width == li.LONG_IMAGE_WIDTH and img.height > img.width,
+          "(%dx%d)" % (img.width, img.height))
+    check("导出字节是合法 PNG",
+          buf.getvalue()[:8] == b"\x89PNG\r\n\x1a\n" and len(buf.getvalue()) > 10_000,
+          "(%d KB)" % (len(buf.getvalue()) // 1024))
 
 try:
     li.render_long_image(pl, width=li.LONG_IMAGE_MIN_WIDTH - 1)
@@ -105,16 +133,18 @@ except ValueError as e:
     narrow = str(e)
 check("宽度低于下限时拒绝出图（不产出畸形排版）", narrow is not None, "(%s)" % (narrow or "未报错")[:40])
 
-_orig_max = li.LONG_IMAGE_MAX_PIXELS
-li.LONG_IMAGE_MAX_PIXELS = 1000     # 人为压低上限，验证护栏生效
-try:
-    li.render_long_image(pl)
-    too_big = None
-except ValueError as e:
-    too_big = str(e)
-finally:
-    li.LONG_IMAGE_MAX_PIXELS = _orig_max
-check("超过像素上限时拒绝出图（防超大图打爆内存）", too_big is not None, "(%s)" % (too_big or "未报错")[:40])
+if HAS_FONT:
+    _orig_max = li.LONG_IMAGE_MAX_PIXELS
+    li.LONG_IMAGE_MAX_PIXELS = 1000     # 人为压低上限，验证护栏生效
+    try:
+        li.render_long_image(pl)
+        too_big = None
+    except ValueError as e:
+        too_big = str(e)
+    finally:
+        li.LONG_IMAGE_MAX_PIXELS = _orig_max
+    check("超过像素上限时拒绝出图（防超大图打爆内存）",
+          too_big is not None, "(%s)" % (too_big or "未报错")[:40])
 
 
 # ---------- 3) 路由确实接上了 + 跟随隐藏信息开关 ----------
@@ -132,17 +162,29 @@ storage.save_user_data(201, "很长的一个昵称", 6, {"uid": 201},
 cl = web.app.test_client()
 r = cl.get("/api/video/%s/longimage" % BV)
 body = r.data
-ok_png = r.status_code == 200 and body[:8] == b"\x89PNG\r\n\x1a\n"
-check("已分析视频可导出长图（PNG 响应）", ok_png,
-      "status=%s, %d KB" % (r.status_code, len(body) // 1024))
+if HAS_FONT:
+    ok_png = r.status_code == 200 and body[:8] == b"\x89PNG\r\n\x1a\n"
+    check("已分析视频可导出长图（PNG 响应）", ok_png,
+          "status=%s, %d KB" % (r.status_code, len(body) // 1024))
+else:
+    # 无字体环境：路由必须降级为可读 JSON 错误（不把异常栈甩给浏览器）。
+    # 注意 jsonify 默认把中文转义成 \uXXXX，断言要解析后再看文案。
+    try:
+        err_msg = json.loads(body.decode("utf-8")).get("error", "")
+    except Exception:
+        err_msg = ""
+    check("无中文字体时路由返回可读 JSON 错误（不崩页面）",
+          r.status_code == 500 and "字体" in err_msg,
+          "(status=%s, error=%r)" % (r.status_code, err_msg[:40]))
 check("未分析视频返回 404", cl.get("/api/video/BVnotexist9/longimage").status_code == 404)
 
-cl_mask = web.app.test_client()
-cl_mask.set_cookie("mask", "1")
-masked = cl_mask.get("/api/video/%s/longimage" % BV).data
-check("开启「隐藏信息」后出图为遮蔽版（方案 A：分享不泄露昵称）",
-      masked[:8] == b"\x89PNG\r\n\x1a\n" and masked != body,
-      "(%d KB vs %d KB)" % (len(masked) // 1024, len(body) // 1024))
+if HAS_FONT:
+    cl_mask = web.app.test_client()
+    cl_mask.set_cookie("mask", "1")
+    masked = cl_mask.get("/api/video/%s/longimage" % BV).data
+    check("开启「隐藏信息」后出图为遮蔽版（方案 A：分享不泄露昵称）",
+          masked[:8] == b"\x89PNG\r\n\x1a\n" and masked != body,
+          "(%d KB vs %d KB)" % (len(masked) // 1024, len(body) // 1024))
 
 print("")
 print("==== 分享长图导出: %d 项通过, %d 项失败 ====" % (ok, fail))

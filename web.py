@@ -3416,7 +3416,7 @@ def _parse_listener_pids(text: str, port: int = 0) -> list[int]:
 
     - ss -ltnp:      ... users:(("python",pid=123,fd=3))
     - lsof -ti:      每行一个 PID
-    - netstat -ano:  TCP  127.0.0.1:8000  0.0.0.0:0  LISTENING  123（按端口过滤，
+    - netstat -ano:  TCP  127.0.0.1:8001  0.0.0.0:0  LISTENING  123（按端口过滤，
                      否则会把别的端口的监听进程也算进来）"""
     pids: list[int] = []
 

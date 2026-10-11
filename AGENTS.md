@@ -22,6 +22,7 @@ python run.py BV1vu4y1b7Y9                # 分析视频
 python run.py BV1vu4y1b7Y9 --force        # 忽略缓存强制重新分析
 python run.py BV1vu4y1b7Y9 --max-users 50 # 手动覆盖动态定员（默认阈值命中者全进，上限随发送者规模浮动：保底300/发送者数×5%/封顶1000）
 python run.py BV1vu4y1b7Y9 --skip-collect # 跳过阶段5采集的网络请求：只用库内已采数据刷新报告（未采用户本轮不出画像，去掉参数重跑自动续采）
+python run.py BV1vu4y1b7Y9 --skip-deep    # 跳过阶段7 LLM 重点深掘（与 config.LLM_DEEP_ENABLED 取与；只少 ai_deep，深掘有缓存）
 python run.py --batch videos.txt          # 批量分析（逐行读取BV号，忽略空行与 # 注释行）
 
 # 辅助脚本
@@ -86,7 +87,7 @@ src/
 项目**没有单元测试框架**（无 pytest/unittest 目录）。改动后按"从便宜到贵"三层验证：
 
 ```bash
-# 1) 离线回归（190 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
+# 1) 离线回归（196 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
 python tests/run_all.py            # 主回归 + 评论路径 + 弹幕/评论判定聚合 + 多分P 口径（密度轴/历史采集/样本标注）
 python tests/run_all.py --lint     # 附带 pyflakes（需 pip install pyflakes）
 

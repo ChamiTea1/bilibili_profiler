@@ -38,6 +38,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyflakes
 
+      # 长图用例会真实出图，需要系统 CJK 字体（ubuntu runner 默认没有，
+      # Windows runner 自带 msyh/simhei）。不装的话该用例会走"无字体降级"分支，
+      # Linux 上的出图路径就没人验证了。
+      - name: 安装中文字体（Linux；长图渲染用例需要）
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
+
       # 全新克隆没有 src/config.py（已 gitignore），run_all.py 会自动从模板生成
       - name: 跑离线回归与静态检查
         run: python tests/run_all.py --lint

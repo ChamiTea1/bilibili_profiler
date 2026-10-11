@@ -57,7 +57,8 @@ SCRIPTS = [
     "tests/offline/regress_long_image.py",      # 分享长图导出（payload/渲染护栏/路由/遮蔽）12 项
     "tests/offline/regress_web_stop.py",        # --stop 兜底与 pidfile 归属 8 项
     "tests/offline/regress_env_proxy.py",       # 环境代理不得劫持本机调用 6 项
-    "tests/offline/regress_llm_proxy.py",       # LLM 客户端不继承环境代理 5 项
+    "tests/offline/regress_llm_proxy.py",       # LLM 客户端不继承环境代理 6 项
+    "tests/offline/regress_cli_switches.py",    # 命令行开关 --skip-deep 判定与接线 5 项
 ]
 SUMMARY_RE = re.compile(r"(\d+) 项通过,\s*(\d+) 项失败")
 
