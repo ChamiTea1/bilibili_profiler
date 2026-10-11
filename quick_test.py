@@ -22,7 +22,7 @@ from danmaku import collect_danmaku_data, group_by_sender
 from spam_detector import batch_detect_spam
 from cringe_detector import detect_cringe_danmaku
 from comment import fetch_comments, build_comment_uid_map
-from uid_resolver import resolve_sender
+from uid_resolver import resolve_sender, VerificationBudget
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from llm_analyzer import LLMAnalyzer
@@ -157,6 +157,7 @@ def main():
 
     # 5. 逐个解析 + 采集 + 画像 + AI
     profiles = []
+    verification_budget = VerificationBudget()
     for rank, (mid_hash, score, level) in enumerate(targets, 1):
         print(f"\n{'='*40}")
         print(f"  #{rank} mid_hash={mid_hash}")
@@ -164,7 +165,7 @@ def main():
 
         # 解析 UID
         uid, confidence, method, _, collision_risk, _ = resolve_sender(
-            mid_hash, group["contents"], comment_uid_map, pool
+            mid_hash, group["contents"], comment_uid_map, pool, verification_budget=verification_budget
         )
         if not uid:
             print("  ❌ UID 解析失败!")

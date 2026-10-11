@@ -1,0 +1,20 @@
+/* 目标报告沿用常规报告的卡片、表格和标签页样式。 */
+.target-query, .target-coverage { background:white; padding:16px; border-radius:12px; margin:16px 0; overflow-wrap:anywhere; }
+.target-query code { white-space:pre-wrap; }
+.target-metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:12px; }
+.target-metric { background:white; border-radius:12px; padding:18px; display:flex; flex-direction:column; gap:6px; }
+.target-metric strong { font-size:26px; color:#00a1d6; }
+.target-metric span, .target-note { color:#666; font-size:14px; line-height:1.8; }
+.target-card-context { display:flex; align-items:center; gap:12px; padding:12px 0; }
+.dm-table td { overflow-wrap:anywhere; }
+.dm-table { min-width:720px; }
+.target-comment-text { white-space:pre-wrap; }
+#targetError { color:#c62828; }
+.space-candidate { margin:10px 0; padding:10px; border:1px solid #ddd; border-radius:8px; }
+.space-candidate summary { cursor:pointer; margin-bottom:8px; }
+.space-assessment { max-width:430px; font-size:14px; line-height:1.7; white-space:normal; }
+.space-assessment ul { padding-left:20px; }
+.space-assessment li { margin:8px 0; white-space:pre-wrap; }
+@media (max-width:600px) {
+    .tab-btn { flex:1; padding:10px 12px; font-size:14px; white-space:nowrap; }
+}

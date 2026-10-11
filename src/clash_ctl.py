@@ -6,7 +6,7 @@
 
 **必须禁用环境代理**：控制器永远在本机（127.0.0.1），而很多代理客户端会把
 http_proxy/https_proxy/all_proxy 写进 shell。此时 requests 默认会把这些本地调用
-也送进代理 → 收到 502/超时 → 表现为「内置核心就绪轮询 60 次全失败、IP 池建不起来、
+也送进代理 → 收到 502/超时 → 表现为「内置核心就绪检查失败、IP 池建不起来、
 启动阶段像卡死」。注意 Python 的 no_proxy 只支持后缀匹配，用户写 127.* 并不生效，
 所以这里不能指望环境变量，只能硬关 trust_env。
 """
@@ -113,6 +113,35 @@ class ClashCtl:
         except requests.RequestException:
             return False
 
+    def startup_status(self, timeout=3) -> dict:
+        """一次请求同时检查控制器和账号节点组，超时预算由启动截止时间限定。
+
+        状态只返回固定类别；响应中的 URL、节点名和凭证不作为诊断文字输出。
+        """
+        try:
+            r = _SESSION.get(f"{self.api_url}/proxies", headers=self._headers(), timeout=timeout)
+            if r.status_code in (401, 403):
+                return {"state": "unauthorized", "nodes": []}
+            if r.status_code != 200:
+                return {"state": "http_error", "nodes": []}
+            body = r.json()
+        except ValueError:
+            return {"state": "invalid_response", "nodes": []}
+        except requests.RequestException:
+            return {"state": "unreachable", "nodes": []}
+        if not isinstance(body, dict) or not isinstance(body.get("proxies"), dict):
+            return {"state": "invalid_response", "nodes": []}
+        with self._lock:
+            proxies = body["proxies"]
+            if self.group and not isinstance(proxies.get(self.group), dict):
+                return {"state": "missing_group", "nodes": []}
+            g = self._group_from_body(body)
+            raw = g["all"] if isinstance(g["all"], list) else []
+            candidates = [n for n in raw if isinstance(n, str) and n and n.upper() not in _PSEUDO]
+            self._nodes = [n for n in candidates if self._is_alive(n)]
+            state = "ready" if self._nodes else ("all_dead" if candidates else "empty")
+            return {"state": state, "nodes": list(self._nodes)}
+
     def _fetch_group(self) -> dict:
         """读节点组信息；group 为空时自动挑选第一个非 GLOBAL、含节点的 Selector 组。
         返回 {"name", "all", "now"}；请求异常向上抛（由调用方静默降级）。"""
@@ -123,6 +152,10 @@ class ClashCtl:
         r = _SESSION.get(f"{self.api_url}/proxies", headers=self._headers(), timeout=5)
         r.raise_for_status()
         body = r.json()
+        return self._group_from_body(body)
+
+    def _group_from_body(self, body) -> dict:
+        """调用方持有共享控制锁，复用节点解析和健康检查口径。"""
         # 防御非预期 JSON 结构（如返回 list/str）：不做 isinstance 检查会让
         # .get 抛 AttributeError 逃逸出 list_nodes 的 requests.RequestException 兜底
         proxies = body.get("proxies") if isinstance(body, dict) else None

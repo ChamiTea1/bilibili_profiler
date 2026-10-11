@@ -459,7 +459,7 @@ def generate_user_card(profile: dict) -> str:
                     <span class="level-badge">Lv.{esc(level)}</span>
                     {f'<span class="school-badge" title="毕业院校（来自空间信息）">🎓 {esc(profile.get("school", ""))}</span>' if profile.get('school') else ''}
                     { '<span class="vip-badge">大会员</span>' if profile.get('vip_status')==1 else '' }
-                    { '<span class="risk-badge" title="该UID由CRC32反查（MITM）得出，存在碰撞误识别风险">可能误识别</span>' if profile.get('collision_risk') else '' }
+                    { '<span class="risk-badge" title="该UID通过CRC32 hash关联，仍存在碰撞误识别风险，不代表身份确认">可能误识别</span>' if profile.get('collision_risk') else '' }
                 </div>
                 <div class="tags">{tag_html}</div>
                 {f'<div class="sign">{esc(sign)}</div>' if sign else ''}

@@ -7,16 +7,18 @@
 （reply_control.location）。
 """
 import json
+import config
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from api_client import BiliAPIClient
+from api_client import BiliAPIClient, RiskControlError
 from config import COMMENT_MAIN_WBI_URL, COMMENT_MAIN_URL, COMMENT_REPLY_URL
 from config import MAX_COMMENT_PAGES, COMMENT_REPLY_MAX_PAGES, CHARGE_LIST_URL
 from config import COMMENT_REFRESH_MAX_PAGES, UID_HARVEST_MAX_PAGES
 from storage import (get_db, get_phase_state, load_comments, load_comment_uids,
-                     save_comments, set_phase_state, save_global_uid, load_global_uid_map)
+                     save_comments, set_phase_state, load_uid_harvest_seen, save_uid_harvest_page)
 from uid_resolver import calc_crc32
+from uid_evidence import add_uid, candidates_of
 
 
 def _parse_comment(r: dict, is_sub: bool) -> dict | None:
@@ -431,122 +433,161 @@ def refresh_comments(oid: int, client: BiliAPIClient, bvid: str,
     return new_total
 
 
+def _checkpoint_int(bvid: str, phase: str, key: str, default: int = 0) -> int:
+    try:
+        return max(0, int(get_phase_state(bvid, phase, key) or default))
+    except (TypeError, ValueError):
+        return default
+
+
 def harvest_comment_uids(oid: int, client: BiliAPIClient, bvid: str,
-                         max_pages: int = UID_HARVEST_MAX_PAGES) -> dict[str, int]:
-    """纯 UID 收割（阶段3尾部调用）：翻评论区只提取发送者 uid → 正向 CRC32 映射，
-    不落评论内容、不补采子评论——目的是提高弹幕发送者解析率（评论者即明文 UID 源），
-    收割结果沉淀 global_uid_map（来源「评论收割」，明文优先级），跨视频复用。
+                         max_pages: int = UID_HARVEST_MAX_PAGES) -> dict:
+    """以本视频已见评论 ID 判断刷新边界，全局已知 UID 仍记录本视频证据。
 
-    断点：phase_state(bvid, "uid_harvest", page/offset/mode/done)，中断/达累计上限
-    （UID_HARVEST_MAX_PAGES，跨运行累计）下轮续翻。首轮启动判据：正文未被截断且
-    评论表非空时收割无增量价值（全部评论者 uid 已在库），直接标 done 跳过
-    （评论采集整体失败、表为空时例外——收割是唯一 UID 来源，不能跳）；
-    正文被截断且有 wbi 游标时接续其热度序游标翻页——热度序与时间序的页码互不
-    对应，但截断点之后恰是正文未覆盖的部分，不必从第 1 页重扫。done=1 后重跑转为
-    刷新模式：时间序（mode=2）从最新往回翻，整页无新 uid（对照本视频已入库
-    评论 + 全局映射库 + 本轮已收）即停。单页失败只告警中断本轮（不写 done）。
-    返回本轮新收割的 {crc32_hex: uid}。"""
+    每页 UID、评论 ID 与游标原子提交；刷新有独立请求预算，正常续页保持累计上限。
+    """
     done = get_phase_state(bvid, "uid_harvest", "done") == "1"
-    # 已知集合：本视频已入库评论 uid + 全局映射库 uid（碰撞守卫：crc 已被占且 uid 不同则跳过）
-    # 只取 uid 列（load_comment_uids）：大评论区全列拉取（含正文数 MB）纯属浪费
-    local_uids: set[int] = load_comment_uids(bvid)
-    known_uids: set[int] = set(local_uids)
-    global_map = load_global_uid_map()
-    known_uids.update(v["uid"] for v in global_map.values())
-
+    local_uids = load_comment_uids(bvid)
+    seen_rpids = load_uid_harvest_seen(bvid)
     offset, page_start, mode = "", 0, 2
     if not done:
-        page_start = int(get_phase_state(bvid, "uid_harvest", "page") or 0)
+        page_start = _checkpoint_int(bvid, "uid_harvest", "page")
         offset = get_phase_state(bvid, "uid_harvest", "offset") or ""
         if page_start or offset:
-            mode = int(get_phase_state(bvid, "uid_harvest", "mode") or 2)   # 续翻沿用原模式
+            mode = _checkpoint_int(bvid, "uid_harvest", "mode", 2)
+            if mode not in (2, 3):
+                mode, page_start, offset = 2, 0, ""
         else:
-            # 首轮启动判据：
-            # 1) 正文未被截断且评论表非空 → 全部评论者 uid 已在库，专门收割无增量价值，
-            #    标 done 跳过（后续重跑走刷新模式捕捉新评论者）；
-            #    例外：评论采集整体失败（表空）时收割是唯一 UID 来源，不能跳；
-            # 2) 正文被截断且有 wbi 游标 → 接续热度序游标翻页，不重扫已采页
-            c_truncated = get_phase_state(bvid, "comment", "truncated") == "1"
-            if not c_truncated and local_uids:
-                print("[Comment] UID收割：评论已完整采集（无截断），评论者 UID 已在库，跳过收割")
+            truncated = get_phase_state(bvid, "comment", "truncated") == "1"
+            complete = (get_phase_state(bvid, "comment", "done") == "1"
+                        or get_phase_state(bvid, "comment", "format") is None)
+            if not truncated and complete and local_uids:
                 set_phase_state(bvid, "uid_harvest", "done", "1")
                 return {}
-            if (c_truncated and get_phase_state(bvid, "comment", "mode") == "wbi"
-                    and (get_phase_state(bvid, "comment", "offset") or "")):
-                offset = get_phase_state(bvid, "comment", "offset")
-                mode = 3
-                print("[Comment] UID收割：正文采集被截断，从热度序截断游标接续翻页（不重扫已采页）")
-        if page_start:
-            print(f"[Comment] UID收割续翻：从第 {page_start + 1} 页继续")
-    else:
-        print("[Comment] UID收割：刷新模式（翻至整页无新 uid 即停）")
-
-    harvested: dict[str, int] = {}
-    page = page_start
-    while page < max_pages:
-        page += 1
+            if truncated and get_phase_state(bvid, "comment", "mode") == "wbi":
+                offset = get_phase_state(bvid, "comment", "offset") or ""
+                if offset:
+                    mode = 3
+    limit = min(max_pages, getattr(config, "UID_HARVEST_REFRESH_MAX_PAGES", 10)) if done else max_pages
+    harvested = {}
+    for page in range(page_start + 1, limit + 1):
         try:
-            data = client.get(COMMENT_MAIN_WBI_URL, params={
-                "oid": oid,
-                "type": 1,
-                "mode": mode,    # 首轮沿用正文热度序游标（截断场景）或时间序；刷新固定时间序
-                "pagination_str": json.dumps({"offset": offset}),
-            })
-        except Exception as e:
-            print(f"[Comment] UID收割第{page}页请求异常（{e}），本轮中止（已收 {len(harvested)} 个）")
+            response = client.get(COMMENT_MAIN_WBI_URL, params={"oid": oid, "type": 1, "mode": mode,
+                                 "pagination_str": json.dumps({"offset": offset})})
+            if not isinstance(response, dict) or response.get("code") != 0 or not isinstance(response.get("data"), dict):
+                break
+            data = response["data"]
+            replies = data.get("replies")
+            if replies is None:
+                if not (data.get("cursor") or {}).get("is_end"):
+                    break  # 空结构可能是降级响应，不能据此写完成。
+                replies = []
+            if not isinstance(replies, list):
+                break
+            roots = {int(_rpid_of(r)) for r in replies if isinstance(r, dict) and _rpid_of(r)}
+            # 没有有效 ID 的页面不能作为“已采到边界”的证据。
+            boundary = done and bool(replies) and len(roots) == len(replies) and roots <= seen_rpids
+            uids, rpids = set(), set()
+            for r in replies:
+                for item in [r, *(r.get("replies") or [])]:
+                    if not isinstance(item, dict):
+                        continue
+                    rpid = _rpid_of(item)
+                    if rpid:
+                        rpids.add(int(rpid))
+                    for uid in candidates_of((item.get("member") or {}).get("mid")):
+                        uids.add(uid)
+                        add_uid(harvested, calc_crc32(uid), uid)
+            cursor = data.get("cursor") or {}
+            next_offset = (cursor.get("pagination_reply") or {}).get("next_offset")
+            ended = not replies or cursor.get("is_end", False) or not next_offset
+            checkpoint = {} if done else {"page": page, "offset": next_offset or offset, "mode": mode,
+                                           "done": "1" if ended else "0"}
+            save_uid_harvest_page(bvid, uids, rpids, checkpoint)
+            seen_rpids.update(rpids)
+            if boundary or ended:
+                break
+            if next_offset == offset:
+                break
+            offset = next_offset
+        except Exception as exc:
+            print(f"[Comment] UID收割第{page}页失败（{exc}），保留已完成页并等待重跑")
             break
-        if data.get("code") != 0:
-            print(f"[Comment] UID收割第{page}页失败: {data.get('message')}，本轮中止（已收 {len(harvested)} 个）")
-            break
-        page_data = data.get("data") or {}
-        replies = page_data.get("replies") or []
-        if not replies:
-            if not done:
-                set_phase_state(bvid, "uid_harvest", "done", "1")
-            break
-
-        page_new = 0
-        for r in replies:
-            mids = [(r.get("member") or {}).get("mid")]
-            mids += [(s.get("member") or {}).get("mid") for s in (r.get("replies") or [])]
-            for mid in mids:
-                try:
-                    uid = int(mid or 0)
-                except (TypeError, ValueError):
-                    continue
-                if not uid or uid in known_uids:
-                    continue
-                crc = calc_crc32(uid)
-                if crc in global_map and global_map[crc]["uid"] != uid:
-                    continue        # crc 碰撞：全局库已有他人，保留先见者
-                known_uids.add(uid)
-                if crc not in harvested:
-                    harvested[crc] = uid
-                    save_global_uid(crc, uid, "评论收割")
-                    page_new += 1
-
-        if page % 20 == 0 or page_new:
-            print(f"[Comment] UID收割第 {page}/{max_pages} 页: +{page_new}（本轮累计 {len(harvested)} 个）")
-
-        if done and page_new == 0:
-            break                   # 刷新模式：整页无新 uid，到达边界
-        cursor = page_data.get("cursor") or {}
-        next_offset = (cursor.get("pagination_reply") or {}).get("next_offset")
-        if cursor.get("is_end", False) or not next_offset:
-            if not done:
-                set_phase_state(bvid, "uid_harvest", "done", "1")
-            break
-        offset = next_offset
-        if not done:
-            set_phase_state(bvid, "uid_harvest", "page", str(page))
-            set_phase_state(bvid, "uid_harvest", "offset", offset)
-            set_phase_state(bvid, "uid_harvest", "mode", str(mode))
-    else:
-        print(f"[Comment] UID收割达累计上限 {max_pages} 页，剩余评论区下轮续翻"
-              f"（可调大 UID_HARVEST_MAX_PAGES）")
-
-    print(f"[Comment] UID收割完成：本轮新收 {len(harvested)} 个 uid 映射")
+    print(f"[Comment] UID收割：本轮关联 {sum(len(v) for v in harvested.values())} 个明文候选")
     return harvested
+
+
+def supplement_uid_replies(oid: int, client: BiliAPIClient, bvid: str, comments: list[dict],
+                           target_hashes: set[str], known_map: dict) -> dict:
+    """优先补采高回复但未收完整的主楼，按目标 hash 命中收益控制请求预算。
+
+    仅收 UID，不新增正文或绕过限速；每个主楼单独保存游标，失败不写完成。
+    """
+    pending = {h for h in target_hashes if not candidates_of(known_map.get(h))}
+    budget = max(0, getattr(config, "UID_REPLY_TOTAL_PAGES", 10))
+    if not oid or not pending or not budget:
+        return {}
+    children = {}
+    for c in comments:
+        if c.get("is_sub") and c.get("root_rpid"):
+            children[c["root_rpid"]] = children.get(c["root_rpid"], 0) + 1
+    roots = [c for c in comments if not c.get("is_sub") and c.get("rpid")
+             and c.get("reply_count", 0) > children.get(c["rpid"], 0)]
+    roots.sort(key=lambda c: (c.get("reply_count", 0), c.get("like", 0)), reverse=True)
+    result, requests_made, hits = {}, 0, set()
+    for root in roots[:getattr(config, "UID_REPLY_MAX_ROOTS", 5)]:
+        phase = f"uid_reply:{root['rpid']}"
+        if get_phase_state(bvid, phase, "done") == "1":
+            continue
+        page = _checkpoint_int(bvid, phase, "page") + 1
+        dry_pages = 0
+        while budget > 0:
+            budget -= 1
+            requests_made += 1
+            try:
+                response = client.get(COMMENT_REPLY_URL, params={"oid": oid, "type": 1,
+                                     "root": root["rpid"], "pn": page, "ps": 20})
+                if isinstance(response, dict) and response.get("code") in (-412, -352, -403):
+                    budget = 0  # 风控时整轮停采，不继续换主楼请求。
+                    break
+                if not isinstance(response, dict) or response.get("code") != 0 or not isinstance(response.get("data"), dict):
+                    break
+                data = response["data"]
+                replies = data.get("replies") or []
+                if not isinstance(replies, list):
+                    break
+                uids, rpids, page_hits = set(), set(), set()
+                for r in replies:
+                    if not isinstance(r, dict):
+                        continue
+                    rpid = _rpid_of(r)
+                    if rpid:
+                        rpids.add(int(rpid))
+                    for uid in candidates_of((r.get("member") or {}).get("mid")):
+                        uids.add(uid)
+                        h = calc_crc32(uid)
+                        add_uid(result, h, uid)
+                        if h in pending:
+                            page_hits.add(h)
+                count = int((data.get("page") or {}).get("count") or 0)
+                ended = not replies or (count > 0 and page * 20 >= count)
+                save_uid_harvest_page(bvid, uids, rpids, {"page": page, "done": "1" if ended else "0"}, phase=phase)
+                new_hits = page_hits - hits
+                hits.update(page_hits)
+                dry_pages = 0 if new_hits else dry_pages + 1
+                if ended or hits >= pending or dry_pages >= getattr(config, "UID_REPLY_NO_HIT_PAGES", 3):
+                    break
+                page += 1
+            except RiskControlError:
+                budget = 0
+                break
+            except Exception as exc:
+                print(f"[Comment] UID楼中楼补采失败（{exc}），保留检查点")
+                break
+        if not budget or hits >= pending:
+            break
+    print(f"[Comment] UID定向补采：{requests_made} 次请求，新增 {len(hits)} 个目标 hash 关联（仍需碰撞复核）")
+    return result
 
 
 def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT_PAGES,
@@ -606,29 +647,17 @@ def fetch_comments(oid: int, client: BiliAPIClient, max_pages: int = MAX_COMMENT
             ex.shutdown(wait=True)
 
 
-def build_comment_uid_map(comments: list[dict]) -> dict[str, int]:
+def build_comment_uid_map(comments: list[dict]) -> dict[str, set[int]]:
     """
     构建 CRC32(mid) -> mid 映射表，用于弹幕mid_hash交叉验证
 
     Returns:
-        {crc32_hash: uid} 映射字典
+        {crc32_hash: {uid, ...}} 候选映射字典
     """
     uid_map = {}
-    seen_uids = set()
-
     for c in comments:
-        uid = c["uid"]
-        if uid in seen_uids:
-            continue
-        seen_uids.add(uid)
-
-        # 计算该UID的CRC32（B站使用的标准CRC32）
-        crc = calc_crc32(uid)
-        # CRC32碰撞时保留先见者并告警，避免弹幕发送者被误归属到后到的用户
-        if crc in uid_map and uid_map[crc] != uid:
-            print(f"[Comment] 警告: CRC32碰撞 {crc}，已归属UID {uid_map[crc]}，忽略 {uid}")
-        else:
-            uid_map.setdefault(crc, uid)
+        for uid in candidates_of(c.get("uid")):
+            add_uid(uid_map, calc_crc32(uid), uid)
 
     return uid_map
 
@@ -702,7 +731,7 @@ def fetch_charge_uid_map(bvid: str, aid: int, up_mid: int, client) -> dict:
             except (TypeError, ValueError):
                 continue
             if pay_mid:
-                uid_map[calc_crc32(pay_mid)] = pay_mid
+                add_uid(uid_map, calc_crc32(pay_mid), pay_mid)
         if uid_map:
             print(f"[Comment] 充电名单: {len(uid_map)} 个明文UID")
     except Exception as e:

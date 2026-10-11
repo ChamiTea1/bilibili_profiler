@@ -39,7 +39,12 @@ def pick_python() -> str:
 
 PY = pick_python()
 SCRIPTS = [
+    "tests/offline/regress_target_analysis.py", # 目标筛选、存档隔离、多分P原文和命令行接线
+    "tests/offline/regress_target_lookup.py",   # 目标轻量取数、找到即停、原文留存与独立续页
+    "tests/offline/regress_candidate_space.py", # 候选空间按需核验、缓存隔离、关联边界与路由防护
+    "tests/offline/regress_uid_evidence.py",    # 多候选、证据迁移、存在性缓存与 UID 定向补采
     "tests/offline/regress_proxy_pool.py",      # 账号出口隔离、共享 IP 限速与故障降级
+    "tests/offline/regress_proxy_startup.py",   # 核心启动实际超时、阶段状态与错误脱敏
     "tests/offline/regress_comprehensive_fixes.py", # 全库审查：存储隔离、事务、缓存、失败覆盖和界面
     "tests/offline/regress_core.py",            # 主回归 13 项
     "tests/offline/regress_comment_path.py",    # 评论采集路径 10 项
@@ -57,6 +62,7 @@ SCRIPTS = [
     "tests/offline/regress_density_peaks.py",   # 弹幕高能点 AI 标注（峰值/缓存/降级）7 项
     "tests/offline/regress_long_image.py",      # 分享长图导出（payload/渲染护栏/路由/遮蔽）12 项
     "tests/offline/regress_web_stop.py",        # --stop 兜底与 pidfile 归属 8 项
+    "tests/offline/regress_web_autostart.py",   # 目标路由就绪、旧服务识别及自动打开404防护
     "tests/offline/regress_env_proxy.py",       # 环境代理不得劫持本机调用 6 项
     "tests/offline/regress_llm_proxy.py",       # LLM 客户端不继承环境代理 6 项
     "tests/offline/regress_cli_switches.py",    # 命令行开关 --skip-deep 判定与接线 5 项

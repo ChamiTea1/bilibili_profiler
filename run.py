@@ -4,6 +4,8 @@ B站弹幕发送者用户画像分析系统 — 入口脚本
 
 用法:
     python run.py BVxxxxxxxx [--force]
+    python run.py BVxxxxxxxx "目标弹幕或正则"  # 自动识别；--literal 强制原文匹配
+    python run.py BVxxxxxxxx "目标弹幕" --target-history  # 显式额外补采历史弹幕
     python run.py BVxxxxxxxx --skip-collect   # 阶段5只读库内已采数据（不发采集请求）
     python run.py BVxxxxxxxx --skip-deep      # 跳过阶段7 LLM 重点深掘（省 token/时间）
     python run.py BVxxxxxxxx --port 9000      # 报告服务端口（默认 8001，跨平台）

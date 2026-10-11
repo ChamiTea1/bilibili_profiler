@@ -9,6 +9,7 @@ B站弹幕发送者用户画像分析系统 — 主控流程
 import sys
 import os
 import argparse
+import re
 import threading
 import time
 from datetime import datetime
@@ -20,7 +21,7 @@ from config import (MAX_ANALYZE_USERS_HARD_CAP, ANALYZE_USERS_FLOOR, ANALYZE_USE
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_video_info
 from storage import load_user_data, has_user_data, load_senders, update_user_profile
-from storage import clear_video_cache, update_sender_spam, save_global_uid, load_global_uid_map
+from storage import clear_video_cache, update_sender_spam, load_global_uid_map, save_uid_evidence_maps
 from storage import save_comments, update_comment_problems
 from storage import load_danmaku, load_comments, append_danmaku
 from storage import get_phase_state, set_phase_state
@@ -32,8 +33,11 @@ from danmaku import (collect_danmaku_data, group_by_sender, fetch_command_dms,
 from danmaku import get_video_info
 from danmaku_history import fetch_history_danmaku
 from comment import collect_comment_data, fetch_charge_uid_map, refresh_comments
-from comment import build_comment_uid_map, build_comment_location_map, harvest_comment_uids
-from uid_resolver import resolve_all_senders, calc_crc32, METHOD_CRC32_CRACK, METHOD_COMMENT_VERIFY
+from comment import (build_comment_uid_map, build_comment_location_map, harvest_comment_uids,
+                     supplement_uid_replies)
+from uid_resolver import (resolve_all_senders, calc_crc32, METHOD_COMMENT_VERIFY, METHOD_PENDING,
+                          build_evidence_maps, resolution_is_current, resolution_record)
+from uid_evidence import add_uid, merge_uid_maps
 from spam_detector import batch_detect_spam, distribution_stats, detect_repeat_events
 from cringe_detector import detect_cringe_danmaku, detect_problem_comments
 from user_collector import collect_user_data
@@ -268,9 +272,9 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
     return video_info, danmaku_list, sender_groups, command_dms
 
 
-def build_video_meta_uid_map(video_info: dict) -> dict[str, int]:
+def build_video_meta_uid_map(video_info: dict) -> dict[str, set[int]]:
     """视频元信息明文 UID 源（P2-b）：UP主本人 + 联合投稿 staff + 简介@提及
-    （desc_v2 中 type=1 的 biz_id 即被@用户 UID）。返回 {crc32_hex: uid}，
+    （desc_v2 中 type=1 的 biz_id 即被@用户 UID）。返回 {crc32_hex: {uid, ...}}，
     供阶段4并入交叉验证映射；这些用户不一定是弹幕发送者，只有 mid_hash 命中时才生效。"""
     uids: set[int] = set()
     owner_mid = (video_info.get("owner") or {}).get("mid")
@@ -282,7 +286,10 @@ def build_video_meta_uid_map(video_info: dict) -> dict[str, int]:
     for d in video_info.get("desc_v2") or []:       # 简介里的 @提及
         if d.get("type") == 1 and d.get("biz_id"):
             uids.add(int(d["biz_id"]))
-    return {calc_crc32(u): u for u in uids}
+    result = {}
+    for uid in uids:
+        add_uid(result, calc_crc32(uid), uid)
+    return result
 
 
 def select_problem_comment_authors(comments: list[dict], comment_problems: dict) -> dict[int, dict]:
@@ -340,8 +347,7 @@ def phase_comment(video_info: dict, client, resume: bool = True):
                 # 纯 UID 收割并入评论明文映射（收割源同为评论明文，证据等级一致）
                 if aid:
                     try:
-                        for h, u in harvest_comment_uids(aid, client, bvid).items():
-                            comment_uid_map.setdefault(h, u)
+                        comment_uid_map = merge_uid_maps(comment_uid_map, harvest_comment_uids(aid, client, bvid))
                     except Exception as e:
                         print(f"[Phase 3] 警告: 评论UID收割失败（{e}），不影响已有映射")
                 return (existing, comment_uid_map,
@@ -360,8 +366,7 @@ def phase_comment(video_info: dict, client, resume: bool = True):
     # 纯 UID 收割并入评论明文映射（收割源同为评论明文，证据等级一致），失败不影响主流程
     if bvid:
         try:
-            for h, u in harvest_comment_uids(aid, client, bvid).items():
-                comment_uid_map.setdefault(h, u)
+            comment_uid_map = merge_uid_maps(comment_uid_map, harvest_comment_uids(aid, client, bvid))
         except Exception as e:
             print(f"[Phase 3] 警告: 评论UID收割失败（{e}），不影响已有映射")
     # 充电名单（独立降级：评论失败也照常尝试）
@@ -375,182 +380,55 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
                   max_users: int | None = None, charge_uid_map: dict | None = None,
                   command_uid_map: dict | None = None, meta_uid_map: dict | None = None,
                   spam_results: dict | None = None, cringe_results: dict | None = None):
-    """阶段4: 解析发送者UID（数据库缓存 + 兴趣分驱动选人）
-
-    选人规则（阈值制动态定员，spec 3）：spam_level∈{高,中} 或 问题弹幕≥1 条的发送者
-    全部进入解析名单；上限随发送者规模浮动（保底 ANALYZE_USERS_FLOOR、按
-    独立发送者数×ANALYZE_USERS_RATIO 上浮、MAX_ANALYZE_USERS_HARD_CAP 封顶），
-    显式传入 max_users（--max-users）时作为手动硬上限优先。
-    """
+    """兴趣阈值控制新解析；已有结论按版本、证据指纹及有效期复核。"""
     print("\n[Phase 4/6] 解析发送者UID...")
-
-    # 1. 从数据库加载已缓存的解析结果
-    cached = load_senders(bvid)
-    cached_map = {r["mid_hash"]: r for r in cached}
-    print(f"[Phase 4] 数据库缓存: {len(cached_map)} 个已解析")
-
-    # 1.5 全局 mid_hash→UID 映射库（跨视频累积）：与当视频评论映射合并，
-    #     评论验证优先，全局库兜底；method_map 标注每个 mid_hash 的来源
-    global_map = load_global_uid_map()
-    plain_uid_map = dict(comment_uid_map)  # 评论映射复制为底
-    method_map = {h: METHOD_COMMENT_VERIFY for h in comment_uid_map}
-    # 1.6 充电名单合并（明文证据，置信度同评论验证；评论优先）
-    charge_hit = 0
-    for h, uid in (charge_uid_map or {}).items():
-        if h not in plain_uid_map:
-            plain_uid_map[h] = uid
-            method_map[h] = "充电名单"
-            charge_hit += 1
-    if charge_hit:
-        print(f"[Phase 4] 充电名单: 补充 {charge_hit} 条到交叉验证映射")
-    # 1.7 互动弹幕明文mid合并（基本只有UP主；评论/充电优先）
-    cmd_hit = 0
-    for h, uid in (command_uid_map or {}).items():
-        if h not in plain_uid_map:
-            plain_uid_map[h] = uid
-            method_map[h] = "互动弹幕"
-            cmd_hit += 1
-    if cmd_hit:
-        print(f"[Phase 4] 互动弹幕: 补充 {cmd_hit} 条到交叉验证映射")
-    # 1.8 视频元信息明文UID合并（UP主/联合投稿staff/简介@提及；评论/充电/互动弹幕优先）
-    meta_hit = 0
-    for h, uid in (meta_uid_map or {}).items():
-        if h not in plain_uid_map:
-            plain_uid_map[h] = uid
-            method_map[h] = "视频信息"
-            meta_hit += 1
-    if meta_hit:
-        print(f"[Phase 4] 视频信息(UP主/staff/简介@): 补充 {meta_hit} 条到交叉验证映射")
-    global_hit = 0
-    for h, ent in global_map.items():
-        if h not in plain_uid_map:
-            plain_uid_map[h] = ent["uid"]
-            method_map[h] = ent["source"]
-            global_hit += 1
-    print(f"[Phase 4] 全局映射库: {len(global_map)} 条（补充 {global_hit} 条到交叉验证映射）")
-
-    for h, old in cached_map.items():
-        if h in sender_groups and h in plain_uid_map and (
-                old["uid"] != plain_uid_map[h] or old["confidence"] != "高"
-                or old["method"] == METHOD_CRC32_CRACK):
-            grp = sender_groups[h]
-            save_sender(bvid, h, plain_uid_map[h], "高", method_map[h], grp["count"], grp["contents"],
-                        (spam_results or {}).get(h, {}).get("spam_level", old["spam_level"]),
-                        (spam_results or {}).get(h, {}).get("spam_score", old["spam_score"]))
-            old.update(uid=plain_uid_map[h], confidence="高", method=method_map[h],
-                       danmaku_count=grp["count"], contents=grp["contents"])
-            save_global_uid(h, plain_uid_map[h], method_map[h])
-
-    # 2. 筛选需要新解析的sender：不在缓存中的，以及缓存中 uid 为 NULL 的历史解析失败记录
-    #    （评论交叉验证随新评论变好，失败记录值得重试；save_sender 为 INSERT OR REPLACE 会覆盖旧记录）
-    unresolved = {}
-    retry_failed = 0
-    for mid_hash, group in sender_groups.items():
-        cached_row = cached_map.get(mid_hash)
-        if cached_row is None:
-            unresolved[mid_hash] = group
-        elif cached_row["uid"] is None:
-            unresolved[mid_hash] = group
-            retry_failed += 1
-
-    if retry_failed > 0:
-        print(f"[Phase 4] {retry_failed} 个历史解析失败的发送者将重试")
-
-    # 3. 兴趣分驱动选人（阈值制：中/高刷屏 或 有问题弹幕 全进；上限兜底/手动覆盖）
-    spam_results = spam_results or {}
-    cringe_results = cringe_results or {}
-
-    def interest_key(mid_hash: str):
-        spam = spam_results.get(mid_hash, {})
-        cringe = cringe_results.get(mid_hash, {})
-        return (spam.get("spam_score", 0.0), cringe.get("max_severity", 0),
-                unresolved[mid_hash]["count"])
-
-    must = [h for h in unresolved
-            if spam_results.get(h, {}).get("spam_level") in ("高", "中")
-            or cringe_results.get(h, {}).get("count", 0) >= 1]
-    must.sort(key=interest_key, reverse=True)
-
-    cap = max_users if max_users is not None else min(
-        MAX_ANALYZE_USERS_HARD_CAP,
+    cached = {r["mid_hash"]: r for r in load_senders(bvid)}
+    sources = [(METHOD_COMMENT_VERIFY, comment_uid_map), ("充电名单", charge_uid_map or {}),
+               ("互动弹幕", command_uid_map or {}), ("视频信息", meta_uid_map or {})]
+    save_uid_evidence_maps(bvid, sources)
+    mapping, methods = build_evidence_maps(bvid, sources, load_global_uid_map())
+    spam_results, cringe_results = spam_results or {}, cringe_results or {}
+    interested = [h for h in sender_groups if spam_results.get(h, {}).get("spam_level") in ("高", "中")
+                  or cringe_results.get(h, {}).get("count", 0) >= 1]
+    interested.sort(key=lambda h: (spam_results.get(h, {}).get("spam_score", 0),
+                    cringe_results.get(h, {}).get("max_severity", 0), sender_groups[h]["count"]), reverse=True)
+    cap = max_users if max_users is not None else min(MAX_ANALYZE_USERS_HARD_CAP,
         max(ANALYZE_USERS_FLOOR, int(len(sender_groups) * ANALYZE_USERS_RATIO)))
-    to_resolve_hashes = must[:cap]
-    print(f"[Phase 4] 兴趣命中 {len(must)} 人（中/高刷屏或问题弹幕），"
-          f"截取 {len(to_resolve_hashes)} 人解析（上限 {cap}）")
-
-    truncated = len(must) - len(to_resolve_hashes)
-    if truncated > 0:
-        print(f"[Phase 4] 上限截断: {truncated} 个兴趣命中者超出上限 {cap}，按兴趣分靠后跳过")
-    not_hit = len(unresolved) - len(must)
-    if not_hit > 0:
-        print(f"[Phase 4] 跳过 {not_hit} 个低兴趣发送者（未命中刷屏/问题弹幕阈值）")
-
-    to_resolve = [(h, unresolved[h]) for h in to_resolve_hashes]
-
-    # 4. 只解析 top N 未缓存的发送者
-    if to_resolve:
-        to_resolve_dict = dict(to_resolve)
-        print(f"[Phase 4] 需新解析: {len(to_resolve_dict)} 个发送者")
-        new_resolved = resolve_all_senders(to_resolve_dict, plain_uid_map, client,
-                                           method_map=method_map)
-
-        # 保存新解析结果到数据库
-        for mid_hash, info in new_resolved.items():
-            save_sender(
-                bvid=bvid,
-                mid_hash=mid_hash,
-                uid=info["uid"],
-                confidence=info["confidence"],
-                method=info["method"],
-                danmaku_count=info["danmaku_count"],
-                contents=info["contents"],
-                spam_level=spam_results.get(mid_hash, {}).get("spam_level", "低"),
-                spam_score=spam_results.get(mid_hash, {}).get("spam_score", 0.0)
-            )
-            # 沉淀到全局映射库：仅明文来源（评论/充电名单/互动弹幕/视频信息）可沉淀；
-            # CRC32破解一律不沉淀——单候选也可能是16位长UID撞 hash 的错误归因，
-            # 一旦入库会跨视频放大误识别（spec 4.2）
-            if info["uid"] is not None and info["method"] != METHOD_CRC32_CRACK:
-                save_global_uid(mid_hash, info["uid"], info["method"])
-    else:
-        new_resolved = {}
-        print("[Phase 4] 无需新解析，全部命中缓存")
-
-    # 5. 合并缓存 + 新解析结果（新解析优先；缓存中 uid 为 NULL 且本轮未重试的记录视为未解析，不并入）
-    resolved = {}
-    for mid_hash, group in sender_groups.items():
-        if mid_hash in new_resolved:
-            resolved[mid_hash] = new_resolved[mid_hash]
-        elif mid_hash in cached_map and cached_map[mid_hash]["uid"] is not None:
-            c = cached_map[mid_hash]
-            # 缓存结果不含 collision_risk 字段，从 method 推断（不改表结构）；
-            # 历史缓存中暴力破解路径可能被标"高"，按现行策略压为"中"
-            is_crack = c["method"] == METHOD_CRC32_CRACK
-            confidence = c["confidence"]
-            if is_crack and confidence == "高":
-                confidence = "中"
-            # 缓存行只承载"解析结论"（uid/方式/置信度）；弹幕统计是廉价本地聚合，
-            # 一律以本轮 sender_groups 为准，避免旧快照 contents 与阶段6 现取的
-            # video_times 在 report.py 被 zip 静默截断/错配（缓存 count/contents 仅兜底）
-            resolved[mid_hash] = {
-                "uid": c["uid"],
-                "confidence": confidence,
-                "method": c["method"],
-                "user_info": {},
-                "danmaku_count": group.get("count", c["danmaku_count"]),
-                "contents": group.get("contents", c["contents"]),
-                "spam_level": c.get("spam_level", "低"),
-                "spam_score": c.get("spam_score", 0.0),
-                "collision_risk": is_crack,
-            }
-
-    # 只统计本轮 sender_groups 范围内、确实来自缓存的命中数（重试成功的不重复计入）
-    cached_success = sum(1 for h, v in resolved.items()
-                         if v.get("uid") and h in cached_map and h not in new_resolved)
-    new_success = sum(1 for v in new_resolved.values() if v.get("uid"))
-    total = len(resolved)
-    print(f"\n[Phase 4] 解析完成: 缓存命中 {cached_success} + 新解析 {new_success} = {cached_success + new_success}/{total}")
-    return resolved
+    selected = set(interested[:max(0, cap)])
+    todo, results = {}, {}
+    for h, group in sender_groups.items():
+        row = cached.get(h)
+        if row and resolution_is_current(row, h, mapping, methods):
+            record = row["resolution"]
+            results[h] = {**group, **row, "danmaku_count": group["count"], "contents": group["contents"],
+                          "user_info": {}, "collision_risk": record.get("collision_risk", True),
+                          "candidates": record.get("candidates", [])}
+        elif h in selected or (row and h in mapping):
+            # 明文证据变化只需本地判断，不受兴趣阈值和网络名额限制。
+            todo[h] = group
+        elif row:
+            # 老的猜测不继续用作归属；保留旧 UID 作审计，等待命中选人阈值再验证。
+            verdict = (None, "无", METHOD_PENDING, {}, True, (row.get("resolution") or {}).get("candidates", []))
+            record = resolution_record(h, verdict, mapping, methods)
+            record.update(previous_uid=row["uid"] or (row.get("resolution") or {}).get("previous_uid"),
+                          reason="旧结论失效，本轮未入选验证名单")
+            results[h] = {**group, "uid": None, "confidence": "无", "method": METHOD_PENDING,
+                          "danmaku_count": group["count"], "user_info": {}, "collision_risk": True,
+                          "candidates": verdict[-1], "resolution": record}
+    if todo:
+        results.update(resolve_all_senders(todo, mapping, client, method_map=methods))
+    for h, info in results.items():
+        old = cached.get(h)
+        if old and old["uid"] != info["uid"]:
+            info["resolution"]["previous_uid"] = old["uid"]
+        save_sender(bvid, h, info["uid"], info["confidence"], info["method"],
+                    info["danmaku_count"], info["contents"],
+                    spam_results.get(h, {}).get("spam_level", (old or {}).get("spam_level", "低")),
+                    spam_results.get(h, {}).get("spam_score", (old or {}).get("spam_score", 0.0)),
+                    resolution=info["resolution"])
+    assigned = sum(v.get("uid") is not None for v in results.values())
+    print(f"[Phase 4] 兴趣命中 {len(interested)}，验证名额 {len(selected)}，已分配候选 {assigned}/{len(results)}；分配不代表身份确认")
+    return results
 
 
 def phase_spam(bvid: str, sender_groups: dict, danmaku_list: list | None = None) -> dict:
@@ -786,7 +664,7 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
 
 def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sender_groups: dict,
                   comment_location_map: dict | None = None, uid_comments: dict | None = None,
-                  video_info: dict | None = None):
+                  video_info: dict | None = None, persist: bool = True):
     """阶段6: 画像分析
 
     comment_location_map（uid→评论IP属地）与 uid_comments（uid→本视频评论）在此处
@@ -840,7 +718,8 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
             profiles.append(profile)
 
             # 保存到数据库
-            save_user_data(uid, user_data.get("name", ""), user_data.get("level", 0), user_data, profile, bvid=(video_info or {}).get("bvid"))
+            if persist:
+                save_user_data(uid, user_data.get("name", ""), user_data.get("level", 0), user_data, profile, bvid=(video_info or {}).get("bvid"))
         except Exception as e:
             print(f"  [Phase 6] 警告: UID:{uid} 画像分析失败，已跳过: {e}")
 
@@ -848,7 +727,7 @@ def phase_analyze(resolved: dict, spam_results: dict, user_data_map: dict, sende
     return profiles
 
 
-def phase_ai_analysis(video_info: dict, profiles: list[dict]):
+def phase_ai_analysis(video_info: dict, profiles: list[dict], persist: bool = True):
     """阶段7: LLM 重点深掘（兴趣分 top K 单人单调用，结果直接注入 profile；
     全员粗筛已砍——命中人数扩大后粗筛是 token 大头，普通用户由规则标签勾画轮廓）"""
     if not LLM_API_KEY:
@@ -871,7 +750,8 @@ def phase_ai_analysis(video_info: dict, profiles: list[dict]):
                 # 深掘结果必须落库：web 报告读的是所属视频的 video_profiles，
                 # 阶段6已在深掘前落库，这里注入后不回写的话报告页永远看不到
                 try:
-                    update_user_profile(uid, p, bvid=video_info.get("bvid"))
+                    if persist:
+                        update_user_profile(uid, p, bvid=video_info.get("bvid"))
                 except Exception as e:
                     print(f"[Phase 7] 警告: UID:{uid} 深掘结果落库失败（{e}），重跑可补")
         print(f"[Phase 7] 完成: {len(deep)} 人生成深度画像")
@@ -989,6 +869,16 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     except Exception as e:
         print(f"    警告: 评论落库失败（{e}），跨视频足迹将缺评论")
 
+    target_hashes = {h for h in sender_groups
+                     if spam_results.get(h, {}).get("spam_level") in ("高", "中")
+                     or cringe_results.get(h, {}).get("count", 0) >= 1}
+    try:
+        extra = supplement_uid_replies(video_info.get("aid") or 0, pool, bvid, comments,
+                                       target_hashes, comment_uid_map)
+        comment_uid_map = merge_uid_maps(comment_uid_map, extra)
+    except Exception as e:
+        print(f"[Phase 3] 警告: UID 定向补采失败（{e}），继续使用已有证据")
+
     # uid → 该用户在本视频的评论（按点赞降序），供阶段6注入画像与阶段7深掘证据包
     uid_comments: dict[int, list] = {}
     for c in comments:
@@ -1070,6 +960,8 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
         why = "--skip-deep" if skip_deep else "config.py 中 LLM_DEEP_ENABLED=False"
         print(f"\n[Phase 7] 跳过 LLM 深掘（{why}）；其余报告内容不受影响")
 
+    # 空视频或零画像也可能已完成常规分析；与目标模式共享的元信息明确区分。
+    set_phase_state(bvid, "report", "ready", "1")
     # 静态单文件 HTML 报告已被交互式 Web 报告（web.py）完全替换，不再生成 .html
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     export_base = os.path.join(REPORT_DIR, f"report_{bvid}_{ts}")
@@ -1177,15 +1069,21 @@ def run_batch(batch_file: str, force: bool = False, max_users: int | None = None
 def main():
     parser = argparse.ArgumentParser(description="B站弹幕发送者用户画像分析")
     parser.add_argument("bvid", nargs="?", help="视频BV号，如 BV1vu4y1b7Y9")
+    parser.add_argument("target", nargs="?", help="目标弹幕；含正则元字符时自动使用正则搜索，否则完整匹配")
+    matching = parser.add_mutually_exclusive_group()
+    matching.add_argument("--literal", action="store_true", help="把第二个参数当作原文完整匹配（含标点时可用）")
+    matching.add_argument("--regex", action="store_true", help="强制把第二个参数当作正则搜索")
+    parser.add_argument("--target-history", action="store_true", help="目标模式额外补采历史弹幕；默认仅当前池和已有缓存")
+    parser.add_argument("--target-pool", action="store_true", help="目标模式在命中后启用多账号/IP池；默认仅用主号限速客户端")
     parser.add_argument("--force", action="store_true",
-                        help="清除该视频的缓存并强制重采全部用户（忽略断点续采）")
+                        help="常规模式清除该视频缓存重采；目标模式重新解析/采集入选者，保留共享采集检查点")
     parser.add_argument("--max-users", type=int, default=None,
-                        help="手动硬上限覆盖阈值制动态定员 (默认按兴趣阈值定员，兜底上限 MAX_ANALYZE_USERS_HARD_CAP)")
+                        help="覆盖分析人数上限；常规模式按兴趣阈值选人，目标模式按命中条数选人（默认最多1000）")
     parser.add_argument("--batch", metavar="FILE",
                         help="批量模式：从文件逐行读取BV号（忽略空行与 # 注释行）")
     parser.add_argument("--skip-collect", action="store_true",
                         help="跳过阶段5用户采集的网络请求：只用库内已采数据（未采用户本轮不出画像），"
-                             "适合不想再打接口时刷新报告；与 --force 同用会因缓存被清而无画像可用")
+                             "常规模式与 --force 同用会因缓存被清而无画像可用；目标模式保留已采资料")
     parser.add_argument("--skip-deep", action="store_true",
                         help="跳过阶段7 LLM 重点深掘（只少 ai_deep 文字画像，判定/画像/报告照常；"
                              "深掘有缓存，之后重跑只补没算过的人）")
@@ -1193,6 +1091,20 @@ def main():
                         help="Web 报告端口（默认 8001；等价于设置 PROFILER_PORT，"
                              "但 Windows 的 cmd/PowerShell 上参数写法才不会踩坑）")
     args = parser.parse_args()
+
+    if args.target is not None and args.batch:
+        parser.error("目标弹幕分析暂不支持 --batch")
+    if (args.literal or args.regex) and args.target is None:
+        parser.error("--literal / --regex 需要提供目标弹幕")
+    if (args.target_history or args.target_pool) and args.target is None:
+        parser.error("--target-history / --target-pool 需要提供目标弹幕")
+    selector = None
+    if args.target is not None:
+        from target_filter import make_selector
+        try:
+            selector = make_selector(args.target, "literal" if args.literal else "regex" if args.regex else "auto")
+        except ValueError as e:
+            parser.error(str(e))
 
     if args.batch:
         try:
@@ -1208,13 +1120,19 @@ def main():
         sys.exit(1)
 
     bvid = args.bvid.strip()
-    if not bvid.startswith("BV"):
-        print("错误: BV号格式不正确，应以 BV 开头")
+    if not re.fullmatch(r"BV[A-Za-z0-9]+", bvid):
+        print("错误: BV号格式不正确，应以 BV 开头且只包含字母和数字")
         sys.exit(1)
 
     try:
-        run_analysis(bvid, force=args.force, max_users=args.max_users,
-                     skip_collect=args.skip_collect, port=args.port, skip_deep=args.skip_deep)
+        if selector is not None:
+            from target_analysis import run_target_analysis
+            run_target_analysis(bvid, selector, force=args.force, max_users=args.max_users,
+                                skip_collect=args.skip_collect, port=args.port, skip_deep=args.skip_deep,
+                                target_history=args.target_history, target_pool=args.target_pool)
+        else:
+            run_analysis(bvid, force=args.force, max_users=args.max_users,
+                         skip_collect=args.skip_collect, port=args.port, skip_deep=args.skip_deep)
     except RiskControlError as e:
         print(f"[Main] 风控兜底耗尽（{e}），本视频分析终止")
         raise SystemExit(1)

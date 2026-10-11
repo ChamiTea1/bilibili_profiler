@@ -57,7 +57,8 @@ src/
 ├── danmaku.py           # 实时弹幕 XML 解析，按 mid_hash 聚合发送者
 ├── danmaku_history.py   # 历史弹幕采集（逐日弹幕池快照，protobuf wire 手写解析+0x0A 特征校验防错误页误判；失败日记账 failed_dates 优先补采、截断写 truncated、done=1 后重跑滚动补采最近 3 天；每日快照为独立请求无游标链，组合池多号分片时按账号并发采多天，落库/检查点推进在主线程串行；多分P 视频按分P 各采一份（page 参数落库标记 + 检查点键 :pN 隔离，分P 1 沿用原键名故既有报告不重采））
 ├── comment.py           # 评论区采集（wbi/main 游标 + 子评论补采 + IP属地），建立 UID→CRC32 映射；页内各主楼的子评论补采互相独立，组合池多号分片时按账号并发补采（主评论游标翻页为链式依赖无法分片，楼中楼补采才是时间大头）；done=1 视频重跑时 refresh_comments 按时间序（mode=2）增量刷新新评论（撞整页已见即停，旧评论顺带刷新热度）；harvest_comment_uids 纯 UID 收割（翻评论区只取 uid 建 CRC32 映射、不落评论内容；正文未被截断且评论表非空时直接跳过，正文截断时接续其热度序游标续翻不重扫已采页；累计上限 UID_HARVEST_MAX_PAGES=500 页，断点续翻，done 后重跑转刷新模式，沉淀全局库）
-├── uid_resolver.py      # mid_hash 破解：评论/充电名单/互动弹幕/视频元信息（main.build_video_meta_uid_map）/全局库交叉验证 + MITM 反查碰撞消歧
+├── uid_resolver.py      # UID 多候选证据、存在性三态与补验预算、规则版本/证据指纹复核；歧义/未知不自动选 UID
+├── uid_evidence.py      # 候选归一化及 CRC32 正向校验，多 UID 碰撞无损合并
 ├── crc_rainbow.py       # MITM 中间相遇 CRC32 反查（10万条内存小表，覆盖全部 ≤10 位 UID；惰性建表加双检锁线程安全，预计算 adv5 表，约 49ms/hash）
 ├── spam_detector.py     # 刷屏检测：只标记风险等级（高/中/低），绝不删除弹幕数据；四规则组合计分（最高分+每多触发一条加成 SPAM_COMBO_BONUS）、高频爆发按滑动窗口口径、全池 P95 相对离群补强、群体复读事件检测（detect_repeat_events：同内容 60s 窗内 ≥5 人 ≥8 条的接龙/队列，全视频维度；**双时间轴**——视频内时间轴按分P 分别开窗（接龙发生在同一画面，观众可横跨数月，是主形态），发送时间轴抓真实时间短窗集中刷屏，两轴各自达标才写进结果；内容先按 `_content_key` 归一化合并写法变体——全半角/空白/首尾标点/连续重复字符（？？？→？、666→6、哈哈哈→哈，非 ASCII 字母才折叠以免 good→god），变体并入同一事件后人数取并集、条数求和，事件带 variants/variant_count 供 tooltip）、分布自检（P50/P90/P95 供阈值校准）
 ├── cringe_detector.py   # LLM 问题弹幕检测（八类判定+发送者聚合+llm_cache缓存，key 带口径版本号 v5，批次响应先解析校验成功才落缓存）+ 问题评论检测（同口径，按内容缓存判定、回映 rpid 回写 comments.problem，未配置 LLM_API_KEY 自动跳过；致命 4xx 直接上抛由 phase 层降级，瞬态错误同厂商短退避，整轮重试 LLM_RETRY_BUDGET_SECONDS=1800s 熔断）
@@ -71,7 +72,7 @@ src/
 └── storage.py           # SQLite 持久化（data/profiler.db，get_db 统一 WAL + busy_timeout=10000 + synchronous=NORMAL），支撑断点续采与 LLM 结果缓存（llm_cache 表、danmaku 全量弹幕表（含 mode/color/pool/dmid/page 属性列）、comments 评论表（含 uname 昵称、parent_rpid 回复树、problem 问题标注、location IP属地）、false_positive 误报标记表（kind: dm=弹幕内容/cmt=评论rpid/spam=发送者mid_hash，展示层扣除聚合）、phase_state 阶段检查点表（弹幕历史 last_date/fetched_dates/failed_dates/truncated、评论游标，中断续采））
 ```
 
-数据流：`run.py` → `main.run_analysis(bvid, force, max_users)`，全阶段断点续采（任意位置 Ctrl+C/崩溃后重跑可续）：弹幕逐日增量落库+phase_state 检查点（danmaku 表 last_date/fetched_dates/failed_dates/truncated/done，历史快照中断后逐日续采、失败日记账优先补采；多分P 视频逐分P 各一套检查点（分P 1 原键名、其余 :pN），各P 独立续采互不影响；月份/日期降序遍历、上限耗尽保留最新日期；done=1 后重跑仍滚动补采最近 HISTORY_RECENT_REFRESH_DAYS=3 天，dmid 幂等去重；仅时间窗完整无失败才写 done）、评论逐页落库+游标检查点（comments 表 mode/page/offset/done/truncated，wbi/legacy 双路径续页，模式切换页码归零、截断不写 done；done=1 后重跑按时间序增量刷新新评论，上限 COMMENT_REFRESH_MAX_PAGES=10 页）、LLM 判定批次级缓存（llm_cache 批次 key=稳定前缀`cringe:{bvid}:版本`/`cmt:{bvid}:版本`@batch:v2:模型:内容指纹（缓存批内下标，命中后平移），先解析校验成功才落缓存、坏响应进重试链，已完成批次重跑零调用）、senders 逐条落库、users 每人落库；非 --force 重跑时各阶段按库内数据存在性独立跳过（完整判据：done=1 或本功能前的旧版完整落库），`--force` 清除该视频全部缓存与检查点强制重采（llm_cache 中仅清该视频的问题弹幕/问题评论判定缓存 `cringe:{bvid}:*` 与 `cmt:{bvid}:*`，深掘缓存 `deep:{uid}:*` 跨视频复用、保留）。全局映射库 `global_uid_map` 跨视频沉淀可靠 mid_hash→UID 映射（仅评论/充电/互动/元信息等明文来源可沉淀，纯 CRC32 破解结果不沉淀防误归因跨视频放大；冲突覆盖按来源优先级，明文>破解），解析率随使用次数累积提升。
+数据流：`run.py` → `main.run_analysis(bvid, force, max_users)`，全阶段断点续采（任意位置 Ctrl+C/崩溃后重跑可续）：弹幕逐日增量落库+phase_state 检查点（danmaku 表 last_date/fetched_dates/failed_dates/truncated/done，历史快照中断后逐日续采、失败日记账优先补采；多分P 视频逐分P 各一套检查点（分P 1 原键名、其余 :pN），各P 独立续采互不影响；月份/日期降序遍历、上限耗尽保留最新日期；done=1 后重跑仍滚动补采最近 HISTORY_RECENT_REFRESH_DAYS=3 天，dmid 幂等去重；仅时间窗完整无失败才写 done）、评论逐页落库+游标检查点（comments 表 mode/page/offset/done/truncated，wbi/legacy 双路径续页，模式切换页码归零、截断不写 done；done=1 后重跑按时间序增量刷新新评论，上限 COMMENT_REFRESH_MAX_PAGES=10 页）、LLM 判定批次级缓存（llm_cache 批次 key=稳定前缀`cringe:{bvid}:版本`/`cmt:{bvid}:版本`@batch:v2:模型:内容指纹（缓存批内下标，命中后平移），先解析校验成功才落缓存、坏响应进重试链，已完成批次重跑零调用）、senders 逐条落库、users 每人落库；非 --force 重跑时各阶段按库内数据存在性独立跳过（完整判据：done=1 或本功能前的旧版完整落库），`--force` 清除该视频全部缓存与检查点强制重采（llm_cache 中仅清该视频的问题弹幕/问题评论判定缓存 `cringe:{bvid}:*` 与 `cmt:{bvid}:*`，深掘缓存 `deep:{uid}:*` 跨视频复用、保留）。全局证据库 `uid_evidence` 跨视频保留全部明文候选及来源视频（仅评论/充电/互动/元信息等明文来源可沉淀；同 hash 多 UID 不覆盖，纯 CRC32 破解不作为明文证据），旧 `global_uid_map` 保留审计并在迁移时隔离纯破解记录。
 
 ## 开发约定
 
@@ -88,7 +89,7 @@ src/
 项目**没有单元测试框架**（无 pytest/unittest 目录）。改动后按"从便宜到贵"三层验证：
 
 ```bash
-# 1) 离线回归（232 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
+# 1) 离线回归（405 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
 python tests/run_all.py            # 主回归 + 评论路径 + 弹幕/评论判定聚合 + 多分P 口径（密度轴/历史采集/样本标注）
 python tests/run_all.py --lint     # 附带 pyflakes（需 pip install pyflakes）
 python tests/offline/regress_proxy_pool.py --mihomo  # 可选 5 项真实核心本机测试（已有 mihomo/openssl，不下载、不访问外网）
@@ -111,3 +112,12 @@ python quick_test.py [BV号] [--top N]
 ## 画像存储与纠偏
 
 `users` 仅共享基础采集缓存；报告画像从 `video_profiles(bvid, uid)` 读取，写画像和深掘结果必须传入所属 bvid。`data_revision` 的触发器修订号负责外部写入后的页面缓存失效。旧的多视频共享画像读取时由本视频证据重建，不传播归属不明的 AI 文本。评论页数据和游标经 `save_comments(..., checkpoint=...)` 原子提交；LLM 评论结果携带 `judged_rpids`，只替换成功范围，失败和截断范围保留。`comments.problem_severity` 持久化严重度，误报扣除后的评论风险及屏蔽导出以本视频评论表为准。历史月份失败使用 `failed_months` 持久化，重试时先将待补日期挂入 `failed_dates` 再清月份标记。
+
+## UID 证据与缓存口径
+
+- `uid_evidence(hash, uid, source, bvid)` 保存全部明文候选及视频来源，碰撞不覆盖；旧 `global_uid_map` 留作审计，仅明文且正向校验相符的条目迁移，旧纯破解隔离。评论页保存与明文证据写入同一事务。
+- 评论作者本人明文 UID 可高置信直引；匿名弹幕的本视频单一明文关联最多中置信度，仅跨视频关联及纯 MITM 唯一存在候选为低置信度，均保留碰撞提示。弹幕条数不是身份消歧证据。多候选为「候选歧义」，仍有未知为「待验证」，不自动采集或 UID 屏蔽。
+- `senders.resolution_json` 保存规则版本、证据指纹、时间、候选、来源和原因。版本或证据变化立即复核，结论默认一天有效；失效旧 UID 保留作审计，不继续用于归属。手动分析复用画像前同样复核。
+- 数学候选缓存按算法版本和搜索上限隔离。名片存在结果缓存 7 天，只有明确 `-404` 才判不存在并缓存 1 小时；网络、风控、空名片、批量缺席均不可直接排除。单点补验每轮 50 次预算，预算不足保留未知，风控整轮停止。
+- UID 收割刷新依据本视频已见评论 ID，不依据全局新 UID 数；UID、已见 ID、游标按页原子提交。面向未关联兴趣 hash 的高回复楼中楼补采默认总计 10 页/最多 5 楼，同楼连续 3 页无新目标命中换楼，逐楼断点续采。配置集中在 `config.example.py` 的 `UID_*` 项，通过 `getattr` 兼容未更新的本地配置。
+- 改动此路径请运行 `tests/offline/regress_uid_evidence.py`（44 项），再跑完整离线回归。禁止用真实 Cookie 或 LLM 做离线测试。

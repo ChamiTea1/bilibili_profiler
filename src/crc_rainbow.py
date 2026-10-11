@@ -9,7 +9,7 @@ MITM（中间相遇）CRC32 反查：mid_hash → 全部候选 UID
 前缀），反查所需后缀 crc 得候选，最后逐候选 zlib 校验保证精确。
 
 参考：esterTion/BiliBili_crc2mid、Aruelius/crc32-crack（MoePus MITM）。
-覆盖范围：全部 ≤10 位 UID（16 位随机长 UID 数学上不可解，见 spec 第 9 节）。
+覆盖范围：全部 ≤10 位 UID；长 UID 可明文正向匹配，无法仅凭 CRC32 唯一恢复身份。
 纯标准库实现，不引入第三方依赖。
 """
 import threading

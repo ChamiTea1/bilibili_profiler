@@ -41,7 +41,7 @@ if sys.version_info < (3, 12):
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from flask import Flask, Response, abort, jsonify, request, send_from_directory
+from flask import Flask, Response, abort, jsonify, request, send_from_directory, redirect
 
 from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTORY_MAX_DAYS,
                      MAX_FOOTPRINT_VIDEOS, MAX_FOOTPRINT_DANMAKU_SAMPLES,
@@ -58,13 +58,20 @@ from auth import load_cookie, verify_cookie, _try_refresh_cookie
 from api_client import BiliAPIClient
 import config as _config
 from storage import get_db, init_db, load_video_profile, ensure_video_profiles, load_comments, load_user_data
-from storage import (load_senders, load_global_uid_map, save_global_uid,
+from storage import (load_senders, load_global_uid_map,
                      save_sender, save_user_data, load_video_info,
                      delete_video_data, toggle_false_positive, load_false_positives,
                      load_faces, load_face_cached_uids, save_face,
                      load_llm_cache, save_llm_cache)
+from storage import (load_target_analysis, list_target_analyses, load_uid_space_cache,
+                     has_normal_report, NORMAL_REPORT_PREDICATE)
+from target_report import render_target_report, render_target_list_page, page_number, render_space_assessment
+from candidate_space import (candidate_uids, cached_assessments, sample_is_fresh,
+                             fetch_space_sample, assess_space, sender_contents)
 from main import run_analysis
-from uid_resolver import resolve_sender, METHOD_CRC32_CRACK
+from uid_resolver import (resolve_sender, METHOD_CRC32_CRACK, build_evidence_maps,
+                          resolution_is_current, resolution_record, VerificationBudget)
+from comment import build_comment_uid_map
 from combo_pool import build_pool
 from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
@@ -306,10 +313,8 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
 
     cached = {r["mid_hash"]: r for r in load_senders(bvid)}
     video_info = load_video_info(bvid) or {}
-    # web 端无评论映射（spec 7 明确不做）：全局映射库作为唯一明文源，CRC32 彩虹表破解兜底
-    global_map = load_global_uid_map()
-    plain_uid_map = {h: ent["uid"] for h, ent in global_map.items()}
-    method_map = {h: ent["source"] for h, ent in global_map.items()}
+    plain_uid_map, method_map = build_evidence_maps(bvid,
+        [("评论区验证", build_comment_uid_map(load_comments(bvid)))], load_global_uid_map())
     # LLM 深掘器：未配置 LLM_API_KEY 时跳过（spec 3.3）；初始化失败也只跳过深掘
     analyzer = None
     if LLM_API_KEY:
@@ -318,11 +323,12 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
         except Exception as e:
             print(f"[Job {job_id}] 警告: LLM 初始化失败（{e}），本次 job 跳过深掘")
 
+    verification_budget = VerificationBudget()
     for i, mid_hash in enumerate(mid_hashes, 1):
         update(current=f"[{i}/{len(mid_hashes)}] {mid_hash}")
         try:
             row = cached.get(mid_hash)
-            uid = row["uid"] if row else None
+            uid = row["uid"] if row and resolution_is_current(row, mid_hash, plain_uid_map, method_map) else None
             # 只有本视频已有画像才跳过；其它视频的基础资料可复用但不能代替本视频画像。
             if uid is not None and load_video_profile(bvid, uid):
                 add_result(uid)
@@ -332,25 +338,19 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
             stats = _sender_danmaku_stats(bvid, mid_hash)
             if uid is None:
                 # 1. UID 解析：全局库明文命中优先，CRC32 彩虹表破解兜底；失败记 errors 继续
-                uid, confidence, method, _info, collision_risk, _candidates = resolve_sender(
-                    mid_hash, stats["contents"], plain_uid_map, pool, method_map=method_map)
+                verdict = resolve_sender(mid_hash, stats["contents"], plain_uid_map, pool, method_map=method_map,
+                                         verification_budget=verification_budget)
+                uid, confidence, method, _info, collision_risk, _candidates = verdict
+                record = resolution_record(mid_hash, verdict, plain_uid_map, method_map)
+                save_sender(bvid, mid_hash, uid, confidence, method, stats["count"], stats["contents"],
+                            (row["spam_level"] if row else None) or "低",
+                            (row["spam_score"] if row else None) or 0.0, resolution=record)
                 if uid is None:
                     add_error(f"UID 解析失败（{method}）", mid_hash)
                     update(done=i)
                     continue
-                # 落库保留真实置信度/方法（"低"/碰撞在画像页有"可能误识别"徽标）
-                save_sender(bvid, mid_hash, uid, confidence, method,
-                            stats["count"], stats["contents"],
-                            (row["spam_level"] if row else None) or "低",
-                            (row["spam_score"] if row else None) or 0.0)
-                # 沉淀全局映射库：CRC32 反查结果一律不沉淀（存在碰撞误识别风险，
-                # 污染全局库会跨视频放大；仅明文交叉验证来源可靠）
-                if method != METHOD_CRC32_CRACK:
-                    save_global_uid(mid_hash, uid, method)
             else:
-                # senders 有 uid 但 users 无数据的中间态：跳过解析直接采集；
-                # collision_risk 从 method 推断（缓存无该字段，口径同 main.py 阶段4）
-                collision_risk = row["method"] == METHOD_CRC32_CRACK
+                collision_risk = row["resolution"].get("collision_risk", True)
 
             # 2. 强制采集（无视置信度，含"低"/碰撞）
             cached_user = load_user_data(uid)
@@ -443,7 +443,7 @@ def _load_profiles(bvid: str) -> list[dict]:
     ensure_video_profiles(bvid)
     with closing(get_db()) as conn:
         rows = conn.execute('''
-            SELECT p.profile_json, u.data_json, s.method, s.confidence, u.collected_at, s.mid_hash
+            SELECT p.profile_json, u.data_json, s.method, s.confidence, u.collected_at, s.mid_hash, s.resolution_json
             FROM senders s JOIN users u ON u.uid = s.uid
             JOIN video_profiles p ON p.bvid=s.bvid AND p.uid=s.uid
             WHERE s.bvid = ? AND s.uid IS NOT NULL
@@ -457,6 +457,9 @@ def _load_profiles(bvid: str) -> list[dict]:
             continue
         p["resolve_method"] = r["method"] or ""
         p["resolve_confidence"] = r["confidence"] or ""
+        resolution = json.loads(r["resolution_json"] or "{}")
+        p["collision_risk"] = resolution.get("collision_risk", r["method"] == METHOD_CRC32_CRACK)
+        p["resolve_reason"] = resolution.get("reason", "")
         p["collected_at"] = r["collected_at"] or ""
         p["_mid_hash"] = r["mid_hash"] or ""
         # 隐藏信息（mask Cookie）：昵称只留末字、另注入遮蔽 UID 显示串
@@ -1103,7 +1106,7 @@ def _resolve_quality(bvid: str) -> dict | None:
     报告结论可靠度判断依据：高置信+明文验证占比越高越可信；碰撞风险人数多需谨慎解读。"""
     with closing(get_db()) as conn:
         rows = conn.execute(
-            "SELECT method, confidence FROM senders WHERE bvid = ? AND uid IS NOT NULL",
+            "SELECT method, confidence, uid, mid_hash, resolution_json FROM senders WHERE bvid = ?",
             (bvid,)).fetchall()
         total_senders = conn.execute(
             "SELECT COUNT(DISTINCT mid_hash) FROM danmaku WHERE bvid = ?", (bvid,)).fetchone()[0]
@@ -1117,7 +1120,8 @@ def _resolve_quality(bvid: str) -> dict | None:
         methods[m] = methods.get(m, 0) + 1
         c = r["confidence"] or "无"
         confs[c] = confs.get(c, 0) + 1
-        if m == METHOD_CRC32_CRACK:
+        record = json.loads(r["resolution_json"] or "{}")
+        if r["uid"] is not None and record.get("collision_risk", m == METHOD_CRC32_CRACK):
             collision += 1
     # 置信度按 高/中/低/无 固定序输出（图表颜色语义稳定）
     conf_order = ["高", "中", "低", "无"]
@@ -1127,7 +1131,10 @@ def _resolve_quality(bvid: str) -> dict | None:
         "conf_labels": [c for c in conf_order if c in confs],
         "conf_data": [confs[c] for c in conf_order if c in confs],
         "collision": collision,
-        "resolved": len(rows),
+        "resolved": sum(r["uid"] is not None and not r["mid_hash"].startswith("cmt:") for r in rows),
+        "ambiguous": sum(r["method"] == "候选歧义" for r in rows),
+        "pending": sum(r["method"] == "待验证" for r in rows),
+        "comment_authors": sum(r["mid_hash"].startswith("cmt:") for r in rows),
         "total_senders": total_senders,
     }
 
@@ -2109,14 +2116,15 @@ def index():
     数据库锁定（分析任务写入期）由 _db_guard 降级为 503 友好页。"""
     with closing(get_db()) as conn:
         # 刷屏高/中统计以库内原始值为准：kind=spam 的发送者级人工误报只在报告页展示层降级
-        rows = conn.execute('''
+        # 只有目标采样的元信息不生成普通视频报告入口，独立目标入口仍保留。
+        rows = conn.execute(f'''
             SELECT v.bvid, v.title, v.created_at, v.duration, v.view_count,
                    (SELECT COUNT(*) FROM danmaku d WHERE d.bvid = v.bvid) AS dm_count,
                    (SELECT COUNT(DISTINCT s.uid) FROM senders s
                     WHERE s.bvid = v.bvid AND s.uid IS NOT NULL) AS profile_count,
                    (SELECT COUNT(*) FROM senders s WHERE s.bvid = v.bvid AND s.spam_level = '高') AS spam_high,
                    (SELECT COUNT(*) FROM senders s WHERE s.bvid = v.bvid AND s.spam_level = '中') AS spam_mid
-            FROM videos v ORDER BY v.created_at DESC
+            FROM videos v WHERE {NORMAL_REPORT_PREDICATE} ORDER BY v.created_at DESC
         ''').fetchall()
     items = "".join(f'''<tr data-title="{esc(((r["title"] or "") + " " + r["bvid"]).lower())}"
         data-time="{esc(r["created_at"])}" data-dm="{r["dm_count"]}" data-profiles="{r["profile_count"]}">
@@ -2211,7 +2219,8 @@ def index():
 <div class="container">
     <div class="header"><h1>🎬 B站弹幕用户画像分析</h1><div class="meta">已分析视频列表</div></div>
     <div class="idx-controls">
-        <input id="idxSearch" class="search-input" placeholder="搜索标题 / BV号...">
+        <input id="idxSearch" class="search-input" placeholder="搜索标题 / BV号..." aria-label="搜索视频标题或BV号">
+        <a class="pager-btn target-entry" href="/targets">目标弹幕分析</a>
     </div>
     <table class="video-table">
         <thead><tr><th>标题</th><th>BV号</th><th>时长</th><th>播放量</th>
@@ -2232,6 +2241,13 @@ def index():
 </html>'''
 
 
+@app.route("/targets")
+@_db_guard
+def target_list_page():
+    """独立目标报告列表，从首页搜索框右侧进入。"""
+    return render_target_list_page(list_target_analyses(limit=getattr(_config, "TARGET_REPORT_LIST_LIMIT", 50)))
+
+
 def _low_conf_tab_html(bvid: str) -> tuple[str, int]:
     """「低置信度」标签页：解析出 UID 但置信度为「低」的发送者（多为 CRC32 碰撞疑似误识别）。
 
@@ -2240,16 +2256,24 @@ def _low_conf_tab_html(bvid: str) -> tuple[str, int]:
     勾选对应 mid_hash 手动强制分析（无视置信度）。返回 (HTML, 人数)。"""
     with closing(get_db()) as conn:
         rows = conn.execute(
-            "SELECT mid_hash, uid, method, danmaku_count, contents_json, spam_level "
-            "FROM senders WHERE bvid = ? AND uid IS NOT NULL AND confidence = '低' "
+            "SELECT mid_hash, uid, method, danmaku_count, contents_json, spam_level, resolution_json "
+            "FROM senders WHERE bvid = ? AND (confidence = '低' OR method IN ('候选歧义', '待验证')) "
             "ORDER BY danmaku_count DESC", (bvid,)).fetchall()
     if not rows:
-        return ('<p class="empty-note">无低置信度解析用户（解析出 UID 的发送者均为高/中置信度）</p>', 0)
+        return ('<p class="empty-note">无低置信度候选或待复核条目</p>', 0)
     mask = _mask_on()
     items = []
     for r in rows:
         uid = r["uid"]
-        uid_disp = _mask_uid(uid) if mask else str(uid)   # 遮蔽只影响可见文本，href 保持真实 uid
+        uid_disp = _mask_uid(uid) if mask else str(uid)
+        uid_html = (f'<a href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener">UID:{esc(uid_disp)}</a>'
+                    if uid is not None else '<span>尚未确定 UID</span>')
+        record = json.loads(r["resolution_json"] or "{}")
+        candidate_html = "、".join(esc(_mask_uid(u) if mask else str(u)) for u in record.get("candidates", []))
+        reason_html = f'<div class="chart-hint">{esc(record.get("reason", ""))}'
+        if candidate_html:
+            reason_html += f' · 候选（未确认身份）：{candidate_html}'
+        reason_html += '</div>'
         try:
             contents = json.loads(r["contents_json"] or "[]")
         except Exception:
@@ -2264,18 +2288,18 @@ def _low_conf_tab_html(bvid: str) -> tuple[str, int]:
         spam_badge = f'<span class="spam-badge spam-{esc(spam)}">刷屏:{esc(spam)}</span>' if spam and spam != "低" else ""
         items.append(f'''<div class="af-item">
             <div class="af-line">
-                <a href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener" title="查看B站空间（新标签页）">UID:{esc(uid_disp)}</a>
+                {uid_html}
                 <span class="hot-badge">{r["danmaku_count"]} 条弹幕</span>
                 <span class="method-badge" title="UID 解析方式">{esc(r["method"] or "")}</span>
                 <span class="risk-badge" title="低置信度解析存在 CRC32 撞库误识别风险">可能误识别</span>
                 {spam_badge}
                 <span class="uid">mid_hash:{esc(r["mid_hash"])}</span>
             </div>
+            {reason_html}
             <ul class="ov-list">{dm_html or '<li class="ov-none">弹幕内容未留存</li>'}</ul>
         </div>''')
-    head = (f'<div class="chart-hint" style="margin:4px 0 10px">以下 {len(rows)} 名发送者的 UID 为低置信度解析'
-            f'（疑似碰撞误识别），未做深度采集/画像；人工复核确认无误后，可在「弹幕浏览器」'
-            f'搜索其 mid_hash 并勾选「分析选中发送者」强制画像。</div>')
+    head = (f'<div class="chart-hint" style="margin:4px 0 10px">以下 {len(rows)} 条为低置信度候选或待复核记录。'
+            f'候选不代表身份确认；存在歧义或未完成验证的发送者保留匿名，不自动采集或屏蔽。</div>')
     return head + "".join(items), len(rows)
 
 
@@ -2288,6 +2312,8 @@ def video_page(bvid: str):
     _attach_other_videos 逐用户查询；job（手动分析/重新生成）完成或删除时主动失效，
     且每次请求比对数据指纹，外部进程（run.py）落库导致的变化也能检出。
     数据库锁定（分析任务写入期）由 _db_guard 降级为 503 友好页。"""
+    if not has_normal_report(bvid) and list_target_analyses(bvid, limit=1):
+        return redirect("/targets")
     page_fp = _page_fingerprint(bvid)
     mask = _mask_on()   # 隐藏信息开关：开/关两版页面分开缓存，防串味
     with _PAGE_CACHE_LOCK:
@@ -2411,8 +2437,9 @@ def video_page(bvid: str):
         <div class="rq-block">
             <h3>🔍 解析质量（用户身份可信度）</h3>
             <div class="rq-summary">已解析发送者 <b>{rq["resolved"]:,}</b> / 全部发送者
-                <b>{rq["total_senders"]:,}</b> · 碰撞风险（CRC32反查）
-                <b class="{collision_cls}">{rq["collision"]} 人</b></div>
+                <b>{rq["total_senders"]:,}</b> · hash 关联碰撞风险
+                <b class="{collision_cls}">{rq["collision"]} 人</b> · 歧义 {rq["ambiguous"]} · 待验证 {rq["pending"]}
+                · 评论明文作者 {rq["comment_authors"]}（另计）；候选分配不代表身份确认</div>
             <div class="charts-grid rq-charts">
                 <div class="chart-card"><h3>解析方式分布</h3><canvas id="rqMethodChart"></canvas></div>
                 <div class="chart-card"><h3>置信度分布</h3><canvas id="rqConfChart"></canvas></div>
@@ -2832,9 +2859,10 @@ def api_delete_video(bvid: str):
     removed_files = 0
     for ext in ("csv", "json"):
         # bvid 来自路由参数：glob.escape 防通配符注入匹配到他视频文件
-        for f in glob.glob(os.path.join(REPORT_DIR, f"report_{glob.escape(bvid)}_*.{ext}")):
-            os.remove(f)
-            removed_files += 1
+        for prefix in ("report", "target"):
+            for f in glob.glob(os.path.join(REPORT_DIR, f"{prefix}_{glob.escape(bvid)}_*.{ext}")):
+                os.remove(f)
+                removed_files += 1
     return jsonify({"ok": True, "removed_files": removed_files, **counts})
 
 
@@ -3293,10 +3321,100 @@ def api_danmaku(bvid: str):
                     "multi_page": len(_load_page_meta(bvid)) > 1})
 
 
+@app.route("/target/<target_id>")
+@_db_guard
+def target_page(target_id: str):
+    """读取已保存的目标分析；渲染时不重新匹配或发起采集。"""
+    record = load_target_analysis(target_id)
+    if record is None:
+        abort(404)
+    return render_target_report(record, request.args, _mask_on(), _mask_name, _mask_uid,
+                                load_false_positives(record["bvid"]), cached_assessments(record),
+                                has_normal_report(record["bvid"]))
+
+
+_CANDIDATE_SPACE_LOCK = threading.Lock()
+
+
+@app.route("/api/target/<target_id>/candidate-space", methods=["POST"])
+@_db_guard
+def api_target_candidate_space(target_id: str):
+    """仅核验报告中低置信度碰撞候选；按需限速采样，不改身份或画像。"""
+    record = load_target_analysis(target_id)
+    if record is None:
+        return jsonify({"error": "未知目标分析"}), 404
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "请提供候选 UID 与 mid_hash"}), 400
+    raw_uid = body.get("uid")
+    if isinstance(raw_uid, bool) or not isinstance(raw_uid, (int, str)) or not re.fullmatch(r"[1-9][0-9]{0,18}", str(raw_uid)):
+        return jsonify({"error": "候选 UID 格式错误"}), 400
+    uid = int(raw_uid)
+    sender = next((s for s in record["result"].get("senders", []) if s["mid_hash"] == body.get("mid_hash")), None)
+    if sender is None or uid not in candidate_uids(sender) or sender.get("confidence") in ("高", "中"):
+        return jsonify({"error": "该 UID 不是本条记录可核验的低置信度候选"}), 400
+    sample = load_uid_space_cache([uid]).get(uid)
+    if not sample or not sample_is_fresh(sample):
+        if not _CANDIDATE_SPACE_LOCK.acquire(blocking=False):
+            return jsonify({"error": "已有空间核验在运行，请稍后重试"}), 409
+        job_id = None
+        try:
+            job_id, error = _try_register_job("candidate-space", record["bvid"], total=1)
+            if job_id is None:
+                return jsonify({"error": error}), 409
+            # 只用主号客户端；不为单个候选启动代理核心或小号池。
+            sample = fetch_space_sample(uid, _get_client())
+        except CookieInvalidError as exc:
+            return jsonify({"error": str(exc)}), 503
+        finally:
+            if job_id:
+                with JOBS_LOCK:
+                    JOBS[job_id]["finished"] = True
+            _CANDIDATE_SPACE_LOCK.release()
+    assessment = assess_space(sample, record["bvid"], record["result"].get("video_info", {}),
+                              sender_contents(record, sender))
+    return jsonify({"html": render_space_assessment(assessment, _mask_on(), _mask_name, _mask_uid)})
+
+
+@app.route("/api/target/<target_id>/danmaku")
+@_db_guard
+def api_target_danmaku(target_id: str):
+    record = load_target_analysis(target_id)
+    if record is None:
+        return jsonify({"error": "未知目标分析"}), 404
+    result = record["result"]
+    mid_hash = request.args.get("mid_hash", "")
+    matches = result.get("matches", [])
+    if mid_hash:
+        matches = [dm for dm in matches if dm["mid_hash"] == mid_hash]
+    matches = sorted(matches, key=lambda dm: (int(dm.get("page", 1) or 1), float(dm.get("time", 0) or 0)))
+    size = max(1, getattr(_config, "TARGET_MATCH_PAGE_SIZE", 100))
+    page, pages = page_number(request.args.get("page"), len(matches), size)
+    senders = {s["mid_hash"]: s for s in result.get("senders", [])}
+    multi_page = len(result.get("video_info", {}).get("pages", [])) > 1
+    rows = []
+    for dm in matches[(page - 1) * size:page * size]:
+        sender = senders.get(dm["mid_hash"], {})
+        uid = sender.get("uid")
+        name = sender.get("name") or ""
+        if _mask_on():
+            uid, name = _mask_uid(uid), _mask_name(name)
+        p, sec = max(1, int(dm.get("page", 1) or 1)), max(0, int(float(dm.get("time", 0) or 0)))
+        label = f"{sec // 60:02d}:{sec % 60:02d}"
+        if multi_page or p != 1:
+            label = f"P{p} {label}"
+        rows.append({"content": dm["content"], "mid_hash": dm["mid_hash"], "page": p, "time": dm.get("time", 0),
+                     "time_label": label, "confidence": sender.get("confidence", "无"), "method": sender.get("method", ""),
+                     "sender_label": f"{name} UID:{uid}" if uid else f"未解析 · {dm['mid_hash']}",
+                     "video_url": f"https://www.bilibili.com/video/{record['bvid']}?p={p}&t={sec}"})
+    return jsonify({"rows": rows, "page": page, "pages": pages, "page_size": size, "total": len(matches)})
+
+
 @app.route("/download/<path:filename>")
 def download(filename: str):
-    """CSV/JSON 导出文件下载（仅允许 report_ 前缀文件，防目录外文件被下载）"""
-    if not filename.startswith("report_") or "/" in filename or ".." in filename:
+    """仅下载报告导出文件，禁止路径穿越。"""
+    allowed = filename.startswith("report_") or (filename.startswith("target_") and filename.endswith((".csv", ".json")))
+    if not allowed or "/" in filename or "\\" in filename or ".." in filename:
         abort(404)
     return send_from_directory(REPORT_DIR, filename, as_attachment=True)
 
@@ -3304,6 +3422,9 @@ def download(filename: str):
 @app.errorhandler(404)
 def not_found(e):
     """未知 bvid / 未知路径 → 中文 404 页面（带站点样式与返回首页按钮，spec 6）"""
+    message = ('目标报告不存在或链接已失效，请从<a href="/targets">「目标弹幕分析」列表</a>打开。'
+               if request.path.startswith("/target/") else
+               '视频不存在或尚未分析，请先运行 <code>python run.py &lt;BV号&gt;</code>')
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -3318,7 +3439,7 @@ def not_found(e):
 <div class="container">
     <div class="header"><h1>404</h1><div class="meta">页面或视频不存在</div></div>
     <div class="nf-card">
-        <p>视频不存在或尚未分析，请先运行 <code>python run.py &lt;BV号&gt;</code></p>
+        <p>{message}</p>
         <p><a class="filter-btn" href="/">返回首页</a></p>
     </div>
 </div>

@@ -8,6 +8,7 @@ from api_client import BiliAPIClient
 from config import VIDEO_INFO_URL, DANMAKU_XML_URL, DANMAKU_VIEW_URL
 from danmaku_history import _read_varint, _skip_field, _take_bytes  # 复用历史弹幕的 wire 手写解析
 from uid_resolver import calc_crc32
+from uid_evidence import add_uid
 
 
 class DanmakuCollectionError(RuntimeError):
@@ -297,5 +298,5 @@ def build_command_uid_map(command_dms: list[dict]) -> dict:
     for item in command_dms:
         mid = item.get("mid")
         if mid:
-            uid_map[calc_crc32(int(mid))] = int(mid)
+            add_uid(uid_map, calc_crc32(int(mid)), int(mid))
     return uid_map

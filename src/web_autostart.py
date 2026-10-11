@@ -26,10 +26,48 @@ _LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _BVID_RE = re.compile(r"^BV[A-Za-z0-9]+$")
 
 
-def maybe_launch_web(bvid: str):
+def _probe_json(url: str) -> tuple[int | None, dict | None]:
+    """仅探测本机报告接口；保留 HTTP 状态，避免把 HTML 404 当作就绪。"""
+    try:
+        with _LOCAL_OPENER.open(url, timeout=1) as resp:
+            status, payload = resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        with e:
+            status, payload = e.code, e.read()
+    except Exception:
+        return None, None
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        return status, None
+    return status, data if isinstance(data, dict) else None
+
+
+def _server_state(port: int, bvid: str, target_id: str | None) -> str:
+    """目标模式须确认目标接口及存档可读，常规视频接口不能证明新功能已加载。"""
+    base = f"http://127.0.0.1:{port}"
+    video_probe = f"{base}/api/video/{urllib.parse.quote(bvid)}/danmaku?page=1&page_size=50"
+    if target_id is None:
+        status, data = _probe_json(video_probe)
+        if data is not None and ("rows" in data or "error" in data):
+            return "ready"
+        return "down" if status is None else "occupied"
+    status, data = _probe_json(f"{base}/api/target/{target_id}/danmaku?page=1")
+    if status == 200 and data is not None and isinstance(data.get("rows"), list) and "total" in data:
+        return "ready"
+    if status == 404 and data is not None and data.get("error") == "未知目标分析":
+        return "missing"
+    if status == 404 and data is None:
+        _, legacy = _probe_json(video_probe)
+        if legacy is not None and ("rows" in legacy or "error" in legacy):
+            return "outdated"
+    return "down" if status is None else "occupied"
+
+
+def maybe_launch_web(bvid: str, target_id: str | None = None):
     """分析结束后自动起 web.py 并用浏览器打开报告页。
 
-    WEB_AUTOSTART=False 时只打印手动提示；已有服务在跑则跳过启动直接开页。
+    WEB_AUTOSTART=False 时只打印手动提示；目标报告须确认当前服务已加载目标路由。
     """
     try:
         port = int(os.environ.get("PROFILER_PORT", "8001"))
@@ -38,43 +76,46 @@ def maybe_launch_web(bvid: str):
         print(f"  [Web] PROFILER_PORT 不是合法端口（{os.environ.get('PROFILER_PORT')!r}），"
               f"跳过自动启动，请手动运行 python web.py")
         return
+    if not 1 <= port <= 65535:
+        print("  [Web] PROFILER_PORT 超出有效端口范围，跳过自动启动，请手动运行 python web.py")
+        return
     if not _BVID_RE.fullmatch(bvid or ""):
         print(f"  [Web] bvid 不合法（{bvid!r}），跳过自动启动，请手动运行 python web.py")
         return
     safe_bvid = urllib.parse.quote(bvid)
     url = f"http://127.0.0.1:{port}/video/{safe_bvid}"
+    if target_id is not None:
+        if not re.fullmatch(r"[0-9a-f]{24}", target_id):
+            print("  [Web] 目标分析编号不合法，跳过自动启动")
+            return
+        url = f"http://127.0.0.1:{port}/target/{target_id}"
     if not WEB_AUTOSTART:
         print(f"  运行 python web.py 后访问报告页: {url}")
         return
 
 
-    # 1 秒超时探测：无服务时快速失败，不阻塞主流程收尾。
-    # 探测 web.py 专有的弹幕 JSON API 并校验响应特征（含 rows/error 键的 JSON），
-    # 非"任意 HTTP 200 即判就绪"——避免端口被其他服务占用时误判
     def _alive() -> bool:
-        probe = f"http://127.0.0.1:{port}/api/video/{safe_bvid}/danmaku?page=1&page_size=50"
-        try:
-            with _LOCAL_OPENER.open(probe, timeout=1) as resp:
-                payload = resp.read()
-        except urllib.error.HTTPError as e:
-            # 4xx/5xx 同样说明有 HTTP 服务在应答，仍需校验是否为 web.py 的 JSON 错误体
-            payload = e.read()
-        except Exception:
-            return False
-        try:
-            data = json.loads(payload.decode("utf-8"))
-        except Exception:
-            return False
-        return isinstance(data, dict) and ("rows" in data or "error" in data)
+        return _server_state(port, bvid, target_id) == "ready"
 
     try:
-        if not _alive():
+        state = _server_state(port, bvid, target_id)
+        if state == "outdated":
+            print(f"  [Web] {port} 端口运行的是旧版报告服务，尚未加载目标报告路由；目标存档已保存，无需重新分析")
+            print(f"  请依次运行 python web.py --stop --port {port} 和 python web.py --port {port}，再访问: {url}")
+            return
+        if state == "missing":
+            print(f"  [Web] 当前服务未找到这份目标存档，请确认服务来自同一项目目录并重启；报告链接: {url}")
+            return
+        if state == "occupied":
+            print(f"  [Web] {port} 端口的服务未能读取报告，请检查该端口服务与 data/web.log；报告链接: {url}")
+            return
+        if state == "down":
             # 分离启动：start_new_session 脱离本进程生命周期，日志重定向到 data/web.log
             root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             log_path = os.path.join(DATA_DIR, "web.log")
             log_f = open(log_path, "a", encoding="utf-8")
             try:
-                subprocess.Popen([sys.executable, os.path.join(root, "web.py")],
+                subprocess.Popen([sys.executable, os.path.join(root, "web.py"), "--port", str(port)],
                                  cwd=root, stdout=log_f, stderr=subprocess.STDOUT,
                                  start_new_session=True)
             except Exception:
@@ -99,7 +140,7 @@ def maybe_launch_web(bvid: str):
             # webbrowser.open 在无图形环境返回 False/抛异常，降级打印 URL
             if webbrowser.open(url):
                 print(f"  报告页已在浏览器打开: {url}")
-                print("  停止后台 web 服务: python web.py --stop")
+                print(f"  停止后台 web 服务: python web.py --stop --port {port}")
             else:
                 print(f"  浏览器打开失败，请手动访问: {url}")
         else:

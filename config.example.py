@@ -102,6 +102,7 @@ SUB_URLS = [u.strip() for u in os.environ.get("SUB_URLS", "").split(",") if u.st
 #                                                      ↑↑↑ 把 "" 中间填上你的订阅链接（引号保留）↑↑↑
 # 覆盖内置 mihomo 二进制定位（默认依次找 vendor/mihomo、data/mihomo，都没有则自动下载）
 MIHOMO_PATH = os.environ.get("MIHOMO_PATH", "")
+SUB_USER_AGENT = os.environ.get("SUB_USER_AGENT", "clash.meta")  # 订阅请求客户端标识；部分机场按此返回格式
 # GitHub 加速前缀列表（下载 mihomo 核心用，按序尝试、全部失败回退直连；
 # 环境变量 GH_PROXIES 逗号分隔可覆盖，置空则只直连）
 GH_PROXIES = [u.strip() for u in os.environ.get(
@@ -125,13 +126,23 @@ PROXY_IP_CHECK_INTERVAL = 1800     # 同一入口公网 IP 复查间隔秒数
 PROXY_IP_CHECK_TIMEOUT = 8         # 公网 IP 探测超时秒数
 PROXY_IP_CHECK_ATTEMPTS = 1        # 单次公网 IP 探测请求次数，避免辅助服务故障长时间阻塞
 PROXY_STARTUP_MAX_TRIES = 3        # 首次去重及恢复自检的尝试上限
+PROXY_CORE_STARTUP_TIMEOUT = 60    # 内置核心控制器/订阅就绪的实际等待秒数（不含下载和退出清理）
+PROXY_CORE_STARTUP_LOG_INTERVAL = 10  # 就绪等待进度日志间隔秒数；核心错误仅输出脱敏类别
 PROXY_FAIL_STRIP_THRESHOLD = 3     # 连续代理连接故障达到此值后降级直连
 PROXY_METRICS_WINDOW = 200         # 出口调用耗时 P95 的滑动样本数
 # 单任务单元允许的风控圈数；风控保留原节点并进入出口冷却，不自动跨地区跳转。
 MAX_RISK_ROUNDS = 3
 
 # ========== 破解配置 ==========
-MITM_MAX_UID = 10_000_000_000   # MITM 反查覆盖上限：全部 ≤10 位 UID（16位随机长UID不可解）
+MITM_MAX_UID = 10_000_000_000   # MITM 覆盖 ≤10 位 UID；长 UID 可明文正向匹配，hash 无法唯一恢复身份
+UID_VERIFY_EXISTS_TTL = 7 * 86400  # 存在名片缓存 7 天
+UID_VERIFY_MISSING_TTL = 3600     # 明确 -404 缓存 1 小时，风控/网络/空名片不缓存
+UID_VERIFY_FALLBACK_BUDGET = 50   # 一轮解析的单点补验请求上限，批量缺席也需单点确认
+UID_RESOLUTION_CACHE_TTL = 86400  # 解析结论一天复核；版本/证据变化立即失效
+UID_HARVEST_REFRESH_MAX_PAGES = 10  # 已完成 UID 收割后的刷新请求上限，按本视频评论 ID 停止
+UID_REPLY_TOTAL_PAGES = 10        # 每轮面向未关联兴趣 hash 的楼中楼 UID 补采总请求预算，0=关闭
+UID_REPLY_MAX_ROOTS = 5           # 优先补采回复数最高且未完整采集的主楼数
+UID_REPLY_NO_HIT_PAGES = 3        # 同一主楼连续无新增目标命中的页数达到此值，转下一个主楼
 
 # ========== 采集配置 ==========
 MAX_COMMENT_PAGES = 100      # 评论最大翻页数（约20条/页，上限~2000条主评论）
@@ -182,6 +193,21 @@ SPAM_MEDIUM_THRESHOLD = (3, 0.5)   # (弹幕数, 重复率)：>2 条且半数重
 ANALYZE_USERS_FLOOR = 300        # 保底名额（小视频的默认上限）
 ANALYZE_USERS_RATIO = 0.05       # 上限 = max(FLOOR, 独立发送者数 × 该比例)
 MAX_ANALYZE_USERS_HARD_CAP = 1000  # 绝对上限（保险丝；采集成本与风控暴露的硬约束）
+
+# 目标弹幕分析：独立选人上限、正则保护与报告分页
+TARGET_MAX_USERS = MAX_ANALYZE_USERS_HARD_CAP
+TARGET_PATTERN_MAX_LENGTH = 2048
+TARGET_REGEX_TIMEOUT = 30  # 正则匹配整轮上限（秒），超时终止独立进程
+TARGET_MATCH_PAGE_SIZE = 100
+TARGET_PROFILE_PAGE_SIZE = 24
+TARGET_REPORT_LIST_LIMIT = 50
+
+# 候选空间按需核验：只取公开首页，不改变 CRC32 身份置信度
+UID_SPACE_SAMPLE_ITEMS = 20
+UID_SPACE_CACHE_TTL = 6 * 3600  # 完整样本缓存 6 小时
+UID_SPACE_RETRY_AFTER = 60     # 资料不完整时短暂缓存，随后可重试
+UID_SPACE_MIN_TEXT_LENGTH = 8  # 过短或重复字符发言不作为措辞关联
+
 LLM_DEEP_TOP_K = 20                # LLM 重点深掘人数（兴趣分 top K 单人单调用）
 LLM_DEEP_ENABLED = os.environ.get("LLM_DEEP_ENABLED", "1") not in ("0", "false", "False")
                                    # 阶段7 LLM 重点深掘总开关（False 或环境变量 LLM_DEEP_ENABLED=0 关闭）

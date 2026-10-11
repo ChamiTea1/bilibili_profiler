@@ -15,8 +15,10 @@ import atexit
 import ctypes
 import gzip
 import hashlib
+import json
 import os
 import platform
+import re
 import secrets
 import signal
 import shutil
@@ -28,6 +30,7 @@ import time
 
 import requests
 
+import config
 from clash_ctl import ClashCtl
 from config import BASE_DIR, DATA_DIR, GH_PROXIES, MIHOMO_PATH
 
@@ -69,6 +72,74 @@ _KNOWN_SHA256 = {
     "mihomo-darwin-arm64-go120-v1.19.30.gz": "79322a547bb7ad09c13d366c4b4fc97553896c52b9168d33df21ca4710580b7d",
     "mihomo-darwin-arm64-go122-v1.19.30.gz": "b87f4b02e2fa1bec7d3e1399d8bfa9f5a300610c75a98263e225144d4a85646f",
     "mihomo-darwin-arm64-go124-v1.19.30.gz": "bc847bad45e04fbca3f177743b58241443834693da8efe7723733e8a2001590f",
+}
+
+
+class _CoreDiagnostics:
+    """只保留错误类别，绝不保留或转发核心原文（原文可能含订阅/节点凭证）。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._reasons = set()
+
+    def feed(self, line):
+        text = line.lower()
+        reasons = []
+        if "address already in use" in text or "only one usage of each socket" in text:
+            reasons.append("本机监听端口被占用")
+        if "no such host" in text or "dns resolve" in text or "dns lookup" in text:
+            reasons.append("DNS 解析失败")
+        if "x509:" in text or "certificate verify" in text or "certificate is not valid" in text:
+            reasons.append("TLS 证书校验失败")
+        if "timeout" in text or "deadline exceeded" in text:
+            reasons.append("网络连接或订阅拉取超时")
+        if "connection refused" in text or "actively refused" in text:
+            reasons.append("网络连接被拒绝")
+        if any(word in text for word in ("network is unreachable", "network unreachable", "no route to host")):
+            reasons.append("网络路由不可达")
+        if "permission denied" in text or "operation not permitted" in text:
+            reasons.append("系统拒绝网络或文件访问权限")
+        if "connection reset" in text or "unexpected eof" in text or " eof" in text:
+            reasons.append("远端连接中断（EOF/连接重置）")
+        if "provider" in text:
+            status = re.search(r"(?:status(?:\s+code)?|http)[^\d\n]{0,12}([45]\d{2})\b", text)
+            if not status:
+                status = re.search(r"\b([45]\d{2})\s+(?:bad request|unauthorized|forbidden|not found|too many requests|internal server error|bad gateway|service unavailable|gateway timeout)\b", text)
+            if status:
+                code = status.group(1)
+                if code in ("401", "403"):
+                    reasons.append("订阅服务器拒绝访问（HTTP 401/403）")
+                elif code == "404":
+                    reasons.append("订阅地址不存在（HTTP 404）")
+                else:
+                    reasons.append(f"订阅服务器返回 HTTP {code}")
+            if (any(word in text for word in ("parse error", "unmarshal", "invalid", "no proxies", "empty", "provider need one proxy"))
+                    or ("proxies" in text and any(word in text for word in ("missing", "field", "doesn't have")))):
+                reasons.append("订阅内容为空或格式不受支持")
+            if any(word in text for word in ("unsupported", "unsupport", "not support")):
+                reasons.append("订阅含核心不支持的节点协议或参数")
+            if "error" in text or "failed" in text:
+                reasons.append("订阅提供器初始化或更新失败")
+        if any(word in text for word in ("parse config error", "yaml:", "config file is invalid")):
+            reasons.append("核心配置解析失败")
+        if not reasons and ("level=error" in text or "level=fatal" in text):
+            reasons.append("核心报告其他错误")
+        with self._lock:
+            self._reasons.update(reasons)
+
+    def summary(self):
+        with self._lock:
+            return "；".join(sorted(self._reasons))
+
+
+_STARTUP_STATES = {
+    "unreachable": "本机控制器尚未连通",
+    "unauthorized": "本机控制器拒绝认证",
+    "http_error": "本机控制器返回异常状态",
+    "invalid_response": "本机控制器响应格式错误",
+    "missing_group": "控制器可达，账号选择组尚未加载",
+    "empty": "控制器可达，订阅尚未加载有效节点",
+    "all_dead": "控制器可达，节点健康检查全部失败",
 }
 
 
@@ -186,7 +257,7 @@ def ensure_binary(allow_download: bool = True) -> str | None:
 
 
 class ProxyCore:
-    """内置 mihomo 核心：start() 成功返回就绪的 ClashCtl，失败返回 None（静默降级）
+    """内置 mihomo 核心：start() 成功返回就绪控制器，失败给出脱敏诊断并返回 None。
 
     单核心管理多个账号入口；新增账号可热加载，已有入口端口保持不变。
     """
@@ -239,9 +310,30 @@ class ProxyCore:
         self._proc: subprocess.Popen | None = None
         self._start_lock = threading.Lock()   # start() 串行化：并发建池不会拉起多个核心
         self._atexit_registered = False       # atexit.register 只注册一次，避免叠加调用
+        self._diagnostics = _CoreDiagnostics()
+        self._log_reader = None
         self._listeners = {}
         self.generation = 0
         self._add_accounts(account_names or ["主号"])
+
+    def _read_core_output(self, stream, diagnostics):
+        """持续排空管道，防止核心被写满的 stdout 阻塞；不落原始日志文件。"""
+        try:
+            with stream:
+                while chunk := stream.readline(4096):
+                    diagnostics.feed(chunk)
+        except (OSError, ValueError):
+            pass
+
+    def _print_diagnostics(self):
+        summary = self._diagnostics.summary()
+        if summary:
+            print(f"[ProxyCore] 核心诊断（已脱敏）：{summary}", flush=True)
+            if "HTTP 400" in summary:
+                print("[ProxyCore] 订阅返回 HTTP 400：请核对订阅链接；若系统代理开启 TUN/增强模式，"
+                      "先关闭后重试（禁用环境代理不能绕过系统路由）", flush=True)
+        else:
+            print("[ProxyCore] 核心未提供可识别的错误；请检查订阅可用性、DNS 与系统 TUN 路由", flush=True)
 
     def _add_accounts(self, names):
         """账号名只用于稳定散列，不直接拼接进 YAML。"""
@@ -327,12 +419,18 @@ class ProxyCore:
     def _gen_config(self) -> str:
         """生成最小 yaml（字符串模板，项目无 pyyaml 依赖）；每订阅一个 provider，
         每账号 select 组引用全部 provider，入口直接绑定所属账号组。"""
+        # 与官方面板的订阅导入标识一致，避免机场把裸核心识别为普通 HTTP 客户端。
+        # JSON 字符串也是合法 YAML 标量，用户覆盖请求头时不能注入额外配置。
+        user_agent = os.environ.get("SUB_USER_AGENT", getattr(config, "SUB_USER_AGENT", "clash.meta"))
+        user_agent = json.dumps(user_agent or "clash.meta", ensure_ascii=True)
         providers = "\n".join(
             f'  sub{i}:\n'
             f'    type: http\n'
             f'    url: "{u}"\n'
             # 订阅必须直连拉取（节点还没加载，走代理组是鸡生蛋问题）
             f'    proxy: DIRECT\n'
+            f'    header:\n'
+            f'      User-Agent: [{user_agent}]\n'
             f'    interval: 86400\n'
             f'    health-check:\n'
             f'      enable: true\n'
@@ -374,7 +472,7 @@ class ProxyCore:
         )
 
     def start(self, allow_download: bool = True) -> ClashCtl | None:
-        """拉起核心子进程并轮询就绪（核心需先拉订阅，最长等 60s）；失败返回 None。
+        """拉起核心并按实际经过时间等待就绪（默认 60s，不含下载与退出清理）。
 
         幂等：已启动且存活（poll() 为 None）直接复用返回既有 ClashCtl，不重复拉起
         （web.py 重新生成 job 会反复 build_pool，进程内只允许一个内置核心）。
@@ -389,6 +487,8 @@ class ProxyCore:
             if not self.sub_urls:
                 print("[ProxyCore] 无可用订阅链接（全部被剔除或未配置），禁用内置核心")
                 return None
+            print(f"[ProxyCore] 准备内置核心：{len(self.sub_urls)} 个订阅，"
+                  f"{len(self._listeners)} 个账号入口，正在查找核心文件", flush=True)
             bin_path = ensure_binary(allow_download=allow_download)
             if not bin_path:
                 print("[ProxyCore] 未找到 mihomo 二进制（可设 MIHOMO_PATH 或放置到 vendor/），禁用内置核心")
@@ -408,31 +508,59 @@ class ProxyCore:
                 print(f"[ProxyCore] 配置写入失败: {e}，禁用内置核心")
                 return None
             try:
+                self._diagnostics = _CoreDiagnostics()
                 self._proc = subprocess.Popen(
                     [bin_path, "-d", self._runtime_dir, "-f", cfg_path],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace",
                     **self._pdeathsig_kwargs())
             except OSError as e:
                 print(f"[ProxyCore] 核心启动失败: {e}")
                 self._stop_locked()     # 回收进程句柄并清掉刚写入的含凭证配置
                 return None
+            self._log_reader = threading.Thread(
+                target=self._read_core_output, args=(self._proc.stdout, self._diagnostics),
+                daemon=True, name="mihomo-diagnostics")
+            self._log_reader.start()
             if not self._atexit_registered:
                 atexit.register(self.stop)
                 self._atexit_registered = True
             ctl = next(iter(self.account_routes().values()))[0]
-            for _ in range(60):
+            timeout = max(1.0, float(getattr(config, "PROXY_CORE_STARTUP_TIMEOUT", 60)))
+            log_interval = max(1.0, float(getattr(config, "PROXY_CORE_STARTUP_LOG_INTERVAL", 10)))
+            started = time.monotonic()
+            deadline = started + timeout
+            next_log = started + log_interval
+            state = "unreachable"
+            print(f"[ProxyCore] 核心已启动，等待控制器和订阅节点（最多 {timeout:g}s）", flush=True)
+            while (remaining := deadline - time.monotonic()) > 0:
                 if self._proc.poll() is not None:
-                    print(f"[ProxyCore] 核心进程退出（code={self._proc.returncode}），禁用内置核心")
+                    print(f"[ProxyCore] 核心进程退出（code={self._proc.returncode}），禁用内置核心", flush=True)
                     self._stop_locked()     # 核心已死：清残留进程引用与含凭证配置
+                    self._print_diagnostics()
                     return None
-                nodes = ctl.refresh_nodes() if ctl.available() else []
-                if nodes:
+                # connect/read 分别占至多一半剩余预算，避免请求超时再叠加 60 轮。
+                probe_timeout = min(1.5, remaining / 2)
+                status = ctl.startup_status(timeout=(probe_timeout, probe_timeout))
+                state, nodes = status["state"], status["nodes"]
+                now = time.monotonic()
+                if nodes and now < deadline:
                     self.generation += 1
-                    print(f"[ProxyCore] 内置核心就绪: {len(nodes)} 个可用节点，{len(self._listeners)} 个独立账号入口")
+                    print(f"[ProxyCore] 内置核心就绪: {len(nodes)} 个可用节点，{len(self._listeners)} 个独立账号入口", flush=True)
                     return ctl
-                time.sleep(1)
-            print("[ProxyCore] 核心就绪超时（订阅拉取失败？），禁用内置核心")
+                if state == "unauthorized":
+                    break
+                if now >= next_log and now < deadline:
+                    print(f"[ProxyCore] 等待中（{now - started:.0f}/{timeout:g}s）："
+                          f"{_STARTUP_STATES.get(state, '尚未就绪')}", flush=True)
+                    next_log = now + log_interval
+                if now < deadline:
+                    time.sleep(min(1.0, deadline - now))
+            cause = _STARTUP_STATES.get(state, "尚未就绪")
+            outcome = "启动失败" if state == "unauthorized" else f"核心就绪超时（{timeout:g}s）"
+            print(f"[ProxyCore] {outcome}：{cause}，禁用内置核心", flush=True)
             self._stop_locked()
+            self._print_diagnostics()
             return None
 
     def _stop_locked(self):
@@ -451,6 +579,9 @@ class ProxyCore:
                     proc.wait(timeout=5)    # kill 后回收，避免僵尸进程
                 except subprocess.TimeoutExpired:
                     pass
+        if self._log_reader is not None:
+            self._log_reader.join(timeout=1)
+            self._log_reader = None
         # provider 缓存也含节点凭证，只清本实例创建的目录，不影响其他核心。
         shutil.rmtree(self._runtime_dir, ignore_errors=True)
 

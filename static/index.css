@@ -5,7 +5,14 @@
 .video-table a { color:#00a1d6; text-decoration:none; }
 
 /* 首页：搜索框 / 可排序列头 / 分页条（spec 6） */
-.idx-controls { margin-bottom:16px; }
+.idx-controls { margin-bottom:16px; display:flex; align-items:center; gap:12px; }
+.idx-controls .search-input { min-width:0; flex:0 1 220px; }
+.target-entry { display:inline-flex; align-items:center; flex-shrink:0; white-space:nowrap;
+    padding:8px 14px; color:#00a1d6; text-decoration:none; }
+.target-report-list { list-style:none; padding:0; margin:12px 0 0; }
+.target-report-list li { padding:14px 0; border-bottom:1px solid #f0f0f0; line-height:1.9; overflow-wrap:anywhere; }
+.target-report-list li:last-child { border-bottom:0; }
+.target-report-list code { white-space:pre-wrap; }
 .video-table th[data-sort] { cursor:pointer; user-select:none; }
 .video-table th[data-sort]:hover { color:#00a1d6; }
 .video-table th[data-sort]::after { content:' ⇅'; font-size:12px; }

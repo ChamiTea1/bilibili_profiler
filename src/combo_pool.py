@@ -165,9 +165,12 @@ def build_pool(main_client):
     """主号与小号绑定稳定入口，首次按真实 IP 去重，自检失败按入口降级。"""
     from auth import load_extra_clients
     accounts = [("主号", main_client)] + load_extra_clients()
+    print(f"[Pool] 账号校验完成（{len(accounts)} 个可用账号），正在初始化出口", flush=True)
     routes = _discover_ip_pool(accounts)
     pool = ComboPool(accounts, routes=routes)
-    for name, client in accounts:
+    for i, (name, client) in enumerate(accounts, 1):
+        if routes[name].active_proxy and not routes[name].ready:
+            print(f"[Pool] 出口自检 {i}/{len(accounts)}（账号[{name}]）", flush=True)
         routes[name].prepare(client)
     status = pool.proxy_status()
     measured = {s["ip"] for s in status.values() if s["proxy_active"] and s["ip"]}
