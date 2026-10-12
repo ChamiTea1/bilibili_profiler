@@ -10,11 +10,7 @@
 .dm-table { min-width:720px; }
 .target-comment-text { white-space:pre-wrap; }
 #targetError { color:#c62828; }
-.space-candidate { margin:10px 0; padding:10px; border:1px solid #ddd; border-radius:8px; }
-.space-candidate summary { cursor:pointer; margin-bottom:8px; }
-.space-assessment { max-width:430px; font-size:14px; line-height:1.7; white-space:normal; }
-.space-assessment ul { padding-left:20px; }
-.space-assessment li { margin:8px 0; white-space:pre-wrap; }
 @media (max-width:600px) {
-    .tab-btn { flex:1; padding:10px 12px; font-size:14px; white-space:nowrap; }
+    .tab-btn { flex:0 0 auto; padding:10px 12px; font-size:14px; white-space:nowrap; }
+    .tab-bar { overflow-x:auto; }
 }

@@ -14,8 +14,8 @@ from api_client import BiliAPIClient, RiskControlError
 from config import MITM_MAX_UID, USER_CARD_URL, USER_CARDS_BATCH_URL
 from crc_rainbow import lookup
 from storage import (load_uid_candidates, save_uid_candidates, load_uid_verify_cache,
-                     save_uid_verify_cache)
-from uid_evidence import candidates_of, crc32_uid, add_uid, PLAINTEXT_SOURCES
+                     save_uid_verify_cache, load_uid_verify_times)
+from uid_evidence import candidates_of, crc32_uid, add_uid, PLAINTEXT_SOURCES, LOCAL_PLAIN_REASON, CRC_UNIQUE_REASON
 
 METHOD_COMMENT_VERIFY = "评论区验证"
 METHOD_CRC32_CRACK = "CRC32破解"
@@ -26,7 +26,7 @@ METHOD_PENDING = "待验证"
 VERIFY_EXISTS = "exists"
 VERIFY_NOT_EXISTS = "not_exists"
 VERIFY_UNKNOWN = "unknown"
-RESOLVER_VERSION = "evidence-v2"
+RESOLVER_VERSION = "evidence-v4"
 CANDIDATE_VERSION = "mitm-v1"
 UID_VERIFY_EXISTS_TTL = getattr(config, "UID_VERIFY_EXISTS_TTL", 7 * 86400)
 UID_VERIFY_MISSING_TTL = getattr(config, "UID_VERIFY_MISSING_TTL", 3600)
@@ -117,21 +117,37 @@ def resolution_record(mid_hash: str, result: tuple, mapping: dict, methods: dict
     uid, confidence, method, _info, risk, candidates = result
     reasons = {METHOD_AMBIGUOUS: "同一 hash 存在多名有效候选，暂不归属",
                METHOD_PENDING: "仍有候选验证未知，不能视为已排除",
-               METHOD_CRC32_CRACK: "搜索范围内仅一个已确认存在的候选，仍可能碰撞长 UID",
+               METHOD_CRC32_CRACK: CRC_UNIQUE_REASON,
                METHOD_CRC32_COLLISION: "搜索范围内的候选均已确认不存在",
                METHOD_UNKNOWN: "搜索范围内无候选，也没有明文关联证据"}
-    reason = reasons.get(method, "同视频明文候选关联，仍有 CRC32 碰撞风险" if confidence == "中"
+    reason = reasons.get(method, LOCAL_PLAIN_REASON if confidence == "高"
                          else "仅跨视频明文候选，尚缺本视频关联证据")
-    return {"version": RESOLVER_VERSION, "fingerprint": evidence_fingerprint(mid_hash, mapping, methods, max_search),
+    record = {"version": RESOLVER_VERSION, "fingerprint": evidence_fingerprint(mid_hash, mapping, methods, max_search),
             "checked_at": time.time(), "candidates": candidates, "collision_risk": risk,
+            "max_search": min(max_search, MITM_MAX_UID), "candidate_version": CANDIDATE_VERSION,
             "reason": reason, "assigned": uid is not None,
             "evidence": [{"uid": u, **ev} for u, ev in sorted(_evidence(mid_hash, mapping, methods).items())]}
+    if method == METHOD_CRC32_CRACK:
+        cached = _cached_verifications(candidates)
+        record["candidate_status"] = {str(u): cached.get(u, (VERIFY_UNKNOWN, {}))[0] for u in candidates}
+        try:
+            record["candidate_checked_at"] = load_uid_verify_times(candidates)
+        except sqlite3.Error:
+            record["candidate_checked_at"] = {}
+    return record
 
 
 def resolution_is_current(row: dict, mid_hash: str, mapping: dict, methods: dict | None = None) -> bool:
     record = row.get("resolution") or {}
     if row.get("method") in (METHOD_PENDING, METHOD_UNKNOWN):
         return False  # 未知没有有效结论，重跑继续验证。
+    if row.get("method") == METHOD_CRC32_CRACK:
+        uids = candidates_of(record.get("candidates"))
+        cached = _cached_verifications(sorted(uids))
+        # 高置信度依赖所有阴性结论；其中一条过期，即须重验，不能按一天缓存跳过。
+        if (row.get("confidence") != "高" or not uids or set(cached) != uids
+                or {u for u, (status, _) in cached.items() if status == VERIFY_EXISTS} != {row.get("uid")}):
+            return False
     return (record.get("version") == RESOLVER_VERSION
             and record.get("fingerprint") == evidence_fingerprint(mid_hash, mapping, methods)
             and 0 <= time.time() - record.get("checked_at", 0) < UID_RESOLUTION_CACHE_TTL)
@@ -261,25 +277,25 @@ def _plain_result(evidence: dict[int, dict]):
     uid = candidates[0]
     ev = evidence[uid]
     # 相同 hash 的弹幕数不是新的身份区分信息；关联置信度不随条数升级。
-    return uid, ("中" if ev["local"] else "低"), ev["source"], None, True, candidates
+    return uid, ("高" if ev["local"] else "低"), ev["source"], None, True, candidates
 
 
 def _finalize(mid_hash: str, danmaku_count: int, plain_uid: Optional[int],
               candidates: list, method_map: dict | None, status_of, info_of):
-    """只在所有候选完成验证且唯一存在时给低置信度候选，永不取最小 UID。"""
+    """全部候选核验完成且唯一存在时按实用分级标高，未知及多名存在不选人。"""
     if plain_uid is not None:
         return _plain_result({plain_uid: {"source": (method_map or {}).get(mid_hash, METHOD_COMMENT_VERIFY), "local": True}})
     if not candidates:
         return None, "无", METHOD_UNKNOWN, None, False, []
     existing = [u for u in candidates if status_of(u) == VERIFY_EXISTS]
-    unknown = [u for u in candidates if status_of(u) == VERIFY_UNKNOWN]
+    unknown = [u for u in candidates if status_of(u) not in (VERIFY_EXISTS, VERIFY_NOT_EXISTS)]
     if len(existing) > 1:
         return None, "无", METHOD_AMBIGUOUS, None, True, candidates
     if unknown:
         return None, "无", METHOD_PENDING, None, True, candidates
     if len(existing) == 1:
         uid = existing[0]
-        return uid, "低", METHOD_CRC32_CRACK, info_of(uid), True, candidates
+        return uid, "高", METHOD_CRC32_CRACK, info_of(uid), True, candidates
     return None, "无", METHOD_CRC32_COLLISION, None, False, candidates
 
 
@@ -305,6 +321,12 @@ def _resolve_many(sender_groups: dict, mapping: dict, client, max_search: int, m
                      "user_info": info or {}, "collision_risk": risk, "candidates": candidates,
                      "danmaku_count": group["count"],
                      "resolution": resolution_record(h, verdict, mapping, methods, max_search)}
+        if h in candidate_map:
+            result[h]["resolution"]["candidate_status"] = {str(u): status_of(u) for u in candidates}
+            try:
+                result[h]["resolution"]["candidate_checked_at"] = load_uid_verify_times(candidates)
+            except sqlite3.Error:
+                pass
     return result
 
 

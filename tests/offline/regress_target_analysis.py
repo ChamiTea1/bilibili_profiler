@@ -128,7 +128,7 @@ def direct_target():
         key = run(skip_collect=True)
     result = storage.load_target_analysis(key)["result"]
     assert result["stats"]["profile_count"] == 1
-    assert result["senders"][0]["confidence"] == "中"
+    assert result["senders"][0]["confidence"] == "高"
     assert result["senders"][0]["matched_count"] == 1
     assert result["profiles"][0]["danmaku"]["count"] == 2
     assert flow.calc_crc32(88888888) not in [s["mid_hash"] for s in result["senders"]]

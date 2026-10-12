@@ -27,7 +27,7 @@ from config import (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS, LLM_CO
                     COMMENT_CRINGE_MAX_ITEMS, LLM_RETRY_BUDGET_SECONDS,
                     LLM_TRANSIENT_RETRIES, LLM_BATCH_THINKING, LLM_DEEP_TIMEOUT)
 from llm_client import make_client   # 统一处理环境代理（默认不继承，见该模块 docstring）
-from storage import load_llm_cache, save_llm_cache
+from storage import load_llm_cache, save_llm_cache, save_danmaku_problems
 
 # 问题弹幕类别（prompt 与聚合均引用，勿散落硬编码字符串）
 PROBLEM_CATEGORIES = ["中二抒情", "尬夸捧杀", "引战阴阳", "人身攻击", "恶意剧透", "广告引流", "键政敏感", "批评吐槽"]
@@ -377,6 +377,54 @@ def _judge_batches(items: list[dict], batch_size: int, video_info: dict,
     return BatchVerdicts(flat_verdicts, covered), len(pending) + len(final_failed), total
 
 
+def _danmaku_cache_key(items: list[dict], sender_groups: dict, bvid: str) -> str:
+    """与判定入口共用指纹，报告读取旧缓存时不能误取其他内容或其他视频。"""
+    hash_items = sorted(items, key=lambda x: (-x["count"], x["content"]))
+    digest = hashlib.sha256(json.dumps(
+        [hash_items, {h: sorted(g.get("contents", [])) for h, g in sender_groups.items()}],
+        ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return f"cringe:{bvid}:{_DM_CACHE_VERSION}:{LLM_MODEL}:{digest}"
+
+
+def load_cached_danmaku_problems(danmaku_list: list[dict], sender_groups: dict, bvid: str) -> dict:
+    """仅读取当前内容指纹的整段/批次缓存，不调用 LLM；用于旧报告的匿名问题证据。"""
+    items = _dedup_contents(danmaku_list)
+    if not items:
+        return {}
+    cached = load_llm_cache(_danmaku_cache_key(items, sender_groups, bvid))
+    if cached:
+        try:
+            results = json.loads(cached)
+            if isinstance(results, dict):
+                allowed = {it["content"] for it in items}
+                return {it["content"]: it for r in results.values() if isinstance(r, dict)
+                        for it in (r.get("items") or r.get("examples") or [])
+                        if isinstance(it, dict) and it.get("content") in allowed and it.get("category") in PROBLEM_CATEGORIES}
+        except (ValueError, TypeError):
+            pass
+    output = {}
+    size = max(1, CRINGE_BATCH_SIZE)
+    for start in range(0, len(items), size):
+        batch = items[start:start + size]
+        digest = hashlib.sha256(json.dumps([it["content"] for it in batch], ensure_ascii=False).encode()).hexdigest()[:16]
+        cached = load_llm_cache(f"cringe:{bvid}:{_DM_CACHE_VERSION}@batch:v2:{LLM_MODEL}:{digest}")
+        for item in (_parse_verdicts(cached) or []) if cached else []:
+            i = item.get("i")
+            if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(batch) and item.get("category") in PROBLEM_CATEGORIES:
+                content = batch[i]["content"]
+                output[content] = {**item, "content": content}
+    return output
+
+
+def _save_problem_evidence(bvid: str, results: dict, judged_contents: set[str]):
+    try:
+        verdicts = {it["content"]: it for r in results.values()
+                    for it in (r.get("items") or r.get("examples") or [])}
+        save_danmaku_problems(bvid, verdicts, judged_contents)
+    except Exception:
+        print("[问题弹幕] 警告: 匿名问题证据保存失败，仍保留本轮判定及已有缓存")
+
+
 def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dict],
                           video_info: dict) -> dict[str, dict]:
     """
@@ -404,13 +452,7 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
     bvid = video_info.get("bvid", "")
     cache_key = ""
     if bvid:
-        # 确定性排序：同内容集合无论输入次序都产生相同 digest（count 降序 + 内容字典序决胜）
-        hash_items = sorted(items, key=lambda x: (-x["count"], x["content"]))
-        digest = hashlib.sha256(
-            json.dumps([hash_items, {h: sorted(g.get("contents", [])) for h, g in sender_groups.items()}],
-                       ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:16]
-        cache_key = f"cringe:{bvid}:{_DM_CACHE_VERSION}:{LLM_MODEL}:{digest}"
+        cache_key = _danmaku_cache_key(items, sender_groups, bvid)
         cached = load_llm_cache(cache_key)
         if cached:      # 空串视为未命中
             try:
@@ -418,6 +460,7 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
                 if not isinstance(results, dict):
                     raise ValueError("缓存结果不是 dict")
                 print(f"[问题弹幕] 缓存命中（{len(results)} 个发送者），跳过 LLM 判定")
+                _save_problem_evidence(bvid, results, {it["content"] for it in items})
                 return results
             except (json.JSONDecodeError, ValueError):
                 print("[问题弹幕] 警告: 缓存内容损坏，重新判定")
@@ -476,6 +519,9 @@ def detect_cringe_danmaku(danmaku_list: list[dict], sender_groups: dict[str, dic
         else:
             print(f"[问题弹幕] 警告: {failed}/{total} 批失败，结果不完整，不写整段缓存（重跑可补齐）")
 
+    judged_indices = getattr(raw_verdicts, "judged_indices", range(len(items)) if failed == 0 else [])
+    _save_problem_evidence(bvid, results, {items[i]["content"] for i in judged_indices
+                                       if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(items)})
     print(f"[问题弹幕] 检测完成: {len(verdicts)} 条问题弹幕，涉及 {len(results)} 个发送者")
     return results
 

@@ -11,6 +11,7 @@ import html as _html
 from datetime import datetime
 from collections import Counter
 from urllib.parse import urlparse
+from uid_evidence import confidence_label
 
 
 # 弹幕样本与时间戳数量不一致的告警去重（web.py 每次页面重建都会调用本模块，
@@ -258,9 +259,10 @@ def generate_user_card(profile: dict) -> str:
                        f'title="人工标记该发送者的刷屏判定为误报；标记后按低风险展示，可撤销">误报</button>')
     resolve_method = profile.get("resolve_method", "")
     resolve_confidence = profile.get("resolve_confidence", "")
+    conf_label = confidence_label(resolve_confidence, resolve_method, bool(profile.get("collision_risk")))
     method_badge = (f'<span class="method-badge" title="UID 解析方式：{esc(resolve_method)}">解析:{esc(resolve_method)}</span>'
                     if resolve_method else "")
-    conf_badge = (f'<span class="method-badge" title="解析置信度：{esc(resolve_confidence)}（低置信度可能误识别）">置信度:{esc(resolve_confidence)}</span>'
+    conf_badge = (f'<span class="method-badge" title="解析置信度：{esc(resolve_confidence)} · {esc(profile.get("resolve_reason", ""))}">置信度:{esc(conf_label)}</span>'
                   if resolve_confidence and resolve_confidence != "无" else "")   # "无"=无置信度信息，不渲染
 
     # 活动模式

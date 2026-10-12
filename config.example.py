@@ -202,7 +202,7 @@ TARGET_MATCH_PAGE_SIZE = 100
 TARGET_PROFILE_PAGE_SIZE = 24
 TARGET_REPORT_LIST_LIMIT = 50
 
-# 候选空间按需核验：只取公开首页，不改变 CRC32 身份置信度
+# 候选空间按需核验：只取公开首页；兴趣措辞不升级身份，唯一有效名片按存在性排除标高
 UID_SPACE_SAMPLE_ITEMS = 20
 UID_SPACE_CACHE_TTL = 6 * 3600  # 完整样本缓存 6 小时
 UID_SPACE_RETRY_AFTER = 60     # 资料不完整时短暂缓存，随后可重试

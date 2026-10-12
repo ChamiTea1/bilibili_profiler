@@ -64,10 +64,13 @@ from storage import (load_senders, load_global_uid_map,
                      load_faces, load_face_cached_uids, save_face,
                      load_llm_cache, save_llm_cache)
 from storage import (load_target_analysis, list_target_analyses, load_uid_space_cache,
-                     has_normal_report, NORMAL_REPORT_PREDICATE)
+                     has_normal_report, NORMAL_REPORT_PREDICATE, load_danmaku,
+                     load_danmaku_problems, load_uid_verify_cache, load_uid_candidates, load_uid_verify_times)
 from target_report import render_target_report, render_target_list_page, page_number, render_space_assessment
 from candidate_space import (candidate_uids, cached_assessments, sample_is_fresh,
                              fetch_space_sample, assess_space, sender_contents)
+from crc_candidates import is_pure_crc, build_crc_groups, render_crc_groups, render_crc_group
+from candidate_cards import read_candidate_card, cache_space_card, reconcile_crc_sender
 from main import run_analysis
 from uid_resolver import (resolve_sender, METHOD_CRC32_CRACK, build_evidence_maps,
                           resolution_is_current, resolution_record, VerificationBudget)
@@ -77,7 +80,7 @@ from user_collector import collect_user_data
 from profile_analyzer import analyze_profile
 from up_analyzer import fetch_up_wordcloud
 from spam_detector import batch_detect_spam, detect_repeat_events, pool_distribution_from_rows
-from cringe_detector import detect_density_peaks
+from cringe_detector import detect_density_peaks, load_cached_danmaku_problems
 from llm_analyzer import LLMAnalyzer
 from up_analyzer import _tokenize
 from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summary_stats,
@@ -2303,10 +2306,54 @@ def _low_conf_tab_html(bvid: str) -> tuple[str, int]:
     return head + "".join(items), len(rows)
 
 
+def _crc_candidate_data(bvid: str, target_record: dict | None = None,
+                        include_resolved: bool = False) -> tuple[dict, list[dict]]:
+    """按匿名 hash 读取问题证据和全部候选，GET 不调用破解、B站或 LLM。"""
+    rows = load_danmaku(bvid)
+    senders = (target_record["result"].get("senders", []) if target_record else load_senders(bvid))
+    senders = [dict(s) for s in senders]
+    for sender in senders:
+        if is_pure_crc(sender):
+            limit = sender.get("resolution", {}).get("max_search", _config.MITM_MAX_UID)
+            cached = load_uid_candidates(sender["mid_hash"], limit, "mitm-v1")
+            sender["_candidate_complete"] = cached is not None
+            if cached is not None:
+                sender["candidates"] = sorted(set(cached) | set(candidate_uids(sender)))
+    if target_record and not rows:
+        rows = target_record["result"].get("matches", [])
+    problems = load_danmaku_problems(bvid)
+    if not problems and rows:
+        groups = {}
+        for dm in rows:
+            groups.setdefault(dm["mid_hash"], {"contents": []})["contents"].append(dm["content"])
+        problems = load_cached_danmaku_problems(rows, groups, bvid)
+    uids = sorted({u for s in senders if is_pure_crc(s) for u in candidate_uids(s)})
+    verifications = load_uid_verify_cache(uids, getattr(_config, "UID_VERIFY_EXISTS_TTL", 604800),
+                                        getattr(_config, "UID_VERIFY_MISSING_TTL", 3600))
+    groups = build_crc_groups(senders, rows, problems, load_false_positives(bvid), verifications,
+                              target_record["result"].get("matches", []) if target_record else None,
+                              load_uid_verify_times(uids), include_resolved=include_resolved)
+    record = {"bvid": bvid, "result": {"senders": senders, "matches": rows,
+                                      "video_info": (target_record["result"].get("video_info", {})
+                                                     if target_record else load_video_info(bvid) or {})}}
+    if target_record:
+        record["id"] = target_record["id"]
+    return record, groups
+
+
+def _crc_candidate_tab_html(bvid: str, target_record: dict | None = None) -> tuple[str, int]:
+    record, groups = _crc_candidate_data(bvid, target_record)
+    endpoint = (f'/api/target/{target_record["id"]}/candidate-space' if target_record
+                else f'/api/video/{bvid}/candidate-space')
+    html = render_crc_groups(groups, endpoint, _mask_on(), _mask_name, _mask_uid,
+                             cached_assessments(record), render_space_assessment, bool(target_record))
+    return html, len(groups)
+
+
 @app.route("/video/<bvid>")
 @_db_guard
 def video_page(bvid: str):
-    """报告页：概览/用户画像/弹幕浏览器/问题弹幕榜/争执焦点/问题评论榜/高回复评论/低置信度 八个标签页。
+    """报告页：常规八个标签页及低置信度后的纯破解候选页。
 
     整页 HTML 按 bvid 内存缓存（_PAGE_CACHE）：避免每次刷新重跑 _load_profiles/
     _attach_other_videos 逐用户查询；job（手动分析/重新生成）完成或删除时主动失效，
@@ -2365,6 +2412,7 @@ def video_page(bvid: str):
     repeat_block = _repeat_events_block(bvid)            # 概览页群体复读事件区块（含全池分布自检）
     dm_attrs = _danmaku_attr_stats(bvid)                 # 弹幕属性分布（mode/color）
     lowconf_tab, lowconf_count = _low_conf_tab_html(bvid)  # 低置信度页（疑似误识别用户复核）
+    crc_tab, crc_count = _crc_candidate_tab_html(bvid)
 
     # CSV/JSON 导出下载链接：默认只显示最新一组，历史导出收进 <details> 折叠块（spec 6）
     latest, history = _export_links(bvid)
@@ -2551,6 +2599,7 @@ def video_page(bvid: str):
 <script src="/static/wordcloud2.min.js"></script>
 <style>{REPORT_CSS}</style>
 <link rel="stylesheet" href="/static/report.css">
+<link rel="stylesheet" href="/static/candidate_space.css">
 </head>
 <body>
 <div class="container">
@@ -2575,6 +2624,7 @@ def video_page(bvid: str):
         <button class="tab-btn" data-tab="cmtwar" onclick="switchTab('cmtwar')">问题评论榜</button>
         <button class="tab-btn" data-tab="hot" onclick="switchTab('hot')">高回复评论</button>
         <button class="tab-btn" data-tab="lowconf" onclick="switchTab('lowconf')">低置信度</button>
+        <button class="tab-btn" data-tab="crc" onclick="switchTab('crc')">纯破解候选（{crc_count}）</button>
     </div>
 
     <div id="tab-overview" class="tab-pane active">
@@ -2661,11 +2711,13 @@ def video_page(bvid: str):
     <div id="tab-hot" class="tab-pane">{hot_tab}</div>
 
     <div id="tab-lowconf" class="tab-pane">{lowconf_tab}</div>
+    <div id="tab-crc" class="tab-pane">{crc_tab}</div>
 
     <div id="wc-popup" class="wc-popup"><canvas id="wc-popup-canvas" width="276" height="216"></canvas></div>
 </div>
 <script>window.__DATA__ = {js_json(page_data)};</script>
 <script src="/static/report.js"></script>
+<script src="/static/candidate_space.js"></script>
 </body>
 </html>'''
     with _PAGE_CACHE_LOCK:
@@ -3330,7 +3382,7 @@ def target_page(target_id: str):
         abort(404)
     return render_target_report(record, request.args, _mask_on(), _mask_name, _mask_uid,
                                 load_false_positives(record["bvid"]), cached_assessments(record),
-                                has_normal_report(record["bvid"]))
+                                has_normal_report(record["bvid"]), _crc_candidate_tab_html(record["bvid"], record)[0])
 
 
 _CANDIDATE_SPACE_LOCK = threading.Lock()
@@ -3339,10 +3391,30 @@ _CANDIDATE_SPACE_LOCK = threading.Lock()
 @app.route("/api/target/<target_id>/candidate-space", methods=["POST"])
 @_db_guard
 def api_target_candidate_space(target_id: str):
-    """仅核验报告中低置信度碰撞候选；按需限速采样，不改身份或画像。"""
+    """仅核验报告中的碰撞候选；名片缺失可排除，空间线索不升级身份。"""
     record = load_target_analysis(target_id)
     if record is None:
         return jsonify({"error": "未知目标分析"}), 404
+    # 旧快照可能只保存已分配 UID；与新页一样从本地数学缓存补齐全部候选。
+    for sender in record["result"].get("senders", []):
+        if is_pure_crc(sender) and not (sender.get("resolution", {}).get("candidates") or sender.get("candidates")):
+            sender["candidates"] = load_uid_candidates(sender["mid_hash"], _config.MITM_MAX_UID, "mitm-v1") or []
+    return _candidate_space_response(record)
+
+
+@app.route("/api/video/<bvid>/candidate-space", methods=["POST"])
+@_db_guard
+def api_video_candidate_space(bvid: str):
+    if _load_video_row(bvid) is None:
+        return jsonify({"error": "未知视频"}), 404
+    record, groups = _crc_candidate_data(bvid, include_resolved=True)
+    hashes = {g["mid_hash"] for g in groups}
+    record["result"]["senders"] = [s for s in record["result"]["senders"] if s["mid_hash"] in hashes]
+    return _candidate_space_response(record)
+
+
+def _candidate_space_response(record: dict):
+    """两种报告共用；自动读取只走名片，深层空间样本仍按需采集。"""
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"error": "请提供候选 UID 与 mid_hash"}), 400
@@ -3351,8 +3423,37 @@ def api_target_candidate_space(target_id: str):
         return jsonify({"error": "候选 UID 格式错误"}), 400
     uid = int(raw_uid)
     sender = next((s for s in record["result"].get("senders", []) if s["mid_hash"] == body.get("mid_hash")), None)
-    if sender is None or uid not in candidate_uids(sender) or sender.get("confidence") in ("高", "中"):
+    if sender is None or uid not in candidate_uids(sender) or (sender.get("confidence") in ("高", "中") and not is_pure_crc(sender)):
         return jsonify({"error": "该 UID 不是本条记录可核验的低置信度候选"}), 400
+    mode = body.get("mode", "space")
+    if mode not in ("card", "space", "reconcile"):
+        return jsonify({"error": "未知核验方式"}), 400
+    if mode == "reconcile":
+        reconcile_crc_sender(record["bvid"], sender["mid_hash"], record.get("id"))
+        _invalidate_page_cache(record["bvid"])
+        return jsonify({"status": "cached", "risk": False, **_updated_crc_group(record, sender["mid_hash"])})
+    if mode == "card":
+        status, info, risk = read_candidate_card(uid)
+        if status == "unknown":
+            if not _CANDIDATE_SPACE_LOCK.acquire(blocking=False):
+                return jsonify({"error": "已有候选核验在运行，请稍后重试"}), 409
+            job_id = None
+            try:
+                job_id, error = _try_register_job("candidate-card", record["bvid"], total=1)
+                if job_id is None:
+                    return jsonify({"error": error}), 409
+                status, info, risk = read_candidate_card(uid, _get_client())
+            except CookieInvalidError as exc:
+                return jsonify({"error": str(exc)}), 503
+            finally:
+                if job_id:
+                    with JOBS_LOCK:
+                        JOBS[job_id]["finished"] = True
+                _CANDIDATE_SPACE_LOCK.release()
+        reconcile_crc_sender(record["bvid"], sender["mid_hash"], record.get("id"))
+        _invalidate_page_cache(record["bvid"])
+        return jsonify({"status": status, "risk": risk,
+                        **_updated_crc_group(record, sender["mid_hash"])})
     sample = load_uid_space_cache([uid]).get(uid)
     if not sample or not sample_is_fresh(sample):
         if not _CANDIDATE_SPACE_LOCK.acquire(blocking=False):
@@ -3364,6 +3465,7 @@ def api_target_candidate_space(target_id: str):
                 return jsonify({"error": error}), 409
             # 只用主号客户端；不为单个候选启动代理核心或小号池。
             sample = fetch_space_sample(uid, _get_client())
+            _invalidate_page_cache(record["bvid"])
         except CookieInvalidError as exc:
             return jsonify({"error": str(exc)}), 503
         finally:
@@ -3371,9 +3473,27 @@ def api_target_candidate_space(target_id: str):
                 with JOBS_LOCK:
                     JOBS[job_id]["finished"] = True
             _CANDIDATE_SPACE_LOCK.release()
+    cache_space_card(sample)
+    reconcile_crc_sender(record["bvid"], sender["mid_hash"], record.get("id"))
+    _invalidate_page_cache(record["bvid"])
     assessment = assess_space(sample, record["bvid"], record["result"].get("video_info", {}),
                               sender_contents(record, sender))
-    return jsonify({"html": render_space_assessment(assessment, _mask_on(), _mask_name, _mask_uid)})
+    return jsonify({"html": render_space_assessment(assessment, _mask_on(), _mask_name, _mask_uid),
+                    "risk": any(s.get("status") == "risk" for s in sample.get("sources", {}).values()),
+                    **_updated_crc_group(record, sender["mid_hash"])})
+
+
+def _updated_crc_group(record: dict, mid_hash: str) -> dict:
+    """返回最新候选条目或明确移除信号，同时更新数量和空状态。"""
+    target = load_target_analysis(record["id"]) if record.get("id") else None
+    if record.get("id") and target is None:
+        return {"group_html": "", "group_removed": False}
+    current, groups = _crc_candidate_data(record["bvid"], target)
+    group = next((g for g in groups if g["mid_hash"] == mid_hash), None)
+    return {"group_html": (render_crc_group(group, request.path, _mask_on(), _mask_name, _mask_uid,
+                                            cached_assessments(current), render_space_assessment) if group else ""),
+            "group_removed": group is None, "candidate_count": len(groups),
+            "empty_html": render_crc_groups([], request.path, _mask_on(), _mask_name, _mask_uid) if not groups else ""}
 
 
 @app.route("/api/target/<target_id>/danmaku")
@@ -3417,6 +3537,25 @@ def download(filename: str):
     if not allowed or "/" in filename or "\\" in filename or ".." in filename:
         abort(404)
     return send_from_directory(REPORT_DIR, filename, as_attachment=True)
+
+
+@app.route("/api/target/<target_id>/export/<kind>")
+@_db_guard
+def export_target_snapshot(target_id: str, kind: str):
+    """下载最新目标快照，避免存在性核验后仍导出旧 UID。"""
+    from target_analysis import write_target_csv
+    record = load_target_analysis(target_id)
+    if record is None or kind not in ("csv", "json"):
+        abort(404)
+    result = {**record["result"], "selector": record["selector"]}
+    if kind == "csv":
+        output = io.StringIO(newline="")
+        write_target_csv(result, output)
+        body, mime = "\ufeff" + output.getvalue(), "text/csv"
+    else:
+        body, mime = json.dumps(result, ensure_ascii=False, indent=2), "application/json"
+    filename = re.sub(r"[^0-9A-Za-z_.-]", "_", f"target_{record['bvid']}_{target_id}.{kind}")
+    return Response(body, mimetype=mime, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @app.errorhandler(404)

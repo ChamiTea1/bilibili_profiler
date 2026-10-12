@@ -63,7 +63,7 @@ def _parse_source(kind: str, data: dict, uid: int, limit: int) -> list[dict]:
         card = data.get("card")
         if not isinstance(card, dict) or str(card.get("mid")) != str(uid):
             raise ValueError("名片 UID 不符或资料缺失")
-        return [{"text": _text(card.get("sign")), "name": _text(card.get("name")),
+        return [{"text": _text(card.get("sign")), "name": _text(card.get("name")), "face": _text(card.get("face")),
                  "url": f"https://space.bilibili.com/{uid}"}]
     field = {"videos": "archives", "dynamics": "items", "followings": "list"}[kind]
     raw = data.get(field)

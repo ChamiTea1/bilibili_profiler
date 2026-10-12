@@ -42,6 +42,7 @@ SCRIPTS = [
     "tests/offline/regress_target_analysis.py", # 目标筛选、存档隔离、多分P原文和命令行接线
     "tests/offline/regress_target_lookup.py",   # 目标轻量取数、找到即停、原文留存与独立续页
     "tests/offline/regress_candidate_space.py", # 候选空间按需核验、缓存隔离、关联边界与路由防护
+    "tests/offline/regress_crc_candidates.py",  # 纯破解全候选、匿名问题证据、误报扣除及两种报告接线
     "tests/offline/regress_uid_evidence.py",    # 多候选、证据迁移、存在性缓存与 UID 定向补采
     "tests/offline/regress_proxy_pool.py",      # 账号出口隔离、共享 IP 限速与故障降级
     "tests/offline/regress_proxy_startup.py",   # 核心启动实际超时、阶段状态与错误脱敏

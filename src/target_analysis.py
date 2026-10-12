@@ -41,26 +41,31 @@ def resolve_targets(bvid: str, groups: dict, sources: list, pool, previous: dict
     return results
 
 
-def export_target(result: dict, prefix: str) -> list[str]:
-    """JSON 保留全量命中及解析证据；CSV 包括未解析/未入选发送者。"""
+def write_target_csv(result: dict, output) -> None:
+    """写出当前快照，供 CLI 文件导出和 Web 即时下载共用。"""
     profiles = {p["uid"]: p for p in result.get("profiles", [])}
     extra = ["匿名hash", "匹配方式", "筛选条件", "命中条数", "解析方式", "置信度", "候选UID", "状态", "命中样本", "目标评论"]
+    writer = csv.DictWriter(output, fieldnames=list(_flatten_profile({})) + extra)
+    writer.writeheader()
+    for sender in result.get("senders", []):
+        profile = profiles.get(sender.get("uid"), {})
+        row = _flatten_profile(profile)
+        row.update({"UID": sender.get("uid") or "", "昵称": sender.get("name", ""),
+                    "弹幕数": sender["danmaku_count"], "匿名hash": sender["mid_hash"],
+                    "匹配方式": result["selector"]["mode"], "筛选条件": result["selector"]["pattern"],
+                    "命中条数": sender["matched_count"], "解析方式": sender.get("method", ""),
+                    "置信度": sender.get("confidence", "无"),
+                    "候选UID": "、".join(str(v) for v in sender.get("candidates", [])),
+                    "状态": sender["status"], "命中样本": " / ".join(sender.get("samples", [])),
+                    "目标评论": " / ".join(c.get("content", "") for c in result.get("comments", [])
+                                        if c["uid"] == sender.get("uid"))})
+        writer.writerow({k: _sanitize_csv_cell(v) for k, v in row.items()})
+
+
+def export_target(result: dict, prefix: str) -> list[str]:
+    """JSON 保留全量命中及解析证据；CSV 包括未解析/未入选发送者。"""
     with open(prefix + ".csv", "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=list(_flatten_profile({})) + extra)
-        writer.writeheader()
-        for sender in result.get("senders", []):
-            profile = profiles.get(sender.get("uid"), {})
-            row = _flatten_profile(profile)
-            row.update({"UID": sender.get("uid") or "", "昵称": sender.get("name", ""),
-                        "弹幕数": sender["danmaku_count"], "匿名hash": sender["mid_hash"],
-                        "匹配方式": result["selector"]["mode"], "筛选条件": result["selector"]["pattern"],
-                        "命中条数": sender["matched_count"], "解析方式": sender.get("method", ""),
-                        "置信度": sender.get("confidence", "无"),
-                        "候选UID": "、".join(str(v) for v in sender.get("candidates", [])),
-                        "状态": sender["status"], "命中样本": " / ".join(sender.get("samples", [])),
-                        "目标评论": " / ".join(c.get("content", "") for c in result.get("comments", [])
-                                            if c["uid"] == sender.get("uid"))})
-            writer.writerow({k: _sanitize_csv_cell(v) for k, v in row.items()})
+        write_target_csv(result, f)
     with open(prefix + ".json", "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2, default=str)
     return [os.path.basename(prefix + ext) for ext in (".csv", ".json")]

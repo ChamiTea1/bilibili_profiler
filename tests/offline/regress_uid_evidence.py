@@ -132,7 +132,89 @@ def comment_atomic():
 def count_not_evidence():
     for count in (1, 2, 100):
         out = ur.resolve_sender(H, ['测试'] * count, {H: A}, None)
-        assert out[:3] == (A, '中', '评论区验证') and out[4]
+        assert out[:3] == (A, '高', '评论区验证') and out[4]
+
+
+@case('五类本视频明文来源的唯一候选均为高且保留碰撞提示')
+def local_sources_high():
+    for source in ue.PLAINTEXT_SOURCES:
+        mapping, methods = ur.build_evidence_maps('BV本', [(source, {H: A})], {})
+        out = ur.resolve_sender(H, ['测试'], mapping, None, method_map=methods)
+        record = ur.resolution_record(H, out, mapping, methods)
+        assert out[:3] == (A, '高', source) and out[4]
+        assert '交叉验证' in record['reason'] and '碰撞' in record['reason']
+
+
+def old_local_record():
+    return {'version': 'evidence-v2', 'fingerprint': '旧指纹', 'checked_at': time.time(),
+            'candidates': [A], 'collision_risk': True,
+            'evidence': [{'uid': A, 'source': '评论区验证', 'local': True}], 'reason': '旧中置信度'}
+
+
+def remigrate():
+    with contextlib.closing(storage.get_db()) as conn:
+        conn.execute("DELETE FROM uid_schema_state WHERE key='local_plain_high_v1'")
+        conn.commit()
+    storage.init_db()
+
+
+@case('旧常规和目标报告可核对的中置信度同步升高，不伪造缓存版本或重采')
+def migrate_local_high():
+    storage.save_global_uid(H, A, '评论区验证', 'BV升级高')
+    record = old_local_record()
+    storage.save_sender('BV升级高', H, A, '中', '评论区验证', 1, ['测试'], '低', 0, resolution=record)
+    storage.save_target_analysis('旧目标', 'BV升级高', {'mode': 'literal', 'pattern': '测试'},
+        {'senders': [{'mid_hash': H, 'uid': A, 'confidence': '中', 'method': '评论区验证', 'resolution': record}],
+         'profiles': [{'uid': A, 'target_mid_hash': H, 'resolve_confidence': '中'}]})
+    remigrate()
+    row = storage.load_senders('BV升级高')[0]
+    target = storage.load_target_analysis('旧目标')['result']
+    assert row['confidence'] == target['senders'][0]['confidence'] == target['profiles'][0]['resolve_confidence'] == '高'
+    assert row['resolution']['version'] == 'evidence-v2' and row['resolution']['fingerprint'] == '旧指纹'
+    assert not ur.resolution_is_current(row, H, {H: A})
+
+
+@case('旧纯破解、跨视频及没有可核对来源的记录不自动升级')
+def migrate_skip():
+    for bvid, method, confidence, record in (
+            ('BV旧CRC', 'CRC32破解', '低', old_local_record()),
+            ('BV跨视频', '评论区验证', '低', old_local_record()),
+            ('BV缺来源', '评论区验证', '中', old_local_record())):
+        storage.save_sender(bvid, H, A, confidence, method, 1, ['测试'], '低', 0, resolution=record)
+    storage.save_global_uid(H, A, '评论区验证', 'BV其他')
+    remigrate()
+    assert storage.load_senders('BV旧CRC')[0]['confidence'] == '低'
+    assert storage.load_senders('BV跨视频')[0]['confidence'] == '低'
+    assert storage.load_senders('BV缺来源')[0]['confidence'] == '中'
+
+
+@case('已有其他明文UID冲突的旧本视频记录不直接升高')
+def migrate_conflict():
+    storage.save_global_uid(H, A, '评论区验证', 'BV冲突旧')
+    storage.save_global_uid(H, B, '评论区验证', 'BV其他')
+    storage.save_sender('BV冲突旧', H, A, '中', '评论区验证', 1, ['测试'], '低', 0, resolution=old_local_record())
+    remigrate()
+    assert storage.load_senders('BV冲突旧')[0]['confidence'] == '中'
+
+
+@case('旧记录候选集合不唯一或正向CRC不符时不升高')
+def migrate_bad_candidates():
+    storage.save_global_uid(H, A, '评论区验证', 'BV不唯一')
+    record = old_local_record()
+    record['candidates'] = [A, B]
+    storage.save_sender('BV不唯一', H, A, '中', '评论区验证', 1, ['测试'], '低', 0, resolution=record)
+    storage.save_sender('BV脏hash', 'ffffffff', A, '中', '评论区验证', 1, ['测试'], '低', 0, resolution=old_local_record())
+    remigrate()
+    assert storage.load_senders('BV不唯一')[0]['confidence'] == storage.load_senders('BV脏hash')[0]['confidence'] == '中'
+
+
+@case('高置信度卡片区分明文交叉验证和直接评论作者')
+def confidence_badge():
+    from report import generate_user_card
+    base = {'uid': A, 'name': '测试', 'resolve_method': '评论区验证', 'resolve_confidence': '高', 'collision_risk': True}
+    assert '置信度:高（交叉验证）' in generate_user_card(base)
+    assert '置信度:高（交叉验证）' not in generate_user_card({**base, 'collision_risk': False})
+    assert '置信度:高（交叉验证）' not in generate_user_card({**base, 'resolve_method': 'CRC32破解'})
 
 
 @case('仅跨视频候选压为低置信度')
@@ -171,11 +253,11 @@ def multiple_exist():
     assert out[0] is None and out[2] == ur.METHOD_AMBIGUOUS
 
 
-@case('唯一存在且其他明确 -404 仅给低置信度候选')
+@case('唯一存在且其他明确 -404 按实用分级给高（存在性排除）')
 def unique_exists():
     with patch.object(ur, 'crack_crc32', return_value=[A, B]):
         out = ur.resolve_sender(H, ['测试'] * 100, {}, fake_cards([B]))
-    assert out[0] == B and out[1] == '低' and out[4]
+    assert out[0] == B and out[1] == '高' and out[4]
 
 
 @case('所有候选明确 -404 才判定搜索范围内碰撞')
@@ -279,7 +361,7 @@ def resolution_invalidation():
 def phase_upgrade():
     storage.save_sender('BV升级', H, A, '低', 'CRC32破解', 1, ['旧'], '低', 0)
     out = main.phase_resolve('BV升级', group(n=1), {H: B}, None)[H]
-    assert out['uid'] == B and out['confidence'] == '中' and out['collision_risk']
+    assert out['uid'] == B and out['confidence'] == '高' and out['collision_risk']
     assert storage.load_senders('BV升级')[0]['resolution']['previous_uid'] == A
 
 
@@ -443,7 +525,7 @@ def manual_job_rechecks():
     assert storage.load_senders('BV手动')[0]['uid'] is None
 
 
-@case('候选来源从其他视频转为本视频时缓存失效并升为关联中置信度')
+@case('候选来源从其他视频转为本视频时缓存失效并升为交叉验证高置信度')
 def context_upgrade():
     storage.save_global_uid(H, A, '评论区验证', 'BV其他')
     mapping, methods = ur.build_evidence_maps('BV本', [], storage.load_global_uid_map())
@@ -452,7 +534,7 @@ def context_upgrade():
     storage.save_global_uid(H, A, '评论收割', 'BV本')
     new_map, new_methods = ur.build_evidence_maps('BV本', [], storage.load_global_uid_map())
     assert not ur.resolution_is_current(row, H, new_map, new_methods)
-    assert ur.resolve_sender(H, ['测试'], new_map, None, method_map=new_methods)[1] == '中'
+    assert ur.resolve_sender(H, ['测试'], new_map, None, method_map=new_methods)[1] == '高'
 
 
 

@@ -351,7 +351,7 @@ def uid_upgrade():
     resolved = main.phase_resolve("BVUIDFIX", main.group_by_sender([dm("测试", "9ae0daaf")]),
                                   {"9ae0daaf": 7533489035}, None)
     assert resolved["9ae0daaf"]["uid"] == 7533489035
-    assert resolved["9ae0daaf"]["confidence"] == "中"
+    assert resolved["9ae0daaf"]["confidence"] == "高"
     assert resolved["9ae0daaf"]["collision_risk"]
 
 

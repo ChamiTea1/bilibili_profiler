@@ -5,7 +5,7 @@
     const el = id => document.getElementById(id);
     let page = 1, pages = 1, hash = '', requestNo = 0;
     function tab(name) {
-        if (!['overview', 'users', 'matches', 'comments'].includes(name)) name = 'overview';
+        if (!['overview', 'users', 'matches', 'comments', 'crc'].includes(name)) name = 'overview';
         document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
         document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === `tab-${name}`));
         if (name === 'matches') load();
@@ -75,28 +75,6 @@
     el('targetMask').addEventListener('click', () => {
         document.cookie = `mask=${data.mask ? '0' : '1'};path=/;SameSite=Lax`; location.reload();
     });
-    document.querySelectorAll('.candidate-space').forEach(button => button.addEventListener('click', async () => {
-        const result = button.parentElement.querySelector('.space-result');
-        button.disabled = true;
-        result.textContent = '正在按限速读取公开空间首页…';
-        try {
-            const response = await fetch(`/api/target/${data.id}/candidate-space`, {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({mid_hash: button.dataset.hash, uid: button.dataset.uid})
-            });
-            const contentType = response.headers.get('content-type') || '';
-            if (!contentType.includes('application/json')) throw new Error('服务暂不可用，请稍后重试');
-            const body = await response.json();
-            if (!response.ok) throw new Error(body.error || '核验失败');
-            // 仅接收本机路由的 HTML；公开原文与链接均由服务端转义、校验。
-            result.innerHTML = body.html;
-            button.textContent = '读取核验缓存';
-        } catch (error) {
-            result.textContent = `核验未完成：${error.message}`;
-        } finally {
-            button.disabled = false;
-        }
-    }));
     window.addEventListener('hashchange', restore);
     restore();
 })();

@@ -2,6 +2,18 @@
 import zlib
 
 PLAINTEXT_SOURCES = frozenset({"评论区验证", "评论收割", "充电名单", "互动弹幕", "视频信息"})
+LOCAL_PLAIN_REASON = "本视频唯一明文候选交叉验证，按实用分级标为高；仍保留 CRC32 碰撞可能"
+CRC_UNIQUE_REASON = "完整搜索范围内仅一个账号确认存在，其余候选均明确不存在；按实用分级标为高（存在性排除），仍保留范围外 CRC32 碰撞可能"
+
+
+def confidence_label(confidence: str, method: str, collision_risk: bool = True) -> str:
+    """高置信度同时说明依据，避免把存在性排除称作明文交叉验证。"""
+    if confidence == "高":
+        if method == "CRC32破解":
+            return "高（存在性排除）"
+        if method in PLAINTEXT_SOURCES and collision_risk:
+            return "高（交叉验证）"
+    return confidence
 
 
 def crc32_uid(uid: int) -> str:

@@ -68,13 +68,14 @@ def record():
             "updated_at": "2026-10-11 23:00:00", "result": {
                 "video_info": {"title": "离线视频", "owner": {"mid": UP}}, "stats": {}, "profiles": [],
                 "senders": [{"mid_hash": HASH, "uid": UID, "candidates": [UID], "selected": True,
-                             "method": "CRC32破解", "confidence": "低", "resolution": {"reason": "无明文验证"},
+                             "method": "CRC32破解", "confidence": "低", "resolution": {"reason": "无明文验证", "max_search": UID},
                              "status": "低置信度", "matched_count": 1, "danmaku_count": 1, "samples": ["目标"]}],
                 "matches": [{"mid_hash": HASH, "content": "这是一条足够长的目标发言", "time": 1}]}}
 
 
 def save_record():
     item = record()
+    storage.save_uid_candidates(HASH, UID, "mitm-v1", [UID])
     storage.save_target_analysis(item["id"], BV, item["selector"], item["result"])
     return item
 
@@ -234,16 +235,18 @@ def bad_cache():
     assert storage.load_user_data(UID) == old
 
 
-@case("读取报告和已缓存核验都不联网、不读Cookie、保留低置信度")
+@case("读取报告和已缓存核验都不联网、不读Cookie、唯一有效者按存在性排除标高")
 def cached_api():
     item = save_record()
     sample()
     client = web.app.test_client()
     with patch.object(web, "_get_client", side_effect=AssertionError("缓存不登录")):
         body = client.get("/target/space-offline").text
-        assert "空间辅助核验" in body and "CRC32破解 · 低" in body
+        assert "核验空间线索" in body and "CRC32破解 · 低" in body
         assert post(client).status_code == 200
-    assert storage.load_target_analysis(item["id"])["result"] == item["result"]
+    updated = storage.load_target_analysis(item["id"])["result"]
+    assert updated["senders"][0]["uid"] == UID and updated["senders"][0]["confidence"] == "高"
+    assert updated["profiles"] == item["result"]["profiles"] and updated["matches"] == item["result"]["matches"]
 
 
 @case("拒绝非法UID、非报告候选和CRC不符，不能任意探测账号")
@@ -269,7 +272,7 @@ def masking():
     assert "&lt;script&gt;危险&lt;/script&gt;" in html and "<script>危险</script>" not in html
 
 
-@case("实际核验只启动主号客户端，不污染发送者、画像或全局映射")
+@case("实际核验只启动主号客户端，回写存在性且唯一有效者标高、不污染画像映射")
 def uncached_api():
     item = save_record()
     clear_cache()
@@ -282,7 +285,9 @@ def uncached_api():
     assert len(fake.calls) == 4
     with contextlib.closing(storage.get_db()) as conn:
         after = {table: [tuple(r) for r in conn.execute(f"SELECT * FROM {table}")] for table in before}
-    assert before == after and storage.load_target_analysis(item["id"])["result"] == item["result"]
+    updated = storage.load_target_analysis(item["id"])["result"]
+    assert before == after and updated["senders"][0]["confidence"] == "高"
+    assert updated["profiles"] == item["result"]["profiles"] and updated["matches"] == item["result"]["matches"]
 
 
 @case("登录失败释放核验锁及任务，可再次核验")

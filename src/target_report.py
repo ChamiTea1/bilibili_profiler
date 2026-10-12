@@ -6,6 +6,10 @@ from urllib.parse import urlencode
 import config
 from report import REPORT_CSS, esc, js_json, generate_user_card
 from candidate_space import candidate_uids
+from crc_candidates import build_crc_groups, render_crc_groups, render_candidate_card
+from storage import load_uid_verify_cache
+from uid_resolver import UID_VERIFY_EXISTS_TTL, UID_VERIFY_MISSING_TTL
+from uid_evidence import confidence_label
 
 
 def page_number(value, total: int, size: int) -> tuple[int, int]:
@@ -70,7 +74,7 @@ def render_space_assessment(assessment: dict, mask: bool, mask_name, mask_uid) -
 
 def render_target_report(record: dict, args, mask: bool, mask_name, mask_uid,
                          false_positives: set | None = None, candidate_checks: dict | None = None,
-                         normal_report_available: bool = True) -> str:
+                         normal_report_available: bool = True, crc_tab_html: str | None = None) -> str:
     data, selector = record["result"], record["selector"]
     target_id, bvid = record["id"], record["bvid"]
     stats = data["stats"]
@@ -84,6 +88,8 @@ def render_target_report(record: dict, args, mask: bool, mask_name, mask_uid,
     disp_uid = mask_uid if mask else str
     disp_name = mask_name if mask else str
     profile_pages = {p["uid"]: i // user_size + 1 for i, p in enumerate(profiles)}
+    verifications = load_uid_verify_cache(sorted({u for s in senders for u in candidate_uids(s)}),
+                                         UID_VERIFY_EXISTS_TTL, UID_VERIFY_MISSING_TTL)
 
     def pager(key, current, pages, tab):
         def link(n, label):
@@ -102,14 +108,18 @@ def render_target_report(record: dict, args, mask: bool, mask_name, mask_uid,
         space_items = []
         if sender.get("confidence") not in ("高", "中"):
             for candidate in candidate_uids(sender):
+                status, info = verifications.get(candidate, ("unknown", {}))
+                if status == "not_exists":
+                    continue
                 assessment = (candidate_checks or {}).get((sender["mid_hash"], candidate))
                 result_html = render_space_assessment(assessment, mask, mask_name, mask_uid) if assessment else ""
-                space_items.append(f'''<details class="space-candidate"><summary>候选 UID:{esc(disp_uid(candidate))} · 空间辅助核验</summary>
-                    <button class="filter-btn candidate-space" data-hash="{esc(sender['mid_hash'])}" data-uid="{candidate}">
-                    {'读取核验缓存' if assessment else '核验候选空间'}</button><div class="space-result" role="status">{result_html}</div></details>''')
+                c = {**info, "uid": candidate, "status": status,
+                     "card_ready": status == "exists" and "sign" in info}
+                space_items.append(render_candidate_card(c, sender["mid_hash"], f"/api/target/{target_id}/candidate-space",
+                                                         mask, mask_name, mask_uid, result_html, auto_load=False))
         rows.append(f'''<tr><td>{label}<br><code>{esc(sender['mid_hash'])}</code></td>
             <td>{sender['matched_count']} / {sender['danmaku_count']}</td>
-            <td>{esc(sender.get('method') or '待解析')} · {esc(sender.get('confidence', '无'))}<br>
+            <td>{esc(sender.get('method') or '待解析')} · {esc(confidence_label(sender.get('confidence', '无'), sender.get('method', '')))}<br>
                 <span class="target-note">{esc(sender['status'])}</span>
                 <details><summary>解析证据</summary>候选 UID：{esc(candidates)}<br>{esc(reason or '暂无补充说明')}{''.join(space_items)}</details></td>
             <td>{'<br>'.join(esc(c) for c in sender.get('samples', []))}<br>
@@ -159,7 +169,8 @@ def render_target_report(record: dict, args, mask: bool, mask_name, mask_uid,
                ("入选解析", "selected_count"), ("已生成画像", "profile_count"),
                ("未解析", "unresolved_count"), ("低置信度", "low_confidence_count"), ("超出人数上限", "omitted_count")]
     metric_html = "".join(f'<div class="target-metric"><strong>{stats.get(key, 0):,}</strong><span>{label}</span></div>' for label, key in metrics)
-    exports = " ".join(f'<a class="filter-btn" href="/download/{esc(name)}">{esc(name.rsplit(".", 1)[-1].upper())} 下载</a>' for name in data.get("exports", []))
+    export_kinds = dict.fromkeys(name.rsplit(".", 1)[-1] for name in data.get("exports", []) if name.endswith((".csv", ".json")))
+    exports = " ".join(f'<a class="filter-btn" href="/api/target/{esc(target_id)}/export/{kind}">{kind.upper()} 下载</a>' for kind in export_kinds)
     history = data.get("coverage", {}).get("history", [])
     history_enabled = data.get("coverage", {}).get("history_enabled", True)
     lightweight = data.get("coverage", {}).get("source_mode") == "realtime_cache"
@@ -176,25 +187,32 @@ def render_target_report(record: dict, args, mask: bool, mask_name, mask_uid,
                             f'待补日期 {esc(row.get("failed_dates") or "无")}；待补月份 {esc(row.get("failed_months") or "无")}</li>' for row in history)
     failed = data.get("coverage", {}).get("failed_realtime_pages", [])
     status = {"running": "分析进行中", "interrupted": "分析已中断，重跑可续采", "completed": "分析完成"}.get(data.get("status"), "")
+    if crc_tab_html is None:
+        crc_tab_html = render_crc_groups(build_crc_groups(senders, data.get("matches", []), {},
+                                                         false_positives, target_matches=data.get("matches", [])),
+                                        f"/api/target/{target_id}/candidate-space", mask, mask_name, mask_uid,
+                                        candidate_checks, render_space_assessment, target_mode=True)
     video_link = f'<a class="filter-btn" href="/video/{esc(bvid)}">视频报告</a>' if normal_report_available else ""
     return f'''<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="referrer" content="no-referrer">
         <title>目标弹幕分析 - {esc(data['video_info'].get('title', bvid))}</title>
-        <style>{REPORT_CSS}</style><link rel="stylesheet" href="/static/report.css"><link rel="stylesheet" href="/static/target.css"></head>
+        <style>{REPORT_CSS}</style><link rel="stylesheet" href="/static/report.css"><link rel="stylesheet" href="/static/target.css">
+        <link rel="stylesheet" href="/static/candidate_space.css"></head>
         <body><div class="container"><header class="header"><h1>目标弹幕分析</h1>
         <div class="meta">{esc(data['video_info'].get('title', bvid))} · {esc(bvid)} · {esc(status)} · {esc(record['updated_at'])}</div></header>
         <div class="ov-actions"><a class="filter-btn" href="/targets">返回目标列表</a><a class="filter-btn" href="/">返回首页</a>{video_link}
         {exports}<button class="filter-btn" id="targetMask">{'显示信息' if mask else '隐藏信息'}</button></div>
         <div class="target-query"><b>{'正则搜索' if selector['mode']=='regex' else '原文完整匹配'}</b> <code>{esc(selector['pattern'])}</code></div>
-        <nav class="tab-bar"><button class="tab-btn active" data-tab="overview">筛选概览</button><button class="tab-btn" data-tab="users">用户画像</button><button class="tab-btn" data-tab="matches">命中弹幕</button><button class="tab-btn" data-tab="comments">目标评论</button></nav>
+        <nav class="tab-bar"><button class="tab-btn active" data-tab="overview">筛选概览</button><button class="tab-btn" data-tab="users">用户画像</button><button class="tab-btn" data-tab="matches">命中弹幕</button><button class="tab-btn" data-tab="comments">目标评论</button><button class="tab-btn" data-tab="crc">纯破解候选（{crc_tab_html.count('class="crc-sender"')}）</button></nav>
         <main><div class="tab-pane active" id="tab-overview"><div class="target-metrics">{metric_html}</div>
         <p class="target-note">命中表示满足本次筛选条件。UID 来自匿名 hash 解析，候选及置信度须结合原文核验；低置信度结果不会自动采集画像。</p>
         <details class="target-coverage"><summary>采集覆盖范围</summary><p>{esc(source_note)}历史网络补采{'已启用' if history_enabled else '未启用（以下为已有检查点，可能仅代表实时池完成）'}。实时采集失败的分P：{esc('、'.join(str(p) for p in failed) or '无')}。</p><p>{esc(lookup_note)}</p><ul>{history_lines}</ul></details>
-        <h2>命中发送者</h2><p class="target-note">按命中条数、该发送者在本视频的弹幕数排序；人数上限外的发送者仍保留命中记录。样本每人最多 3 条，完整原文在「命中弹幕」。低置信度候选可展开「解析证据」→「空间辅助核验」，按需检查公开资料；空间线索不改变身份置信度。</p>{sender_table}{pager('senders_page',sender_page,sender_pages,'overview')}</div>
+        <h2>命中发送者</h2><p class="target-note">按命中条数、该发送者在本视频的弹幕数排序；人数上限外的发送者仍保留命中记录。样本每人最多 3 条，完整原文在「命中弹幕」。纯破解候选的长条名片在「纯破解候选」页，点击直达空间；空间线索不改变身份置信度。</p>{sender_table}{pager('senders_page',sender_page,sender_pages,'overview')}</div>
         <div class="tab-pane" id="tab-users"><p class="target-note">画像参考入选者在该视频的已采弹幕和个人行为资料；命中条数单独显示。每页 {user_size} 人，共 {len(profiles)} 人。</p>{card_html}{pager('users_page',user_page,user_pages,'users')}</div>
         <div class="tab-pane" id="tab-matches"><div class="dm-controls"><span id="targetScope">全部命中</span><button class="filter-btn" id="targetReset">显示全部</button></div>
         <div class="dm-table-wrap"><table class="dm-table"><thead><tr><th>视频内时刻</th><th>命中原文</th><th>发送者</th><th>解析置信度</th></tr></thead><tbody id="targetMatches"></tbody></table></div>
         <div class="dm-pager"><button id="targetPrev">上一页</button><span id="targetPage"></span><button id="targetNext">下一页</button></div><p id="targetError" role="status"></p></div>
         <div class="tab-pane" id="tab-comments"><p class="target-note">以下是搜索途中发现及缓存中的目标作者评论，保留原文；找到全部目标即停，不代表这些作者的全部评论。</p>
-        <p class="target-note">{esc(lookup_note)} 共保留 {len(comments)} 条。</p>{comment_html}{pager('comments_page',comment_page,comment_pages,'comments')}</div></main></div>
-        <script>window.__TARGET__={js_json({'id': target_id, 'mask': mask})};</script><script src="/static/target.js"></script></body></html>'''
+        <p class="target-note">{esc(lookup_note)} 共保留 {len(comments)} 条。</p>{comment_html}{pager('comments_page',comment_page,comment_pages,'comments')}</div>
+        <div class="tab-pane" id="tab-crc">{crc_tab_html}</div></main></div>
+        <script>window.__TARGET__={js_json({'id': target_id, 'mask': mask})};</script><script src="/static/target.js"></script><script src="/static/candidate_space.js"></script></body></html>'''

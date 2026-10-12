@@ -13,7 +13,8 @@ from contextlib import closing
 from datetime import datetime
 
 from config import DB_PATH
-from uid_evidence import PLAINTEXT_SOURCES, crc32_uid, candidates_of
+import config
+from uid_evidence import PLAINTEXT_SOURCES, crc32_uid, candidates_of, LOCAL_PLAIN_REASON, CRC_UNIQUE_REASON
 
 # uid/content 为空的评论被 save_comments 静默丢弃时的累计计数（debug 统计用）
 _dropped_comment_count = 0
@@ -276,6 +277,10 @@ def init_db():
             id TEXT PRIMARY KEY, bvid TEXT NOT NULL, selector_json TEXT NOT NULL,
             result_json TEXT NOT NULL, summary_json TEXT NOT NULL, updated_at TEXT NOT NULL)''')
         cursor.execute("CREATE INDEX IF NOT EXISTS target_analyses_video ON target_analyses(bvid, updated_at)")
+        # 问题弹幕按视频和原文保存，不依赖 UID 或画像；匿名候选也能展示原始证据。
+        cursor.execute('''CREATE TABLE IF NOT EXISTS danmaku_problems (
+            bvid TEXT NOT NULL, content TEXT NOT NULL, verdict_json TEXT NOT NULL,
+            PRIMARY KEY(bvid, content))''')
         # 单视频旧画像可直接迁移；多视频旧画像无法确定归属，读取时用本视频证据重建。
         cursor.execute('''INSERT OR IGNORE INTO video_profiles(bvid, uid, profile_json)
             SELECT MIN(s.bvid), u.uid, u.profile_json FROM users u JOIN senders s ON s.uid=u.uid
@@ -284,21 +289,162 @@ def init_db():
         # 数据修订号也覆盖同条数更新，避免热度、UID、头像和深掘变更命中旧页面。
         cursor.execute('''CREATE TABLE IF NOT EXISTS data_revision (
             scope TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0)''')
-        for table in ("videos", "senders", "users", "video_profiles", "target_analyses", "comments", "danmaku", "false_positive", "face_cache"):
+        for table in ("videos", "senders", "users", "video_profiles", "target_analyses", "comments", "danmaku", "danmaku_problems", "false_positive", "face_cache", "uid_verify_cache", "uid_space_cache"):
             for operation in ("INSERT", "UPDATE", "DELETE"):
                 ref = "OLD" if operation == "DELETE" else "NEW"
-                scope = f"{ref}.bvid" if table not in ("users", "face_cache") else "'*'"
+                scope = f"{ref}.bvid" if table not in ("users", "face_cache", "uid_verify_cache", "uid_space_cache") else "'*'"
                 cursor.execute(f'''CREATE TRIGGER IF NOT EXISTS revision_{table}_{operation}
                     AFTER {operation} ON {table} BEGIN
                     INSERT INTO data_revision(scope, revision) VALUES({scope}, 1)
                     ON CONFLICT(scope) DO UPDATE SET revision=revision+1;
                     END''')
+        _upgrade_local_plain_confidence(cursor)
+        _upgrade_verified_crc_confidence(cursor)
         conn.commit()
 
         # 清理旧版本的 progress 表（断点续采已改为纯 senders/users 缓存机制）
         cursor.execute("DROP TABLE IF EXISTS progress")
         conn.commit()
     print("[Storage] 数据库初始化完成")
+
+
+def _upgrade_local_plain_confidence(cursor):
+    """一次性升级可核对的旧中置信度记录，不伪造新版本指纹，不重新采集。"""
+    key = "local_plain_high_v1"
+    if cursor.execute("SELECT 1 FROM uid_schema_state WHERE key=?", (key,)).fetchone():
+        return
+    # 并发初始化时先取得写锁，再复查标记，避免迁移重复执行或覆盖正在更新的快照。
+    if not cursor.connection.in_transaction:
+        cursor.execute("BEGIN IMMEDIATE")
+    if cursor.execute("SELECT 1 FROM uid_schema_state WHERE key=?", (key,)).fetchone():
+        return
+    known = {}
+
+    def eligible(sender, bvid):
+        if sender.get("confidence") != "中" or sender.get("method") not in PLAINTEXT_SOURCES:
+            return False
+        h, uid = sender.get("mid_hash"), sender.get("uid")
+        if not candidates_of(uid) or crc32_uid(uid) != h:
+            return False
+        record = sender.get("resolution")
+        if not isinstance(record, dict) or candidates_of(record.get("candidates", [])) != {uid}:
+            return False
+        evidence = record.get("evidence") or []
+        if not isinstance(evidence, list) or not evidence:
+            return False
+        if any(not isinstance(e, dict) or e.get("source") not in PLAINTEXT_SOURCES
+               or e.get("uid") != uid for e in evidence):
+            return False
+        if not any(e.get("local") is True for e in evidence):
+            return False
+        if h not in known:
+            known[h] = [(r["uid"], r["bvid"]) for r in cursor.execute(
+                "SELECT uid, source, bvid FROM uid_evidence WHERE mid_hash=?", (h,)).fetchall()
+                if r["source"] in PLAINTEXT_SOURCES and crc32_uid(r["uid"]) == h]
+        return {u for u, _ in known[h]} == {uid} and (uid, bvid) in known[h]
+
+    for row in cursor.execute("SELECT * FROM senders WHERE confidence='中'").fetchall():
+        try:
+            sender = dict(row)
+            sender["resolution"] = json.loads(row["resolution_json"] or "{}")
+            if eligible(sender, row["bvid"]):
+                sender["resolution"]["reason"] = LOCAL_PLAIN_REASON
+                cursor.execute("UPDATE senders SET confidence='高', resolution_json=? WHERE id=?",
+                               (json.dumps(sender["resolution"], ensure_ascii=False), row["id"]))
+        except (ValueError, TypeError):
+            continue
+    for row in cursor.execute("SELECT id, bvid, result_json FROM target_analyses").fetchall():
+        try:
+            result = json.loads(row["result_json"])
+            upgraded = set()
+            for sender in result.get("senders", []):
+                if eligible(sender, row["bvid"]):
+                    sender["confidence"] = "高"
+                    sender["resolution"]["reason"] = LOCAL_PLAIN_REASON
+                    upgraded.add(sender["mid_hash"])
+            if upgraded:
+                for profile in result.get("profiles", []):
+                    if profile.get("target_mid_hash") in upgraded:
+                        profile["resolve_confidence"] = "高"
+                cursor.execute("UPDATE target_analyses SET result_json=? WHERE id=?",
+                               (json.dumps(result, ensure_ascii=False), row["id"]))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    cursor.execute("INSERT OR IGNORE INTO uid_schema_state VALUES (?, '1')", (key,))
+
+
+def _upgrade_verified_crc_confidence(cursor):
+    """仅凭完整数学缓存及未过期的逐UID验证升级旧低分级，不新建明文证据。"""
+    if not cursor.connection.in_transaction:
+        cursor.execute("BEGIN IMMEDIATE")
+    now = time.time()
+
+    def eligible(sender):
+        record = sender.get("resolution") or {}
+        if (sender.get("method") != "CRC32破解" or sender.get("confidence") != "低"
+                or not isinstance(record, dict) or record.get("evidence")
+                or sender.get("selected") is False):
+            return False
+        h, uid = sender.get("mid_hash"), sender.get("uid")
+        saved = record.get("candidates") or sender.get("candidates")
+        if not isinstance(saved, list) or not saved or uid not in candidates_of(saved):
+            return False
+        limit = record.get("max_search", config.MITM_MAX_UID)
+        if type(uid) is not int or type(limit) is not int or not 0 < limit <= config.MITM_MAX_UID:
+            return False
+        canonical = cursor.execute("SELECT candidates_json FROM uid_candidate_cache WHERE mid_hash=? AND max_uid=? AND version=?",
+                                   (h, limit, "mitm-v1")).fetchone()
+        if not canonical:
+            return False
+        values = json.loads(canonical[0])
+        if (not isinstance(values, list) or not values or set(values) != set(saved)
+                or any(not isinstance(u, int) or isinstance(u, bool) or not 0 < u <= limit
+                       or crc32_uid(u) != h for u in values)):
+            return False
+        times = {}
+        for u in values:
+            row = cursor.execute("SELECT status, info_json, verified_at FROM uid_verify_cache WHERE uid=?", (u,)).fetchone()
+            expected = "exists" if u == uid else "not_exists"
+            ttl = getattr(config, "UID_VERIFY_EXISTS_TTL", 604800) if u == uid else getattr(config, "UID_VERIFY_MISSING_TTL", 3600)
+            if not row or row["status"] != expected or not 0 <= now - row["verified_at"] < ttl:
+                return False
+            if u == uid and json.loads(row["info_json"]).get("uid") != uid:
+                return False
+            times[str(u)] = row["verified_at"]
+        sender["confidence"] = "高"
+        sender["resolution"] = {**record, "reason": CRC_UNIQUE_REASON, "collision_risk": True,
+                                "candidate_status": {str(u): "exists" if u == uid else "not_exists" for u in values},
+                                "candidate_checked_at": times}
+        return True
+
+    for row in cursor.execute("SELECT * FROM senders WHERE method='CRC32破解' AND confidence='低'").fetchall():
+        try:
+            sender = {**dict(row), "resolution": json.loads(row["resolution_json"] or "{}")}
+            if eligible(sender):
+                cursor.execute("UPDATE senders SET confidence='高', resolution_json=? WHERE id=?",
+                               (json.dumps(sender["resolution"], ensure_ascii=False), row["id"]))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    for row in cursor.execute("SELECT id, result_json FROM target_analyses").fetchall():
+        try:
+            result = json.loads(row["result_json"])
+            upgraded = {s["mid_hash"] for s in result.get("senders", []) if eligible(s)}
+            if not upgraded:
+                continue
+            for sender in result["senders"]:
+                if sender["mid_hash"] in upgraded:
+                    sender["status"] = "已核验高置信度，重跑可生成画像"
+            for profile in result.get("profiles", []):
+                if profile.get("target_mid_hash") in upgraded:
+                    profile.update(resolve_confidence="高", resolve_reason=CRC_UNIQUE_REASON, collision_risk=True)
+            stats = result.setdefault("stats", {})
+            stats["low_confidence_count"] = sum(s.get("selected", True) and s.get("uid") is not None and s.get("confidence") not in ("高", "中")
+                                                for s in result.get("senders", []))
+            summary = {"title": result.get("video_info", {}).get("title", ""), "status": result.get("status", "running"), **stats}
+            cursor.execute("UPDATE target_analyses SET result_json=?, summary_json=? WHERE id=?",
+                           (json.dumps(result, ensure_ascii=False), json.dumps(summary, ensure_ascii=False), row["id"]))
+        except (ValueError, TypeError, AttributeError):
+            continue
 
 
 def save_target_analysis(target_id: str, bvid: str, selector: dict, result: dict) -> None:
@@ -323,6 +469,54 @@ def load_target_analysis(target_id: str) -> dict | None:
         return None
     return {"id": row["id"], "bvid": row["bvid"], "selector": json.loads(row["selector_json"]),
             "result": json.loads(row["result_json"]), "updated_at": row["updated_at"]}
+
+
+def refresh_sender_resolution(bvid: str, mid_hash: str, transform, target_id: str | None = None) -> dict | None:
+    """锁内读取最新记录，仅回写候选解析，避免空间请求期间覆盖重跑结果。"""
+    with closing(get_db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if target_id:
+            row = conn.execute("SELECT result_json FROM target_analyses WHERE id=? AND bvid=?",
+                               (target_id, bvid)).fetchone()
+            if row is None:
+                return None
+            result = json.loads(row[0])
+            sender = next((s for s in result.get("senders", []) if s.get("mid_hash") == mid_hash), None)
+        else:
+            row = conn.execute("SELECT * FROM senders WHERE bvid=? AND mid_hash=?", (bvid, mid_hash)).fetchone()
+            sender = ({**dict(row), "resolution": json.loads(row["resolution_json"] or "{}")}
+                      if row else None)
+        if sender is None:
+            return None
+        updated = transform(sender)
+        if updated is None:
+            return None
+        if target_id:
+            sender.update(updated)
+            kept = []
+            for profile in result.get("profiles", []):
+                if profile.get("target_mid_hash") == mid_hash:
+                    if profile.get("uid") != sender.get("uid"):
+                        result.setdefault("excluded_profiles", []).append(profile)
+                        continue
+                    profile.update(resolve_confidence=sender["confidence"], resolve_method=sender["method"])
+                kept.append(profile)
+            result["profiles"] = kept
+            stats = result.setdefault("stats", {})
+            stats.update(profile_count=len(kept),
+                         unresolved_count=sum(s.get("selected", True) and not s.get("uid") for s in result.get("senders", [])),
+                         low_confidence_count=sum(s.get("selected", True) and s.get("uid") is not None and s.get("confidence") not in ("高", "中")
+                                                  for s in result.get("senders", [])))
+            summary = {"title": result.get("video_info", {}).get("title", bvid),
+                       "status": result.get("status", "running"), **stats}
+            conn.execute("UPDATE target_analyses SET result_json=?, summary_json=? WHERE id=? AND bvid=?",
+                         (json.dumps(result, ensure_ascii=False), json.dumps(summary, ensure_ascii=False), target_id, bvid))
+        else:
+            conn.execute("UPDATE senders SET uid=?, confidence=?, method=?, resolution_json=? WHERE bvid=? AND mid_hash=?",
+                         (updated["uid"], updated["confidence"], updated["method"],
+                          json.dumps(updated["resolution"], ensure_ascii=False), bvid, mid_hash))
+        conn.commit()
+        return {**sender, **updated}
 
 
 def load_uid_space_cache(uids: list[int]) -> dict[int, dict]:
@@ -713,6 +907,34 @@ def load_danmaku(bvid: str) -> list[dict]:
              "pool": r["pool"], "dmid": r["dmid"], "page": r["page"]} for r in rows]
 
 
+def save_danmaku_problems(bvid: str, verdicts: dict, judged_contents: set[str]):
+    """只替换成功判定的内容；失败批次保留旧标注，成功空批次可以清除旧标注。"""
+    if not bvid or not judged_contents:
+        return
+    with closing(get_db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany("DELETE FROM danmaku_problems WHERE bvid=? AND content=?",
+                         [(bvid, c) for c in judged_contents])
+        conn.executemany("INSERT INTO danmaku_problems VALUES (?, ?, ?)",
+                         [(bvid, c, json.dumps(v, ensure_ascii=False)) for c, v in verdicts.items()
+                          if c in judged_contents])
+        conn.commit()
+
+
+def load_danmaku_problems(bvid: str) -> dict:
+    with closing(get_db()) as conn:
+        rows = conn.execute("SELECT content, verdict_json FROM danmaku_problems WHERE bvid=?", (bvid,)).fetchall()
+    result = {}
+    for row in rows:
+        try:
+            item = json.loads(row["verdict_json"])
+            if isinstance(item, dict) and item.get("category"):
+                result[row["content"]] = item
+        except (ValueError, TypeError):
+            continue
+    return result
+
+
 def load_comments(bvid: str, uids: list[int] | None = None) -> list[dict]:
     """从库读回某视频的全部评论（断点续采用：跳过阶段3网络重采）。
     返回与采集侧同形的 dict 列表（problem 列带出 LLM 标注；location 旧行可能为空）。"""
@@ -864,6 +1086,7 @@ def clear_video_cache(bvid: str):
         cursor.execute("DELETE FROM senders WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM videos WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,))
+        cursor.execute("DELETE FROM danmaku_problems WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM comments WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM phase_state WHERE bvid = ?", (bvid,))
         cursor.execute("DELETE FROM uid_harvest_seen WHERE bvid = ?", (bvid,))
@@ -913,6 +1136,7 @@ def delete_video_data(bvid: str) -> dict:
         counts["video_profiles"] = cursor.execute("DELETE FROM video_profiles WHERE bvid = ?", (bvid,)).rowcount
         counts["target_analyses"] = cursor.execute("DELETE FROM target_analyses WHERE bvid = ?", (bvid,)).rowcount
         counts["danmaku"] = cursor.execute("DELETE FROM danmaku WHERE bvid = ?", (bvid,)).rowcount
+        counts["danmaku_problems"] = cursor.execute("DELETE FROM danmaku_problems WHERE bvid=?", (bvid,)).rowcount
         counts["comments"] = cursor.execute("DELETE FROM comments WHERE bvid = ?", (bvid,)).rowcount
         counts["false_positive"] = cursor.execute(
             "DELETE FROM false_positive WHERE bvid = ?", (bvid,)).rowcount
@@ -1019,14 +1243,26 @@ def load_uid_verify_cache(uids: list[int], exists_ttl: float, missing_ttl: float
     return result
 
 
-def save_uid_verify_cache(uid: int, status: str, info: dict):
+def save_uid_verify_cache(uid: int, status: str, info: dict, verified_at: float | None = None):
     if status not in ("exists", "not_exists"):
         return
     with closing(get_db()) as conn:
         conn.execute("INSERT INTO uid_verify_cache VALUES(?, ?, ?, ?) "
             "ON CONFLICT(uid) DO UPDATE SET status=excluded.status, info_json=excluded.info_json, "
-            "verified_at=excluded.verified_at", (uid, status, json.dumps(info, ensure_ascii=False), time.time()))
+            "verified_at=excluded.verified_at WHERE excluded.verified_at >= uid_verify_cache.verified_at", (uid, status, json.dumps(info, ensure_ascii=False),
+                                                 time.time() if verified_at is None else verified_at))
         conn.commit()
+
+
+def load_uid_verify_times(uids: list[int]) -> dict[str, float]:
+    """保留缓存最初的核验时间，不能把缓存命中时刻当作重新核验。"""
+    result = {}
+    with closing(get_db()) as conn:
+        for start in range(0, len(uids), 500):
+            chunk = uids[start:start + 500]
+            rows = conn.execute(f"SELECT uid, verified_at FROM uid_verify_cache WHERE uid IN ({','.join('?' for _ in chunk)})", chunk)
+            result.update({str(row["uid"]): row["verified_at"] for row in rows})
+    return result
 
 
 def load_uid_candidates(mid_hash: str, max_uid: int, version: str) -> list[int] | None:

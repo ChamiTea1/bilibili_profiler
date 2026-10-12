@@ -1,0 +1,34 @@
+/* 候选空间与纯破解候选页共用；不改变普通弹幕表格的布局。 */
+.space-candidate { margin:0; border:1px solid #e2e6ec; border-radius:10px; background:#fff; overflow:hidden; min-width:0; }
+.candidate-card { display:flex; align-items:center; gap:16px; padding:18px 20px; color:#263344; text-decoration:none; white-space:normal; }
+.candidate-card:hover { background:#f6f9fc; color:#087ea4; }
+.candidate-card:focus-visible { outline:2px solid #087ea4; outline-offset:-3px; }
+.candidate-avatar { width:60px; height:60px; border-radius:50%; flex-shrink:0; object-fit:cover; background:#eef3f8; }
+.candidate-placeholder { display:flex; align-items:center; justify-content:center; color:#8291a4; font-size:24px; }
+.candidate-info { display:flex; flex:1; flex-direction:column; gap:7px; min-width:0; overflow-wrap:anywhere; }
+.candidate-name { font-size:17px; }
+.candidate-sign { color:#607086; font-size:14px; line-height:1.6; white-space:pre-wrap; }
+.candidate-meta { display:flex; flex-wrap:wrap; gap:8px 18px; font-size:12px; color:#788599; }
+.candidate-status { color:#64748b; }
+.candidate-arrow { flex-shrink:0; font-size:22px; color:#8291a4; }
+.candidate-actions { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:8px; padding:8px 20px; border-top:1px solid #f0f2f5; }
+.candidate-card-note { margin-right:auto; font-size:12px; color:#788599; }
+.candidate-actions [hidden] { display:none; }
+.space-result:empty { display:none; }
+.space-result:not(:empty) { padding:0 20px 16px; }
+.space-assessment { font-size:14px; line-height:1.7; white-space:normal; overflow-wrap:anywhere; }
+.space-assessment ul { padding-left:20px; }
+.space-assessment li { margin:8px 0; white-space:pre-wrap; }
+.crc-sender { background:white; padding:18px; margin:16px 0; border:1px solid #e0e0e0; border-radius:12px; overflow-wrap:anywhere; }
+.crc-heading { display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
+.crc-candidate-list { display:flex; flex-direction:column; gap:12px; margin-top:16px; }
+.crc-candidates details { margin-top:10px; }
+.crc-candidates .ov-list { padding-left:20px; line-height:1.8; white-space:pre-wrap; }
+@media(max-width:600px) {
+    .crc-sender { padding:12px; }
+    .candidate-card { gap:12px; padding:14px 12px; }
+    .candidate-avatar { width:48px; height:48px; }
+    .candidate-name { font-size:15px; }
+    .candidate-actions { padding:8px 12px; }
+    .space-result:not(:empty) { padding:0 12px 12px; }
+}
