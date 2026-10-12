@@ -207,7 +207,7 @@ def render_target_report(record: dict, args, mask: bool, mask_name, mask_uid,
         <main><div class="tab-pane active" id="tab-overview"><div class="target-metrics">{metric_html}</div>
         <p class="target-note">命中表示满足本次筛选条件。UID 来自匿名 hash 解析，候选及置信度须结合原文核验；低置信度结果不会自动采集画像。</p>
         <details class="target-coverage"><summary>采集覆盖范围</summary><p>{esc(source_note)}历史网络补采{'已启用' if history_enabled else '未启用（以下为已有检查点，可能仅代表实时池完成）'}。实时采集失败的分P：{esc('、'.join(str(p) for p in failed) or '无')}。</p><p>{esc(lookup_note)}</p><ul>{history_lines}</ul></details>
-        <h2>命中发送者</h2><p class="target-note">按命中条数、该发送者在本视频的弹幕数排序；人数上限外的发送者仍保留命中记录。样本每人最多 3 条，完整原文在「命中弹幕」。纯破解候选的长条名片在「纯破解候选」页，点击直达空间；空间线索不改变身份置信度。</p>{sender_table}{pager('senders_page',sender_page,sender_pages,'overview')}</div>
+        <h2>命中发送者</h2><p class="target-note">按命中条数、该发送者在本视频的弹幕数排序；人数上限外的发送者仍保留命中记录。样本每人最多 3 条，完整原文在「命中弹幕」。待复核候选的长条名片和空间资料在「纯破解候选」页，由命令行采集保存；点击名片直达空间，页面不补采。</p>{sender_table}{pager('senders_page',sender_page,sender_pages,'overview')}</div>
         <div class="tab-pane" id="tab-users"><p class="target-note">画像参考入选者在该视频的已采弹幕和个人行为资料；命中条数单独显示。每页 {user_size} 人，共 {len(profiles)} 人。</p>{card_html}{pager('users_page',user_page,user_pages,'users')}</div>
         <div class="tab-pane" id="tab-matches"><div class="dm-controls"><span id="targetScope">全部命中</span><button class="filter-btn" id="targetReset">显示全部</button></div>
         <div class="dm-table-wrap"><table class="dm-table"><thead><tr><th>视频内时刻</th><th>命中原文</th><th>发送者</th><th>解析置信度</th></tr></thead><tbody id="targetMatches"></tbody></table></div>

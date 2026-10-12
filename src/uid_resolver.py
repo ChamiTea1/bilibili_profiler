@@ -301,6 +301,7 @@ def _finalize(mid_hash: str, danmaku_count: int, plain_uid: Optional[int],
 
 def _resolve_many(sender_groups: dict, mapping: dict, client, max_search: int, methods: dict | None,
                   budget: VerificationBudget | None = None) -> dict:
+    budget = budget if budget is not None else VerificationBudget()
     plain, candidate_map, universe = {}, {}, set()
     for h in sender_groups:
         ev = _evidence(h, mapping, methods)
@@ -318,6 +319,7 @@ def _resolve_many(sender_groups: dict, mapping: dict, client, max_search: int, m
         verdict = plain[h] if h in plain else _finalize(h, group["count"], None, candidate_map[h], methods, status_of, found.get)
         uid, confidence, method, info, risk, candidates = verdict
         result[h] = {**group, "uid": uid, "confidence": confidence, "method": method,
+                     "verification_stopped": budget.stopped,
                      "user_info": info or {}, "collision_risk": risk, "candidates": candidates,
                      "danmaku_count": group["count"],
                      "resolution": resolution_record(h, verdict, mapping, methods, max_search)}

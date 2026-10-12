@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 from unittest.mock import patch
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT), str(ROOT / "src")]
@@ -242,11 +243,11 @@ def api_validation():
     client = web.app.test_client()
     path = f"/api/video/{BV}/candidate-space"
     with patch.object(web, "_get_client", side_effect=AssertionError("错误输入不采集")):
-        assert client.post(path, json={"mid_hash": H, "uid": 456789}).status_code == 400
+        assert client.post(path, json={"mid_hash": H, "uid": 456789}).status_code == 410
         assert client.post(path, json={"mid_hash": H, "uid": A}, headers={"Origin": "https://outside.example"}).status_code == 403
         assert client.post("/api/video/unknown/candidate-space", json={}).status_code == 404
         storage.save_danmaku_problems(BV, {}, {"问题原文"})
-        assert client.post(path, json={"mid_hash": H, "uid": A}).status_code == 400
+        assert client.post(path, json={"mid_hash": H, "uid": A}).status_code == 410
 
 
 @case("数学候选和问题原文展示不污染明文证据库、画像或屏蔽列表")
@@ -265,12 +266,12 @@ def cached_space_api():
               "sources": {kind: {"status": "ok", "items": []} for kind in ("card", "videos", "dynamics", "followings")}}
     sample["sources"]["card"]["items"] = [{"name": "离线候选甲", "text": "公开签名"}]
     storage.save_uid_space_cache(A, sample)
-    with patch.object(web, "_get_client", side_effect=AssertionError("缓存命中不登录")):
-        response = web.app.test_client().post(f"/api/video/{BV}/candidate-space", json={"mid_hash": H, "uid": A})
-    assert response.status_code == 200 and "离线候选甲" in response.get_json()["html"]
-    updated = storage.load_senders(BV)[0]
-    assert updated["uid"] is None and updated["method"] == "待验证" and storage.load_user_data(A) is None
-    assert updated["resolution"]["candidate_status"] == {str(A): "exists", str(B): "unknown"}
+    before = storage.load_senders(BV)
+    with patch.object(web, "_get_client", side_effect=AssertionError("页面不采集")):
+        client = web.app.test_client()
+        assert "离线候选甲" in client.get(f"/video/{BV}").text
+        response = client.post(f"/api/video/{BV}/candidate-space", json={"mid_hash": H, "uid": A})
+    assert response.status_code == 410 and storage.load_senders(BV) == before
 
 
 @case("旧候选集合可从数学缓存补齐，读取报告不重算CRC或联网")
@@ -333,9 +334,14 @@ class CardClient:
 
 
 def card_post(uid, fake=None, target=False):
-    path = f"/api/target/crc-offline/candidate-space" if target else f"/api/video/{BV}/candidate-space"
-    with patch.object(web, "_get_client", return_value=fake or CardClient()):
-        return web.app.test_client().post(path, json={"mid_hash": H, "uid": uid, "mode": "card"})
+    """模拟命令行的单点名片操作；旧用例继续验证收敛规则，不走已禁用的Web采集。"""
+    status, info, risk = cards.read_candidate_card(uid, fake or CardClient())
+    cards.reconcile_crc_sender(BV, H, "crc-offline" if target else None)
+    record = storage.load_target_analysis("crc-offline") if target else web._crc_candidate_data(BV, include_resolved=True)[0]
+    path = "/api/target/crc-offline/candidate-space" if target else f"/api/video/{BV}/candidate-space"
+    with web.app.test_request_context(path):
+        body = {"status": status, "risk": risk, **web._updated_crc_group(record, H)}
+    return SimpleNamespace(status_code=200, json=body)
 
 
 @case("候选是直接可点击的长条名片，头像昵称签名UID完整且按钮不嵌套在链接中")
@@ -356,7 +362,7 @@ def card_escaping():
     text = crc.render_candidate_card(row, H, "/endpoint", False, str, str)
     assert "javascript:" not in text and "<img onerror" not in text and "未设置签名" in text
     row["card_ready"] = False
-    assert "签名待读取" in crc.render_candidate_card(row, H, "/endpoint", False, str, str)
+    assert "签名未取得" in crc.render_candidate_card(row, H, "/endpoint", False, str, str)
 
 
 @case("自动名片模式只请求一个限速名片接口，不采评论动态投稿关注或画像")
@@ -378,7 +384,7 @@ def card_cache_api():
     with patch.object(web, "_get_client", side_effect=AssertionError("完整缓存不登录")):
         for uid in (A, B):
             response = web.app.test_client().post(f"/api/video/{BV}/candidate-space", json={"uid": uid, "mid_hash": H, "mode": "card"})
-            assert response.status_code == 200
+            assert response.status_code == 410
 
 
 @case("批量名片只有昵称头像时，补一次单点名片读取签名")
@@ -494,9 +500,11 @@ def older_space():
 def space_missing_convergence():
     setup_video()
     card_post(A)
-    with patch.object(web, "_get_client", return_value=CardClient({B: {"code": -404}})):
-        response = web.app.test_client().post(f"/api/video/{BV}/candidate-space", json={"mid_hash": H, "uid": B})
-    assert response.status_code == 200 and storage.load_senders(BV)[0]["uid"] == A
+    import candidate_space
+    sample = candidate_space.fetch_space_sample(B, CardClient({B: {"code": -404}}))
+    cards.cache_space_card(sample)
+    cards.reconcile_crc_sender(BV, H)
+    assert storage.load_senders(BV)[0]["uid"] == A
     assert storage.load_uid_verify_cache([B], 100, 100)[B][0] == "not_exists"
 
 
@@ -588,7 +596,7 @@ def shared_cache_reconciliation():
     html, _ = web._crc_candidate_tab_html(BV)
     assert 'data-reconcile="1"' in html
     with patch.object(web, "_get_client", side_effect=AssertionError("缓存同步不登录")):
-        response = web.app.test_client().post(f'/api/video/{BV}/candidate-space', json={"mid_hash": H, "uid": A, "mode": "reconcile"})
+        response = card_post(A)
     assert response.status_code == 200 and storage.load_senders(BV)[0]["uid"] == A
     assert response.json["group_removed"] and response.json["candidate_count"] == 0
 
@@ -601,7 +609,7 @@ def shared_missing_cache():
     html, _ = web._crc_candidate_tab_html(BV)
     assert 'data-reconcile="1"' in html and 'class="candidate-card"' not in html
     with patch.object(web, "_get_client", side_effect=AssertionError("同步排除不登录")):
-        response = web.app.test_client().post(f'/api/video/{BV}/candidate-space', json={"mid_hash": H, "uid": A, "mode": "reconcile"})
+        response = card_post(A)
     assert response.status_code == 200 and storage.load_senders(BV)[0]["uid"] is None
 
 
@@ -771,10 +779,9 @@ def hidden_api_cached():
     setup_video()
     card_post(A)
     card_post(B, CardClient({B: {"code": -404}}))
-    with patch.object(web, "_get_client", side_effect=AssertionError("已解析缓存不采集")):
+    with patch.object(web, "_get_client", side_effect=AssertionError("页面不采集")):
         response = web.app.test_client().post(f'/api/video/{BV}/candidate-space', json={"uid": A, "mid_hash": H, "mode": "card"})
-    assert response.status_code == 200 and response.json["group_removed"]
-    assert response.json["candidate_count"] == 0 and not response.json["group_html"]
+    assert response.status_code == 410 and storage.load_senders(BV)[0]["confidence"] == "高"
 
 
 @case("一个高分级条目移除后仍准确保留其他未解析条目，返回剩余数量")
@@ -791,6 +798,162 @@ def partial_removal():
     assert response.json["group_removed"] and response.json["candidate_count"] == 1 and not response.json["empty_html"]
     html, count = web._crc_candidate_tab_html(BV)
     assert count == 1 and f'data-hash="{other}"' in html and f'data-hash="{H}"' not in html
+
+
+class ReportClient:
+    def __init__(self, risk=False):
+        self.calls = []
+        self.risk = risk
+
+    def get(self, url, params):
+        uid = params.get("mid") or params.get("host_mid") or params.get("vmid")
+        self.calls.append((url, uid))
+        if self.risk:
+            return {"code": -412}
+        if url == config.USER_CARD_URL:
+            return {"code": 0, "data": {"card": {"mid": uid, "name": f"离线用户{uid}",
+                   "face": "https://i0.hdslb.com/test.png", "sign": "命令行保存的签名"}}}
+        field = {config.USER_VIDEOS_URL: "archives", config.USER_DYNAMICS_URL: "items",
+                 config.USER_FOLLOWINGS_URL: "list"}[url]
+        return {"code": 0, "data": {field: []}}
+
+
+def prepare_cli(client=None):
+    row = sender()
+    row["resolution"].update(candidate_version="mitm-v1", version=resolver.RESOLVER_VERSION)
+    for uid in (A, B):
+        storage.save_uid_verify_cache(uid, "exists", {"uid": uid, "name": "批量昵称", "face": ""})
+    resolved = {H: row}
+    cards.prepare_candidate_reports(resolved, client or ReportClient())
+    return resolved
+
+
+@case("命令行完整采集两名候选的名片与三种空间首页，每人不重复请求名片")
+def cli_prepares_all():
+    client = ReportClient()
+    row = prepare_cli(client)[H]
+    assert len(client.calls) == 8 and row["uid"] is None and row["method"] == "候选歧义"
+    assert row["resolution"]["candidate_cards"][str(A)]["sign"] == "命令行保存的签名"
+    assert all(s["complete"] for s in row["resolution"]["space_samples"].values())
+
+
+@case("命令行准备的完整资料缓存重复执行零请求，名片核验时间不被空间复用刷新")
+def cli_reuses_cache():
+    row = prepare_cli()[H]
+    before = storage.load_uid_verify_times([A, B])
+    client = ReportClient()
+    cards.prepare_candidate_reports({H: row}, client)
+    assert not client.calls and storage.load_uid_verify_times([A, B]) == before
+
+
+@case("命令行风控立刻停止剩余候选取数，失败状态保存而不是留给报告补采")
+def cli_risk_stops():
+    client = ReportClient(risk=True)
+    row = prepare_cli(client)[H]
+    assert len(client.calls) == 1
+    assert len(row["resolution"]["candidate_cards"]) == 2
+    assert "风控" in row["resolution"]["candidate_cards"][str(B)]["note"]
+
+
+@case("命令行准备过程逐候选保存检查点，中断后仍有已采名片与空间快照")
+def cli_checkpoint():
+    saved = []
+    for uid in (A, B):
+        storage.save_uid_verify_cache(uid, "exists", {"uid": uid, "name": "批量", "face": ""})
+    resolved = {H: sender()}
+    def progress(h, info):
+        saved.append(json.loads(json.dumps(info)))
+        if len(saved) == 1:
+            raise KeyboardInterrupt()
+    try:
+        cards.prepare_candidate_reports(resolved, ReportClient(), on_progress=progress)
+    except KeyboardInterrupt:
+        pass
+    assert saved[0]["resolution"]["candidate_cards"][str(A)]["sign"]
+    assert saved[0]["resolution"]["space_samples"][str(A)]["complete"]
+
+
+@case("报告冻结命令行名片快照，即使全局缓存过期也不退回等待页面取数")
+def cli_snapshot_stable():
+    row = prepare_cli()[H]
+    with patch.object(crc.time, "time", return_value=time.time() + 30 * 86400):
+        out = groups(row=row)
+    assert all(c["name"].startswith("离线用户") and c["status"] == "exists" for c in out[0]["candidates"])
+
+
+@case("两种报告仅展示命令行准备的名片与空间资料，无采集按钮且旧API返回410")
+def readonly_prepared_reports():
+    from lxml import html as parser
+    setup_video()
+    row = prepare_cli()[H]
+    storage.save_sender(BV, H, row["uid"], row["confidence"], row["method"], 2, row["contents"], "低", 0,
+                        resolution=row["resolution"])
+    item = target_record()
+    item["result"]["senders"][0].update(row)
+    storage.save_target_analysis(item["id"], BV, item["selector"], item["result"])
+    client = web.app.test_client()
+    with patch.object(web, "_get_client", side_effect=AssertionError("报告禁止采集")):
+        for path in (f'/video/{BV}', '/target/crc-offline'):
+            response = client.get(path)
+            pane = parser.fromstring(response.text).get_element_by_id('tab-crc')
+            assert "命令行保存的签名" in pane.text_content() and "公开名片：已检查" in pane.text_content()
+            assert not pane.xpath('.//button')
+        assert client.post(f'/api/video/{BV}/candidate-space', json={}).status_code == 410
+        assert client.post('/api/target/crc-offline/candidate-space', json={}).status_code == 410
+
+
+@case("常规UID解析阶段保存候选资料，在进入画像和报告之前完成")
+def normal_cli_pipeline():
+    import main as flow
+    row = sender()
+    for uid in (A, B):
+        storage.save_uid_verify_cache(uid, "exists", {"uid": uid, "name": "批量", "face": ""})
+    with patch.object(flow, "resolve_all_senders", return_value={H: row}):
+        result = flow.phase_resolve(BV, {H: {"count": 2, "contents": ["问题原文"]}}, {}, ReportClient(),
+                                    spam_results={H: {"spam_level": "中"}})
+    assert result[H]["resolution"]["candidate_cards"]
+    assert storage.load_senders(BV)[0]["resolution"]["space_samples"][str(A)]["complete"]
+
+
+@case("前端候选脚本无fetch或可见性补采入口，旧报告也不会自动获取资料")
+def readonly_script():
+    script = (ROOT / 'static/candidate_space.js').read_text()
+    assert 'fetch(' not in script and 'IntersectionObserver' not in script
+
+
+@case("缓存模式下候选资料准备零网络，缺失字段明确标注而不是在报告补采")
+def cli_cache_only():
+    for uid in (A, B):
+        storage.save_uid_verify_cache(uid, "exists", {"uid": uid, "name": "缓存昵称"})
+    client = ReportClient()
+    resolved = {H: sender()}
+    cards.prepare_candidate_reports(resolved, client, cache_only=True)
+    assert not client.calls and "只读已有缓存" in resolved[H]["resolution"]["candidate_cards"][str(A)]["note"]
+
+
+@case("目标模式候选准备在用户采集之前运行，逐项写入独立快照")
+def target_cli_pipeline():
+    import target_analysis as target
+    import main as flow
+    from target_filter import make_selector
+    rows_data = rows()
+    video = {"bvid": BV, "title": "离线目标", "aid": 0, "pages": []}
+    client = ReportClient()
+    for uid in (A, B):
+        storage.save_uid_verify_cache(uid, "exists", {"uid": uid, "name": "批量", "face": ""})
+    row = sender()
+    def before_collect(resolved, *a, **kw):
+        assert resolved[H]["resolution"]["space_samples"][str(A)]["complete"]
+        return {}
+    with patch.multiple(flow, get_auth_client=lambda: client, fetch_command_dms=lambda *a: [],
+                        phase_collect_users=before_collect, phase_analyze=lambda *a, **kw: []), \
+         patch.multiple(target, collect_target_danmaku=lambda *a, **kw: (video, rows_data, flow.group_by_sender(rows_data), []),
+                        resolve_targets=lambda *a, **kw: {H: row},
+                        probe_comment_uids=lambda *a, **kw: ({}, [], {"reason": "end"})), \
+         patch.object(config, "REPORT_DIR", str(Path(storage.DB_PATH).parent / 'reports')):
+        key = target.run_target_analysis(BV, make_selector("问题原文"), launch_web=False, skip_deep=True)
+    saved = storage.load_target_analysis(key)["result"]["senders"][0].get("resolution", {})
+    assert saved.get("candidate_cards", {}).get(str(A), {}).get("sign")
 
 
 def main():

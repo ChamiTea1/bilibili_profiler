@@ -379,7 +379,8 @@ def phase_comment(video_info: dict, client, resume: bool = True):
 def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
                   max_users: int | None = None, charge_uid_map: dict | None = None,
                   command_uid_map: dict | None = None, meta_uid_map: dict | None = None,
-                  spam_results: dict | None = None, cringe_results: dict | None = None):
+                  spam_results: dict | None = None, cringe_results: dict | None = None,
+                  report_cache_only: bool = False):
     """兴趣阈值控制新解析；已有结论按版本、证据指纹及有效期复核。"""
     print("\n[Phase 4/6] 解析发送者UID...")
     cached = {r["mid_hash"]: r for r in load_senders(bvid)}
@@ -417,7 +418,8 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
                           "candidates": verdict[-1], "resolution": record}
     if todo:
         results.update(resolve_all_senders(todo, mapping, client, method_map=methods))
-    for h, info in results.items():
+    from candidate_cards import prepare_candidate_reports
+    def save_resolution(h, info):
         old = cached.get(h)
         if old and old["uid"] != info["uid"]:
             info["resolution"]["previous_uid"] = old["uid"]
@@ -426,6 +428,10 @@ def phase_resolve(bvid: str, sender_groups: dict, comment_uid_map: dict, client,
                     spam_results.get(h, {}).get("spam_level", (old or {}).get("spam_level", "低")),
                     spam_results.get(h, {}).get("spam_score", (old or {}).get("spam_score", 0.0)),
                     resolution=info["resolution"])
+    for h, info in results.items():
+        save_resolution(h, info)
+    prepare_candidate_reports({h: info for h, info in results.items() if h in interested}, client,
+                               on_progress=save_resolution, cache_only=report_cache_only)
     assigned = sum(v.get("uid") is not None for v in results.values())
     print(f"[Phase 4] 兴趣命中 {len(interested)}，验证名额 {len(selected)}，已分配候选 {assigned}/{len(results)}；分配不代表身份确认")
     return results
@@ -911,7 +917,7 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
                          max_users=max_users, charge_uid_map=charge_uid_map,
                          command_uid_map=build_command_uid_map(command_dms),
                          meta_uid_map=build_video_meta_uid_map(video_info),
-                         spam_results=spam_results, cringe_results=cringe_results)
+                         spam_results=spam_results, cringe_results=cringe_results, report_cache_only=skip_collect)
 
     # 合并刷屏/问题弹幕数据到resolved（阶段5置信度过滤与阶段6画像注入均从此处取）
     for mid_hash in resolved:

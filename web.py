@@ -67,10 +67,8 @@ from storage import (load_target_analysis, list_target_analyses, load_uid_space_
                      has_normal_report, NORMAL_REPORT_PREDICATE, load_danmaku,
                      load_danmaku_problems, load_uid_verify_cache, load_uid_candidates, load_uid_verify_times)
 from target_report import render_target_report, render_target_list_page, page_number, render_space_assessment
-from candidate_space import (candidate_uids, cached_assessments, sample_is_fresh,
-                             fetch_space_sample, assess_space, sender_contents)
+from candidate_space import candidate_uids, cached_assessments
 from crc_candidates import is_pure_crc, build_crc_groups, render_crc_groups, render_crc_group
-from candidate_cards import read_candidate_card, cache_space_card, reconcile_crc_sender
 from main import run_analysis
 from uid_resolver import (resolve_sender, METHOD_CRC32_CRACK, build_evidence_maps,
                           resolution_is_current, resolution_record, VerificationBudget)
@@ -3414,73 +3412,8 @@ def api_video_candidate_space(bvid: str):
 
 
 def _candidate_space_response(record: dict):
-    """两种报告共用；自动读取只走名片，深层空间样本仍按需采集。"""
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict):
-        return jsonify({"error": "请提供候选 UID 与 mid_hash"}), 400
-    raw_uid = body.get("uid")
-    if isinstance(raw_uid, bool) or not isinstance(raw_uid, (int, str)) or not re.fullmatch(r"[1-9][0-9]{0,18}", str(raw_uid)):
-        return jsonify({"error": "候选 UID 格式错误"}), 400
-    uid = int(raw_uid)
-    sender = next((s for s in record["result"].get("senders", []) if s["mid_hash"] == body.get("mid_hash")), None)
-    if sender is None or uid not in candidate_uids(sender) or (sender.get("confidence") in ("高", "中") and not is_pure_crc(sender)):
-        return jsonify({"error": "该 UID 不是本条记录可核验的低置信度候选"}), 400
-    mode = body.get("mode", "space")
-    if mode not in ("card", "space", "reconcile"):
-        return jsonify({"error": "未知核验方式"}), 400
-    if mode == "reconcile":
-        reconcile_crc_sender(record["bvid"], sender["mid_hash"], record.get("id"))
-        _invalidate_page_cache(record["bvid"])
-        return jsonify({"status": "cached", "risk": False, **_updated_crc_group(record, sender["mid_hash"])})
-    if mode == "card":
-        status, info, risk = read_candidate_card(uid)
-        if status == "unknown":
-            if not _CANDIDATE_SPACE_LOCK.acquire(blocking=False):
-                return jsonify({"error": "已有候选核验在运行，请稍后重试"}), 409
-            job_id = None
-            try:
-                job_id, error = _try_register_job("candidate-card", record["bvid"], total=1)
-                if job_id is None:
-                    return jsonify({"error": error}), 409
-                status, info, risk = read_candidate_card(uid, _get_client())
-            except CookieInvalidError as exc:
-                return jsonify({"error": str(exc)}), 503
-            finally:
-                if job_id:
-                    with JOBS_LOCK:
-                        JOBS[job_id]["finished"] = True
-                _CANDIDATE_SPACE_LOCK.release()
-        reconcile_crc_sender(record["bvid"], sender["mid_hash"], record.get("id"))
-        _invalidate_page_cache(record["bvid"])
-        return jsonify({"status": status, "risk": risk,
-                        **_updated_crc_group(record, sender["mid_hash"])})
-    sample = load_uid_space_cache([uid]).get(uid)
-    if not sample or not sample_is_fresh(sample):
-        if not _CANDIDATE_SPACE_LOCK.acquire(blocking=False):
-            return jsonify({"error": "已有空间核验在运行，请稍后重试"}), 409
-        job_id = None
-        try:
-            job_id, error = _try_register_job("candidate-space", record["bvid"], total=1)
-            if job_id is None:
-                return jsonify({"error": error}), 409
-            # 只用主号客户端；不为单个候选启动代理核心或小号池。
-            sample = fetch_space_sample(uid, _get_client())
-            _invalidate_page_cache(record["bvid"])
-        except CookieInvalidError as exc:
-            return jsonify({"error": str(exc)}), 503
-        finally:
-            if job_id:
-                with JOBS_LOCK:
-                    JOBS[job_id]["finished"] = True
-            _CANDIDATE_SPACE_LOCK.release()
-    cache_space_card(sample)
-    reconcile_crc_sender(record["bvid"], sender["mid_hash"], record.get("id"))
-    _invalidate_page_cache(record["bvid"])
-    assessment = assess_space(sample, record["bvid"], record["result"].get("video_info", {}),
-                              sender_contents(record, sender))
-    return jsonify({"html": render_space_assessment(assessment, _mask_on(), _mask_name, _mask_uid),
-                    "risk": any(s.get("status") == "risk" for s in sample.get("sources", {}).values()),
-                    **_updated_crc_group(record, sender["mid_hash"])})
+    """兼容旧页的请求入口；报告不采集，旧脚本也不能触发B站请求。"""
+    return jsonify({"error": "候选资料已改为命令行阶段采集，请重跑原分析命令补齐；报告页面只读"}), 410
 
 
 def _updated_crc_group(record: dict, mid_hash: str) -> dict:

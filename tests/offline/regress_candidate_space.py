@@ -235,17 +235,17 @@ def bad_cache():
     assert storage.load_user_data(UID) == old
 
 
-@case("读取报告和已缓存核验都不联网、不读Cookie、唯一有效者按存在性排除标高")
+@case("读取报告和已缓存核验都不联网、不读Cookie、既有解析保持不变")
 def cached_api():
     item = save_record()
     sample()
     client = web.app.test_client()
     with patch.object(web, "_get_client", side_effect=AssertionError("缓存不登录")):
         body = client.get("/target/space-offline").text
-        assert "核验空间线索" in body and "CRC32破解 · 低" in body
-        assert post(client).status_code == 200
+        assert "命令行" in body and "CRC32破解 · 低" in body
+        assert post(client).status_code == 410
     updated = storage.load_target_analysis(item["id"])["result"]
-    assert updated["senders"][0]["uid"] == UID and updated["senders"][0]["confidence"] == "高"
+    assert updated["senders"][0]["uid"] == UID and updated["senders"][0]["confidence"] == "低"
     assert updated["profiles"] == item["result"]["profiles"] and updated["matches"] == item["result"]["matches"]
 
 
@@ -255,10 +255,10 @@ def bad_api():
     client = web.app.test_client()
     with patch.object(web, "_get_client", side_effect=AssertionError("非法候选不登录")):
         for uid in (True, 1.2, -1, "1 OR 1=1", "0", UP, 2**63):
-            assert post(client, uid=uid).status_code == 400
-        assert post(client, mid_hash="ffffffff").status_code == 400
+            assert post(client, uid=uid).status_code == 410
+        assert post(client, mid_hash="ffffffff").status_code == 410
         assert client.post("/api/target/unknown/candidate-space", json={"uid": UID}).status_code == 404
-        assert client.post("/api/target/space-offline/candidate-space", json=[]).status_code == 400
+        assert client.post("/api/target/space-offline/candidate-space", json=[]).status_code == 410
 
 
 @case("缓存与接口公开原文防XSS，昵称及UID遮蔽")
@@ -267,12 +267,12 @@ def masking():
     sample(Client(USER_CARD_URL={"code": 0, "data": {"card": {"mid": UID, "name": "离线昵称甲", "sign": "<script>危险</script>"}}}))
     client = web.app.test_client()
     client.set_cookie("mask", "1")
-    html = post(client).get_json()["html"]
+    html = client.get("/target/space-offline").text
     assert "离线昵称甲" not in html and "UID:123*****" in html
     assert "&lt;script&gt;危险&lt;/script&gt;" in html and "<script>危险</script>" not in html
 
 
-@case("实际核验只启动主号客户端，回写存在性且唯一有效者标高、不污染画像映射")
+@case("旧页面采集入口返回410，不启动客户端或改写画像映射")
 def uncached_api():
     item = save_record()
     clear_cache()
@@ -281,28 +281,28 @@ def uncached_api():
         before = {table: [tuple(r) for r in conn.execute(f"SELECT * FROM {table}")] for table in ("senders", "video_profiles", "global_uid_map", "uid_evidence", "users")}
     fake = Client()
     with patch.object(web, "_get_client", return_value=fake), patch.object(web, "_get_pool", side_effect=AssertionError("不启动代理池")):
-        assert post(client).status_code == 200
-    assert len(fake.calls) == 4
+        assert post(client).status_code == 410
+    assert len(fake.calls) == 0
     with contextlib.closing(storage.get_db()) as conn:
         after = {table: [tuple(r) for r in conn.execute(f"SELECT * FROM {table}")] for table in before}
     updated = storage.load_target_analysis(item["id"])["result"]
-    assert before == after and updated["senders"][0]["confidence"] == "高"
+    assert before == after and updated["senders"][0]["confidence"] == "低"
     assert updated["profiles"] == item["result"]["profiles"] and updated["matches"] == item["result"]["matches"]
 
 
-@case("登录失败释放核验锁及任务，可再次核验")
+@case("旧页面请求不读取Cookie、不注册采集任务")
 def failed_login():
     save_record()
     clear_cache()
     client = web.app.test_client()
     with patch.object(web, "_get_client", side_effect=web.CookieInvalidError("请重新登录")):
-        assert post(client).status_code == 503
+        assert post(client).status_code == 410
     assert not web._has_running_job(BV) and not web._CANDIDATE_SPACE_LOCK.locked()
     with patch.object(web, "_get_client", return_value=Client()):
-        assert post(client).status_code == 200
+        assert post(client).status_code == 410
 
 
-@case("并发核验和正在运行的视频任务均拒绝额外采集")
+@case("旧页面请求即使已有任务也不新增候选采集")
 def busy():
     save_record()
     clear_cache()
@@ -310,12 +310,12 @@ def busy():
     with patch.object(web, "_get_client", side_effect=AssertionError("忙碌时不登录")):
         web._CANDIDATE_SPACE_LOCK.acquire()
         try:
-            assert post(client).status_code == 409
+            assert post(client).status_code == 410
         finally:
             web._CANDIDATE_SPACE_LOCK.release()
         job_id, _ = web._try_register_job("offline", BV)
         try:
-            assert post(client).status_code == 409
+            assert post(client).status_code == 410
         finally:
             web.JOBS[job_id]["finished"] = True
     assert not web._CANDIDATE_SPACE_LOCK.locked()

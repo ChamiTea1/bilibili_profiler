@@ -98,7 +98,7 @@ def _parse_source(kind: str, data: dict, uid: int, limit: int) -> list[dict]:
     return items
 
 
-def fetch_space_sample(uid: int, client) -> dict:
+def fetch_space_sample(uid: int, client, card_info: dict | None = None, card_checked_at: float | None = None) -> dict:
     """最多调用四个空间接口，各取首页；风控后停止后续请求，所有调用遵守客户端限速。"""
     limit = max(1, min(20, int(getattr(config, "UID_SPACE_SAMPLE_ITEMS", 20))))
     sample = {"version": 1, "uid": uid, "checked_at": time.time(), "sources": {}, "complete": False}
@@ -113,8 +113,18 @@ def fetch_space_sample(uid: int, client) -> dict:
         if stopped:
             source.update(status="skipped", note="前序核验中止，未请求")
             continue
+        if kind == "card" and card_info is not None:
+            source.update(status="ok" if "sign" in card_info and "face" in card_info else "unavailable", items=[{"name": _text(card_info.get("name")),
+                          "text": _text(card_info.get("sign")), "face": _text(card_info.get("face")),
+                          "url": f"https://space.bilibili.com/{uid}"}])
+            sample["card_checked_at"] = card_checked_at if card_checked_at is not None else sample["checked_at"]
+            if source["status"] != "ok":
+                source["note"] = "命令行名片字段未取得完整，保留缺失标记"
+            continue
         try:
             response = client.get(url, params=params)
+            if kind == "card":
+                sample["card_checked_at"] = time.time()
             code = response.get("code") if isinstance(response, dict) else None
             if code in (-412, -352, -403):
                 raise RiskControlError("空间接口风控")
@@ -203,8 +213,8 @@ def cached_assessments(record: dict) -> dict:
     output = {}
     for sender in senders:
         for uid in candidate_uids(sender):
-            sample = samples.get(uid)
-            if sample and sample_is_fresh(sample):
+            sample = (sender.get("resolution", {}).get("space_samples") or {}).get(str(uid)) or samples.get(uid)
+            if sample and isinstance(sample, dict) and sample.get("uid") == uid and sample_is_fresh(sample, now=sample.get("checked_at")):
                 contents = sender_contents(record, sender)
                 output[(sender["mid_hash"], uid)] = assess_space(sample, record["bvid"],
                                                               record["result"].get("video_info", {}), contents)

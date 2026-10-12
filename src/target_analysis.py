@@ -14,6 +14,7 @@ from storage import (init_db, load_senders, load_global_uid_map, save_uid_eviden
 from target_filter import analysis_id, make_selector, match_danmaku
 from target_lookup import collect_target_danmaku, probe_comment_uids
 from uid_evidence import add_uid
+from candidate_cards import prepare_candidate_reports
 from uid_resolver import (METHOD_COMMENT_VERIFY, METHOD_AMBIGUOUS, calc_crc32, resolve_all_senders,
                           build_evidence_maps, resolution_is_current)
 
@@ -134,7 +135,8 @@ def run_target_analysis(bvid: str, selector: dict, force: bool = False, max_user
             status = ("未入选（人数上限）" if h not in selected else "待解析" if not info else
                       "未解析" if not uid else "低置信度，待核验" if confidence not in ("高", "中") else
                       "已生成画像" if uid in profiled else "未生成画像（采集跳过或失败）")
-            name = next((p.get("name", "") for p in profiles if p["uid"] == uid), "") if uid else ""
+            name = (next((p.get("name", "") for p in profiles if p["uid"] == uid), "")
+                    or info.get("user_info", {}).get("name", "")) if uid else ""
             rows.append({"mid_hash": h, "uid": uid, "confidence": confidence,
                          "method": info.get("method", ""), "resolution": info.get("resolution", {}),
                          "candidates": info.get("candidates", []), "collision_risk": info.get("collision_risk", True),
@@ -223,6 +225,9 @@ def run_target_analysis(bvid: str, selector: dict, force: bool = False, max_user
                     lookup["reason"] = "api_error"
             result["uid_lookup"] = lookup
             checkpoint(resolved)
+            timer.run("候选报告资料", prepare_candidate_reports, resolved, pool,
+                      on_progress=lambda *_: checkpoint(resolved, profiles), cache_only=skip_collect)
+            checkpoint(resolved, profiles)
             known_uids = {info["uid"] for info in resolved.values()
                           if info.get("uid") and info.get("confidence") in ("高", "中")}
             comments = [c for c in result["comments"] if c["uid"] in known_uids]

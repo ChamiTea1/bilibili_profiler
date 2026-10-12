@@ -59,9 +59,12 @@ def build_crc_groups(senders: list[dict], danmaku: list[dict], problems: dict,
             recorded = {}
         candidates = []
         for uid in uids:
-            status, info = (verifications or {}).get(uid, ("unknown", {}))
+            saved_card = (resolution.get("candidate_cards") or {}).get(str(uid))
+            frozen = isinstance(saved_card, dict) and saved_card.get("uid") == uid
+            status, info = ((saved_card.get("status", "unknown"), saved_card) if frozen else
+                            (verifications or {}).get(uid, ("unknown", {})))
             note = "最近核验结果" if status != "unknown" else "尚待验证"
-            if status == "unknown":
+            if status == "unknown" and not frozen:
                 previous = recorded.get(str(uid))
                 ttl = getattr(config, "UID_VERIFY_EXISTS_TTL", 604800) if previous == "exists" else getattr(config, "UID_VERIFY_MISSING_TTL", 3600)
                 try:
@@ -78,7 +81,7 @@ def build_crc_groups(senders: list[dict], danmaku: list[dict], problems: dict,
             candidates.append({"uid": uid, "status": status, "name": info.get("name", ""),
                                "face": info.get("face", ""), "sign": info.get("sign", ""),
                                "card_ready": status == "not_exists" or (status == "exists" and "sign" in info and "face" in info),
-                               "note": note})
+                               "note": saved_card.get("note", note) if frozen else "旧报告未保存完整候选资料，请重跑原命令补齐"})
         exists = [c["uid"] for c in candidates if c["status"] == "exists"]
         known = all(c["status"] != "unknown" for c in candidates)
         complete = sender.get("_candidate_complete", resolution.get("candidate_version") == "mitm-v1")
@@ -119,17 +122,15 @@ def render_candidate_card(c: dict, mid_hash: str, endpoint: str, mask: bool, mas
               if face else '<span class="candidate-avatar candidate-placeholder" aria-hidden="true">?</span>')
     status = ("高（存在性排除） · 唯一有效候选" if c.get("unique_verified") else
               "账号存在 · 身份未确认" if c.get("status") == "exists" else "存在性待验证 · 身份未确认")
-    sign = c.get("sign") or ("未设置签名" if c.get("card_ready") else "签名待读取")
+    sign = c.get("sign") or ("未设置签名" if c.get("card_ready") else "签名未取得")
     return f'''<article class="space-candidate" data-hash="{esc(mid_hash)}" data-uid="{uid}" data-endpoint="{esc(endpoint)}"
         data-card-ready="{'1' if c.get('card_ready') or not auto_load else '0'}">
         <a class="candidate-card" href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener">
-            {avatar}<span class="candidate-info"><strong class="candidate-name">{esc(name or '昵称待读取')}</strong>
+            {avatar}<span class="candidate-info"><strong class="candidate-name">{esc(name or '昵称未取得')}</strong>
             <span class="candidate-sign">{esc(sign)}</span><span class="candidate-meta">UID:{esc(uid_disp)}
             <span class="candidate-status">{esc(status)}</span></span></span><span class="candidate-arrow" aria-hidden="true">↗</span></a>
-        <div class="candidate-actions"><span class="candidate-card-note" role="status"></span>
-        <button class="filter-btn candidate-card-retry" hidden>重试名片</button>
-        <button class="filter-btn candidate-space" data-hash="{esc(mid_hash)}" data-uid="{uid}" data-endpoint="{esc(endpoint)}">核验空间线索</button></div>
-        <div class="space-result" role="status">{result}</div></article>'''
+        <div class="candidate-actions"><span class="candidate-card-note">{esc(c.get('note') or '命令行采集快照；缺失资料请重跑原分析命令补齐')}</span></div>
+        <div class="space-result">{result or '<p class="chart-hint">命令行尚未保存空间辅助资料；此页不会补采。</p>'}</div></article>'''
 
 
 def render_crc_group(group: dict, endpoint: str, mask: bool, mask_name, mask_uid,
@@ -177,7 +178,7 @@ def render_crc_groups(groups: list[dict], endpoint: str, mask: bool, mask_name, 
     scope = ("本页列出本次目标筛选中的纯破解候选；命中筛选不等于问题判定。"
              if target_mode else "本页集中列出有问题弹幕或高中风险刷屏、且解析时没有明文来源佐证的记录。")
     head = f'''<p class="chart-hint">{scope} 共 <span data-crc-total>{len(groups)}</span> 个待复核匿名发送者。同一 hash 的所有已存候选均列出。</p>
-        <p class="chart-hint">点击长条名片直达空间；可见候选按限速读取公开名片，不采评论或完整画像。
+        <p class="chart-hint">点击长条名片直达空间；名片和空间辅助资料由命令行阶段采集，此页只展示已保存数据。
         仅名片接口明确返回 -404 才排除；其他候选全部明确不存在时，唯一存在者标为高（存在性排除）并移出本页。</p>
         <p class="chart-hint">原文属于匿名发送者，不能据此断言下方每个候选账号都发过这些弹幕。
         仍可能碰撞搜索范围外的 UID；不写入明文证据库，未知和歧义候选不用于 UID 屏蔽。</p>'''
