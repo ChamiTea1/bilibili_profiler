@@ -47,7 +47,7 @@ data/profiler.db-shm
 
 # 内部开发文档（不对外公开）
 docs/
-videos_until_0822.txt
+videos_list.txt
 
 # 本地工作记忆（不入库）
 .workbuddy/
