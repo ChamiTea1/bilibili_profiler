@@ -268,6 +268,89 @@ def _():
             assert "\nexternal-controller: 0.0.0.0:9090" not in text
 
 
+@case("Popen 发生在常驻线程，而不是发起启动的临时线程")
+def _():
+    import os
+    import threading
+    seen = {}
+
+    class FakePopen:
+        def __init__(self, *args, **kwargs):
+            seen["name"] = threading.current_thread().name
+            self.stdout = io.StringIO("")
+            self.returncode = 1
+
+        def poll(self):
+            return 1
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 1
+
+        def kill(self):
+            pass
+
+    def launch():
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(pc, "_RUNTIME_DIR", tmp), \
+                patch.object(pc, "ensure_binary", return_value=os.path.join(tmp, "mihomo")), \
+                patch.object(pc.subprocess, "Popen", FakePopen), \
+                patch.object(pc.atexit, "register"), \
+                redirect_stdout(io.StringIO()):
+            core = pc.ProxyCore(["https://测试订阅.invalid/subscribe"])
+            core.start(allow_download=False)
+
+    worker = threading.Thread(target=launch, name="临时启动线程")
+    worker.start()
+    worker.join(10)
+    assert not worker.is_alive()
+    assert seen.get("name") == pc._SPAWN_THREAD_NAME
+    assert seen["name"] != "临时启动线程"
+
+
+@case("已退出进程的运行目录会被清理，存活进程目录保留且不打印凭证")
+def _():
+    import os
+    with tempfile.TemporaryDirectory() as tmp, patch.object(pc, "_RUNTIME_DIR", tmp):
+        dead_pid = next(cand for cand in range(1_000_000, 1_002_000) if not pc._pid_alive(cand))
+        dead = Path(tmp) / f"{dead_pid}-abcd1234"
+        dead.mkdir()
+        (dead / "config.yaml").write_text("订阅凭证不可输出", encoding="utf-8")
+        live = Path(tmp) / f"{os.getpid()}-eeeeffff"
+        live.mkdir()
+        (live / "config.yaml").write_text("保留", encoding="utf-8")
+        other = Path(tmp) / "notes"
+        other.mkdir()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            pc._reap_stale_runtimes()
+        text = output.getvalue()
+        assert not dead.exists() and live.exists() and other.exists()
+        assert "订阅凭证不可输出" not in text and "abcd1234" not in text
+
+
+@case("有摘要则必须一致才执行，无摘要的手动二进制允许并警告")
+def _():
+    import hashlib
+    with tempfile.TemporaryDirectory() as tmp:
+        binary = Path(tmp) / "mihomo"
+        binary.write_bytes(b"offline-core")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            assert pc._binary_digest_ok(str(binary))
+        assert "警告" in output.getvalue()
+        side = Path(str(binary) + ".sha256")
+        side.write_text("00" * 32 + "\n", encoding="utf-8")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            assert pc._binary_digest_ok(str(binary)) is False
+        assert "重新下载" in output.getvalue()
+        side.write_text(hashlib.sha256(b"offline-core").hexdigest() + "\n", encoding="utf-8")
+        assert pc._binary_digest_ok(str(binary)) is True
+
+
 def main():
     passed = failed = 0
     for name, fn in CASES:

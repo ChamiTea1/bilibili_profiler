@@ -245,16 +245,29 @@ def failed_month():
     assert len(storage.load_danmaku("BVMONTH")) == 1
 
 
-@case("已完成视频也会重试失败的旧月份，突破滚动窗口高水位")
+@case("滚动补采不因更早月份失败整月回补，窗口内失败日仍补")
 def refresh_failed_month():
+    from datetime import datetime, timedelta, timezone
+    today = datetime.now(timezone(timedelta(hours=8))).date()
+    recent = (today - timedelta(days=1)).isoformat()
     storage.set_phase_state("BVOLDMONTH", "danmaku", "done", "1")
+    storage.set_phase_state("BVOLDMONTH", "danmaku", "fetched_dates", "2024-05-01")
     storage.set_phase_state("BVOLDMONTH", "danmaku", "failed_months", "2020-01")
+    storage.set_phase_state("BVOLDMONTH", "danmaku", "failed_dates", recent)
+    months = []
+
+    def month_dates(cid, month, client):
+        months.append(month)
+        return [recent] if month == recent[:7] else [f"{month}-01"]
+
     with patch.object(dh, "HISTORY_DANMAKU_ENABLED", True), \
-         patch.object(dh, "_month_range", return_value=["2026-10"]), \
-         patch.object(dh, "_fetch_month_dates", side_effect=lambda c, m, cli: ["2020-01-01"] if m == "2020-01" else []), \
-         patch.object(dh, "_fetch_day_danmaku", return_value=[dm("旧月份", dmid=2)]) as fetch:
+         patch.object(dh, "_month_range", return_value=["2020-01", recent[:7]]), \
+         patch.object(dh, "_fetch_month_dates", side_effect=month_dates), \
+         patch.object(dh, "_fetch_day_danmaku", return_value=[dm("窗口内", dmid=2)]) as fetch:
         dh.fetch_history_danmaku(1, None, bvid="BVOLDMONTH")
+    assert "2020-01" not in months and recent[:7] in months
     assert fetch.call_count == 1
+    assert storage.get_phase_state("BVOLDMONTH", "danmaku", "done") == "1"
 
 
 class FakeOpenAI:
@@ -541,6 +554,7 @@ def quick_report():
     assert "冒烟用户" in html and "快速采样报告" in html
     assert launch.call_args.args[0].startswith("file:")
     assert storage.get_phase_state("BVQUICKFIX", "danmaku", "done") is None
+    assert storage.load_video_info("BVQUICKFIX") is None
 
 
 @case("浏览器 UID 为空、零、负数或非整数时不生成无效链接")
@@ -574,6 +588,228 @@ def llm_budget():
          patch.object(cd, "LLM_FALLBACK", ("", "", "", "")):
         result = cd._judge_batches([{"content": "测试"}], 1, {}, builder, "预算测试")
     assert clock["calls"] == [(0, 1)] and result[1] == 1
+
+
+@case("评论截断到页数上限后重跑会刷新，且不把 done 写成 1")
+def truncated_comment_refresh():
+    storage.save_comments("BVCAP", [{"uid": 1, "rpid": 1, "content": "旧评论"}], checkpoint={
+        "mode": "wbi", "page": str(main.MAX_COMMENT_PAGES), "offset": "x",
+        "truncated": "1", "format": "v2", "done": "0"})
+    with patch.object(main, "refresh_comments", return_value=0) as refresh, \
+         patch.object(main, "collect_comment_data", side_effect=AssertionError("不应零请求续采")), \
+         patch.object(main, "harvest_comment_uids", return_value={}), \
+         patch.object(main, "fetch_charge_uid_map", return_value={}):
+        main.phase_comment({"bvid": "BVCAP", "aid": 9, "owner": {"mid": 1}}, None)
+    assert refresh.call_count == 1
+    assert storage.get_phase_state("BVCAP", "comment", "done") != "1"
+
+
+@case("评论采集异常后仍读回已落库评论并重建映射")
+def comment_exception_keeps_rows():
+    storage.save_comments("BVEXC", [{"uid": 4, "rpid": 4, "content": "已落库", "location": "IP属地：江苏"}])
+    with patch.object(main, "collect_comment_data", side_effect=RuntimeError("采集中断")):
+        comments, uid_map, loc_map, _ = main.phase_comment(
+            {"bvid": "BVEXC", "aid": 1}, SimpleNamespace(), resume=False)
+    assert [c["content"] for c in comments] == ["已落库"]
+    assert any(4 in (v if isinstance(v, (set, list, tuple)) else {v}) for v in uid_map.values())
+    assert loc_map.get(4) == "IP属地：江苏"
+
+
+@case("误报评论作者不入名单，过期 cmt 行删除且不误删弹幕发送者")
+def prune_comment_authors():
+    storage.save_sender("BVCMT", "aabbccdd", 2, "高", "评论区验证", 1, ["弹幕"], "低", 0)
+    storage.save_sender("BVCMT", "cmt:1", 1, "高", "问题评论", 0, [], "低", 0)
+    storage.save_sender("BVCMT", "cmt:2", 2, "高", "问题评论", 0, [], "低", 0)
+    storage.save_sender("BVCMT", "cmt:9", 9, "高", "问题评论", 0, [], "低", 0)
+    storage.save_user_data(1, "甲", 1, {"uid": 1}, {"uid": 1}, bvid="BVCMT")
+    storage.save_user_data(2, "乙", 1, {"uid": 2}, {"uid": 2}, bvid="BVCMT")
+    storage.save_user_data(9, "丙", 1, {"uid": 9}, {"uid": 9}, bvid="BVCMT")
+    storage.toggle_false_positive("BVCMT", "cmt", "11")
+    comments = [
+        {"uid": 1, "rpid": 11, "content": "误报", "problem": "人身攻击", "problem_severity": 3},
+        {"uid": 3, "rpid": 33, "content": "真问题", "problem": "引战阴阳", "problem_severity": 3},
+    ]
+    resolved = {"aabbccdd": {"uid": 2, "confidence": "高"}}
+    main.sync_problem_comment_authors("BVCMT", comments, resolved)
+    hashes = {row["mid_hash"] for row in storage.load_senders("BVCMT")}
+    assert hashes == {"aabbccdd", "cmt:3"}
+    assert resolved["cmt:3"]["uid"] == 3 and "cmt:1" not in resolved
+    assert storage.load_video_profile("BVCMT", 1) is None
+    assert storage.load_video_profile("BVCMT", 9) is None
+    assert storage.load_video_profile("BVCMT", 2)["uid"] == 2
+
+
+@case("无日期集的 done 不会让分P1 进入滚动补采")
+def spurious_history_done():
+    storage.set_phase_state("BVSPURIOUS", "danmaku", "done", "1")
+    assert dh.history_done_before("BVSPURIOUS") is False
+    assert storage.get_phase_state("BVSPURIOUS", "danmaku", "done") != "1"
+    storage.set_phase_state("BVREALHIST", "danmaku", "done", "1")
+    storage.set_phase_state("BVREALHIST", "danmaku", "fetched_dates", "2026-01-02")
+    assert dh.history_done_before("BVREALHIST") is True
+    assert storage.get_phase_state("BVREALHIST", "danmaku", "done") == "1"
+    months = []
+    storage.set_phase_state("BVSPURIOUS2", "danmaku", "done", "1")
+    with patch.object(dh, "HISTORY_DANMAKU_ENABLED", True), \
+         patch.object(dh, "_month_range", return_value=["2020-06", "2026-10"]), \
+         patch.object(dh, "_fetch_month_dates", side_effect=lambda c, m, cli: months.append(m) or []), \
+         patch.object(dh, "_fetch_day_danmaku", return_value=[]):
+        dh.fetch_history_danmaku(1, None, bvid="BVSPURIOUS2")
+    assert "2020-06" in months
+
+
+@case("关闭历史采集写 phase_done，重跑不重采实时池；失败不清除历史 done")
+def history_off_phase_done():
+    info = {"bvid": "BVNOHIST", "cid": 1, "title": "无历史"}
+    row = dm("实时", dmid=7)
+    with patch.object(main, "collect_danmaku_data", return_value=(info, [row], main.group_by_sender([row]))), \
+         patch.object(main, "HISTORY_DANMAKU_ENABLED", False), \
+         patch.object(main, "fetch_command_dms", return_value=[]):
+        main.phase_danmaku("BVNOHIST", None, resume=False)
+    assert storage.get_phase_state("BVNOHIST", "danmaku", "done") != "1"
+    assert storage.get_phase_state("BVNOHIST", "danmaku", "phase_done") == "1"
+    with patch.object(main, "collect_danmaku_data", side_effect=AssertionError("不应重采实时池")), \
+         patch.object(main, "get_video_info", return_value=dict(info)), \
+         patch.object(main, "fetch_command_dms", return_value=[]), \
+         patch.object(main, "HISTORY_DANMAKU_ENABLED", False):
+        main.phase_danmaku("BVNOHIST", None)
+    storage.set_phase_state("BVKEEP", "danmaku", "done", "1")
+    storage.set_phase_state("BVKEEP", "danmaku", "fetched_dates", "2026-01-01")
+    kept = {"bvid": "BVKEEP", "pages": [{"cid": 1}], "realtime_failed_pages": [1]}
+    storage.save_video_info("BVKEEP", kept)
+    storage.append_danmaku("BVKEEP", [dm("已有", dmid=8)], set())
+    with patch.object(main, "get_video_info", return_value=dict(kept)), \
+         patch.object(main, "fetch_command_dms", return_value=[]), \
+         patch.object(main, "HISTORY_DANMAKU_ENABLED", False), \
+         patch.object(main, "fetch_danmaku", side_effect=RuntimeError("实时池仍失败")):
+        main.phase_danmaku("BVKEEP", None)
+    assert storage.get_phase_state("BVKEEP", "danmaku", "done") == "1"
+    assert storage.get_phase_state("BVKEEP", "danmaku", "realtime_ok") == "0"
+
+
+@case("同一 bvid+dmid 只留一行，dmid=0 仍可多行，迁移删掉旧重复")
+def danmaku_unique_dmid():
+    storage.append_danmaku("BVDUP2", [dm("一", dmid=9)], set())
+    storage.append_danmaku("BVDUP2", [dm("二", dmid=9)], set())
+    assert [row["content"] for row in storage.load_danmaku("BVDUP2") if row["dmid"] == 9] == ["一"]
+    storage.append_danmaku("BVDUP2", [dm("零", dmid=0)], set())
+    storage.append_danmaku("BVDUP2", [dm("零二", dmid=0)], set())
+    assert sorted(row["content"] for row in storage.load_danmaku("BVDUP2") if row["dmid"] == 0) == ["零", "零二"]
+    path = str(Path(TMP.name) / "dup.db")
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE danmaku (bvid TEXT, mid_hash TEXT, content TEXT, time REAL, "
+                     "timestamp INTEGER, mode INTEGER DEFAULT 1, color TEXT DEFAULT '', pool INTEGER DEFAULT 0, "
+                     "dmid INTEGER DEFAULT 0, page INTEGER DEFAULT 1)")
+        conn.executemany("INSERT INTO danmaku (bvid, mid_hash, content, time, timestamp, dmid) "
+                         "VALUES ('BVDUP', 'h', ?, 1, 1, ?)", [("a", 5), ("b", 5), ("z1", 0), ("z2", 0)])
+    with patch.object(storage, "DB_PATH", path):
+        storage.init_db()
+        rows = storage.load_danmaku("BVDUP")
+    assert [row["content"] for row in rows if row["dmid"] == 5] == ["a"]
+    assert sorted(row["content"] for row in rows if row["dmid"] == 0) == ["z1", "z2"]
+
+
+@case("历史弹幕当日数据与检查点同一事务提交")
+def history_checkpoint_atomic():
+    with contextlib.closing(storage.get_db()) as conn:
+        conn.execute("""CREATE TRIGGER fail_hist_ck BEFORE INSERT ON phase_state
+            WHEN NEW.bvid='BVHISTTX' AND NEW.key='last_date'
+            BEGIN SELECT RAISE(ABORT, '模拟检查点中断'); END""")
+        conn.commit()
+    try:
+        storage.append_danmaku("BVHISTTX", [dm("日弹幕", dmid=77)], set(),
+                               checkpoint={"last_date": "2026-10-01", "fetched_dates": "2026-10-01"})
+    except sqlite3.IntegrityError:
+        pass
+    assert storage.load_danmaku("BVHISTTX") == []
+    assert storage.get_phase_state("BVHISTTX", "danmaku", "fetched_dates") is None
+    with contextlib.closing(storage.get_db()) as conn:
+        conn.execute("DROP TRIGGER fail_hist_ck")
+        conn.commit()
+    seen = {}
+    real = storage.append_danmaku
+
+    def wrapped(*args, **kwargs):
+        seen["checkpoint"] = kwargs.get("checkpoint")
+        return real(*args, **kwargs)
+
+    with patch.object(storage, "append_danmaku", wrapped), \
+         patch.object(dh, "HISTORY_DANMAKU_ENABLED", True), \
+         patch.object(dh, "_month_range", return_value=["2026-10"]), \
+         patch.object(dh, "_fetch_month_dates", return_value=["2026-10-01"]), \
+         patch.object(dh, "_fetch_day_danmaku", return_value=[dm("快照", dmid=4)]):
+        dh.fetch_history_danmaku(1, None, bvid="BVCKPT")
+    assert seen.get("checkpoint") and "fetched_dates" in seen["checkpoint"]
+    assert storage.get_phase_state("BVCKPT", "danmaku", "fetched_dates") == "2026-10-01"
+    assert len(storage.load_danmaku("BVCKPT")) == 1
+    storage.append_danmaku("BVHISTTX", [dm("日弹幕", dmid=77)], set(), checkpoint={"last_date": "2026-10-01"})
+    assert len(storage.load_danmaku("BVHISTTX")) == 1
+    assert storage.get_phase_state("BVHISTTX", "danmaku", "last_date") == "2026-10-01"
+
+
+@case("已验证 CRC 升级只扫一次，判定规则不变")
+def crc_upgrade_once():
+    from uid_evidence import crc32_uid
+    left, right = 12345678, 7533489035
+    digest = crc32_uid(left)
+    with contextlib.closing(storage.get_db()) as conn:
+        conn.execute("DELETE FROM uid_schema_state WHERE key='verified_crc_high_v1'")
+        conn.commit()
+    storage.save_uid_candidates(digest, config.MITM_MAX_UID, "mitm-v1", [left, right])
+    resolution = {"candidates": [left, right], "evidence": []}
+    storage.save_sender("BVCRCUP", digest, left, "低", "CRC32破解", 1, ["x"], "低", 0, resolution=resolution)
+    storage.save_uid_verify_cache(left, "exists", {"uid": left})
+    storage.save_uid_verify_cache(right, "not_exists", {})
+    storage.init_db()
+    assert storage.load_senders("BVCRCUP")[0]["confidence"] == "高"
+    storage.save_sender("BVCRCUP", digest, left, "低", "CRC32破解", 1, ["x"], "低", 0, resolution=resolution)
+    storage.init_db()
+    assert storage.load_senders("BVCRCUP")[0]["confidence"] == "低"
+
+
+@case("主流程重跑不把已入库评论再写一遍")
+def comments_not_rewritten():
+    storage.save_comments("BVNORWR", [{"uid": 5, "rpid": 1, "content": "已有", "like": 2}])
+    loaded = storage.load_comments("BVNORWR")
+    assert main._comments_pending_save("BVNORWR", loaded) is False
+    assert main._comments_pending_save("BVNORWR", []) is False
+    assert main._comments_pending_save("BVNORWR", [{"uid": 6, "rpid": 2, "content": "新评论"}]) is True
+    with contextlib.closing(storage.get_db()) as conn:
+        before = conn.execute(
+            "SELECT hit_count FROM uid_evidence WHERE bvid='BVNORWR' AND uid=5").fetchone()[0]
+    with patch.object(main, "phase_login", return_value=None), patch.object(main, "build_pool", return_value=None), \
+         patch.object(main, "phase_danmaku", return_value=({"bvid": "BVNORWR", "aid": 1, "title": "t"}, [], {}, [])), \
+         patch.object(main, "phase_comment", return_value=(loaded, {}, {}, {})), \
+         patch.object(main, "phase_cringe", return_value={}), \
+         patch.object(main, "phase_comment_cringe", return_value=None), \
+         patch.object(main, "phase_resolve", return_value={}), \
+         patch.object(main, "phase_collect_users", return_value={}), \
+         patch.object(main, "phase_analyze", return_value=[]), \
+         patch.object(main, "REPORT_DIR", str(Path(TMP.name) / "reports")):
+        main.run_analysis("BVNORWR", launch_web=False, skip_deep=True)
+    with contextlib.closing(storage.get_db()) as conn:
+        after = conn.execute(
+            "SELECT hit_count FROM uid_evidence WHERE bvid='BVNORWR' AND uid=5").fetchone()[0]
+    assert before == after
+    assert storage.load_comments("BVNORWR")[0]["content"] == "已有"
+
+
+@case("快速分析只更新已有视频行")
+def quick_existing_video():
+    import quick_test as qt
+    storage.save_video_info("BVQUICKOLD", {"bvid": "BVQUICKOLD", "title": "旧标题",
+                                          "danmaku_coverage": {"merged": 3}})
+    with patch.object(qt, "get_auth_client", return_value=None), patch.object(qt, "build_pool", return_value=None), \
+         patch.object(qt, "collect_danmaku_data", return_value=({"bvid": "BVQUICKOLD", "title": "新标题"}, [dm("测试")], {})), \
+         patch.object(qt, "fetch_comments", return_value=[]), patch.object(qt, "LLM_API_KEY", ""), \
+         patch.object(qt, "resolve_sender", return_value=(888, "高", "评论区验证", {}, False, [])), \
+         patch.object(qt, "collect_user_data", return_value={"uid": 888, "name": "冒烟用户"}), \
+         patch.object(qt, "_Tee", side_effect=lambda path, stream: stream), \
+         patch.object(qt, "DATA_DIR", TMP.name), patch.object(qt, "WEB_AUTOSTART", False), \
+         patch.object(sys, "argv", ["quick_test.py", "BVQUICKOLD", "--top", "1"]):
+        qt.main()
+    info = storage.load_video_info("BVQUICKOLD")
+    assert info["title"] == "新标题" and info["danmaku_coverage"]["merged"] == 3
 
 
 print(f"\n==== 全库审查修复: {ok} 项通过, {fail} 项失败 ====")

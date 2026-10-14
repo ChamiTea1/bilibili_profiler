@@ -14,18 +14,20 @@ import threading
 import time
 from datetime import datetime
 
+import config
 from config import (MAX_ANALYZE_USERS_HARD_CAP, ANALYZE_USERS_FLOOR, ANALYZE_USERS_RATIO,
                     LLM_API_KEY, LLM_DEEP_ENABLED, HISTORY_DANMAKU_ENABLED, REPORT_DIR,
                     COMMENT_AUTHOR_MIN_SEVERITY, COMMENT_AUTHOR_MIN_HITS,
-                    HISTORY_MULTIPAGE_ENABLED, HISTORY_MULTIPAGE_MAX_PAGES)
+                    HISTORY_MULTIPAGE_ENABLED, HISTORY_MULTIPAGE_MAX_PAGES,
+                    MAX_COMMENT_PAGES)
 from storage import init_db, save_video_info, save_sender, save_user_data
 from storage import load_video_info
 from storage import load_user_data, has_user_data, load_senders, update_user_profile
 from storage import clear_video_cache, update_sender_spam, load_global_uid_map, save_uid_evidence_maps
 from storage import save_comments, update_comment_problems
 from storage import load_danmaku, load_comments, append_danmaku
-from storage import get_phase_state, set_phase_state
-from auth import get_auth_client, LoginRequiredError
+from storage import get_phase_state, set_phase_state, load_false_positives, delete_senders_by_mid_hash
+from auth import get_auth_client, LoginRequiredError, account_cookie_path, save_cookie_if_current
 from combo_pool import build_pool
 from api_client import RiskControlError
 from danmaku import (collect_danmaku_data, group_by_sender, fetch_command_dms,
@@ -118,17 +120,22 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
       last_date 也缺失则从头逐日采集，与库内已有 dmid 去重）；
     - 无数据 → 全新采集：实时池先增量落库，再历史逐日续采，任意时刻中断可续。
 
-    resume 判据依据 phase_state 哨兵而非弹幕非空：空弹幕视频早退路径也写 done=1
-    哨兵，若按 load_danmaku 非空判定会对空列表恒 falsy 而永远全量重采。
+    resume 判据依据 phase_state 哨兵而非弹幕非空：空弹幕视频也会写 format/phase_done，
+    若按 load_danmaku 非空判定会对空列表恒 falsy 而永远全量重采。
+    关闭历史采集时完成标记是 phase_done，不是 done（done 专供历史模块判断分P是否采完）。
+    实时池失败记 realtime_ok=0，不把已经完成的历史 done 打回去。
     """
     print("\n[Phase 2/6] 采集弹幕数据...")
 
     if resume:
         done = get_phase_state(bvid, "danmaku", "done")
+        phase_done = get_phase_state(bvid, "danmaku", "phase_done")
         last = get_phase_state(bvid, "danmaku", "last_date")
         fmt = get_phase_state(bvid, "danmaku", "format")
         existing = load_danmaku(bvid)
-        if existing or done == "1" or fmt is not None:
+        # phase_done 只表示「关闭历史采集时本阶段已处理完」，用来跳过实时池重采。
+        # 真正的历史完成仍看 done，避免把已采完的历史打成每次从头重采。
+        if existing or done == "1" or phase_done == "1" or fmt is not None:
             prev_info = load_video_info(bvid) or {}
             try:
                 video_info = get_video_info(bvid, client)
@@ -193,7 +200,9 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
                     history_new_list = _fetch_history_all_pages(video_info, client, bvid)
                 else:
                     history_new_list = []
-                    set_phase_state(bvid, "danmaku", "done", "1")
+                    # 不写 done：历史模块会把分P1 的 done=1 当成历史已完成。
+                    if not video_info.get("realtime_failed_pages"):
+                        set_phase_state(bvid, "danmaku", "phase_done", "1")
                 danmaku_list = load_danmaku(bvid)
                 # 半成品续采完成后补算覆盖率（此前只有全新路径会写）：沿用全新路径
                 # 同一算法，但实时池数量以续采前库内已有条数近似（含此前已采的部分历史，
@@ -208,7 +217,8 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
                     save_video_info(bvid, video_info)
                 print(f"[Phase 2] 断点续采：历史弹幕续采完成，库内共 {len(danmaku_list)} 条")
             if video_info.get("realtime_failed_pages"):
-                set_phase_state(bvid, "danmaku", "done", "0")
+                # 下一轮只重试实时池，不能把已经完成的分P1 历史 done 清掉。
+                set_phase_state(bvid, "danmaku", "realtime_ok", "0")
             return video_info, danmaku_list, group_by_sender(danmaku_list), command_dms
 
     # 视频不存在/已删除或触发风控时给友好中文提示并以非零码退出，不再抛原始 traceback
@@ -254,13 +264,15 @@ def phase_danmaku(bvid: str, client, resume: bool = True):
             danmaku_list, sender_groups = merged, group_by_sender(merged)
         except Exception as e:
             print(f"[Main] 警告：历史弹幕采集失败，降级为仅实时弹幕池: {e}")
-    else:
-        set_phase_state(bvid, "danmaku", "done", "0" if video_info.get("realtime_failed_pages") else "1")
+    elif not video_info.get("realtime_failed_pages"):
+        # 历史采集关闭：phase_done 表示本阶段已处理完，避免每次重采实时池。
+        # 不写 done=1，否则之后打开历史采集会把分P1 当成已完成、只补最近几天。
+        set_phase_state(bvid, "danmaku", "phase_done", "1")
 
     # 落库时机在历史合并之后：danmaku_coverage 由上方写入 video_info，
     # 提前保存会导致 Web 概览页拿不到覆盖率
     if video_info.get("realtime_failed_pages"):
-        set_phase_state(bvid, "danmaku", "done", "0")
+        set_phase_state(bvid, "danmaku", "realtime_ok", "0")
     save_video_info(bvid, video_info)
 
     print(f"[Phase 2] 已落库 {len(load_danmaku(bvid))} 条弹幕（danmaku 表）")
@@ -311,12 +323,61 @@ def select_problem_comment_authors(comments: list[dict], comment_problems: dict)
             or st["hits"] >= COMMENT_AUTHOR_MIN_HITS}
 
 
+def sync_problem_comment_authors(bvid: str, comments: list, resolved: dict) -> int:
+    """扣掉误报评论后直引问题评论作者，并删掉本轮不再入选的 cmt: 发送者。
+
+    误报（false_positive kind=cmt）不参与计数。本轮名单外的 cmt: 行，以及 uid
+    已经在弹幕解析名单里的 cmt: 行，连同「该 uid 已无其他发送者」时的画像一起删。
+    非 cmt: 行不动。返回本轮新写入的人数。
+    """
+    existing_uids = {info["uid"] for key, info in resolved.items()
+                     if info.get("uid") and not str(key).startswith("cmt:")}
+    fp_cmt = {target for kind, target in load_false_positives(bvid) if kind == "cmt"}
+    current_verdicts = {}
+    for comment in comments:
+        if not comment.get("problem"):
+            continue
+        if str(comment.get("rpid")) in fp_cmt:
+            continue
+        current_verdicts[comment["rpid"]] = {
+            "category": comment["problem"],
+            "severity": comment.get("problem_severity") or 1,
+        }
+    cmt_authors = select_problem_comment_authors(comments, current_verdicts)
+    keep = {uid for uid in cmt_authors if uid not in existing_uids}
+    for key in list(resolved):
+        if str(key).startswith("cmt:") and resolved[key].get("uid") not in keep:
+            resolved.pop(key, None)
+    stale = [row["mid_hash"] for row in load_senders(bvid)
+             if str(row["mid_hash"]).startswith("cmt:") and row.get("uid") not in keep]
+    if stale:
+        delete_senders_by_mid_hash(bvid, stale)
+    added = 0
+    for uid, stats in cmt_authors.items():
+        if uid not in keep:
+            continue
+        key = f"cmt:{uid}"
+        resolved[key] = {"uid": uid, "confidence": "高", "method": "问题评论",
+                         "user_info": {}, "danmaku_count": 0, "contents": [],
+                         "spam_level": "低", "spam_score": 0.0, "collision_risk": False,
+                         "comment_problem": stats}
+        save_sender(bvid=bvid, mid_hash=key, uid=uid, confidence="高", method="问题评论",
+                    danmaku_count=0, contents=[], spam_level="低", spam_score=0.0)
+        added += 1
+    if added:
+        print(f"[Phase 4+] 问题评论作者直引: {added} 人并入画像名单"
+              f"（严重度≥{COMMENT_AUTHOR_MIN_SEVERITY} 或 命中≥{COMMENT_AUTHOR_MIN_HITS} 条，"
+              f"共候选 {len(cmt_authors)} 人）")
+    return added
+
+
 def phase_comment(video_info: dict, client, resume: bool = True):
     """阶段3: 采集评论 + 充电名单（失败不影响后续流程）
 
     断点续采（resume=True 的非 --force 路径）：comments 表有完整数据
     （done=1，或旧版落库——判据为新格式哨兵 format 缺失）→ 直接读库跳过网络重采；
-    有部分数据（哨兵 format 存在但无 done）→ collect_comment_data 内部
+    truncated=1 且游标已到页数上限时同样走增量刷新，但不把截断写成 done；
+    有部分数据（哨兵 format 存在但无 done、也还没到上限）→ collect_comment_data 内部
     从游标续页，已入库评论靠 UNIQUE 约束去重。"""
     print("\n[Phase 3/6] 采集评论区数据...")
     bvid = video_info.get("bvid", "")
@@ -330,9 +391,18 @@ def phase_comment(video_info: dict, client, resume: bool = True):
             done = get_phase_state(bvid, "comment", "done")
             mode = get_phase_state(bvid, "comment", "mode")
             fmt = get_phase_state(bvid, "comment", "format")
+            try:
+                comment_page = int(get_phase_state(bvid, "comment", "page") or 0)
+            except (TypeError, ValueError):
+                comment_page = 0
+            # 截断到采集上限后，续采的页码区间是空的，重跑会零请求返回且永远不刷新。
+            # 按「已到采集上限」走增量刷新；截断不是采完，这里不写 done。
+            truncated_at_cap = (get_phase_state(bvid, "comment", "truncated") == "1"
+                                and comment_page >= MAX_COMMENT_PAGES)
             # 哨兵 format 存在而无 done 必为半成品；三者皆无才是旧版完整落库。
             # 否则中断点早于首个游标检查点时会被误判为完整而永久跳过剩余翻页
-            if done == "1" or (done is None and mode is None and fmt is None):
+            old_complete = done is None and mode is None and fmt is None
+            if done == "1" or old_complete or truncated_at_cap:
                 # 完整数据（含旧版完整落库）：先按时间序增量刷新（新评论撞整页已见即停，
                 # 旧评论顺带刷新热度；失败降级沿用库内数据），再读库
                 if aid:
@@ -341,7 +411,10 @@ def phase_comment(video_info: dict, client, resume: bool = True):
                         existing = load_comments(bvid)
                     except Exception as e:
                         print(f"[Phase 3] 警告: 评论增量刷新失败（{e}），沿用库内已有数据")
-                print(f"[Phase 3] 断点续采：从库读回 {len(existing)} 条评论，跳过评论重采")
+                if truncated_at_cap and done != "1" and not old_complete:
+                    print(f"[Phase 3] 评论已到采集上限（{len(existing)} 条），改为增量刷新，不写 done")
+                else:
+                    print(f"[Phase 3] 断点续采：从库读回 {len(existing)} 条评论，跳过评论重采")
                 charge_uid_map = fetch_charge_uid_map(bvid, aid, up_mid, client) if up_mid else {}
                 comment_uid_map = build_comment_uid_map(existing)
                 # 纯 UID 收割并入评论明文映射（收割源同为评论明文，证据等级一致）
@@ -363,6 +436,11 @@ def phase_comment(video_info: dict, client, resume: bool = True):
         comments, comment_uid_map, comment_location_map = collect_comment_data(aid, client, bvid=bvid or None)
     except Exception as e:
         print(f"[Phase 3] 评论采集失败 (将仅用其他来源): {e}")
+        # 页数据已在采集途中落库。异常不能把内存列表清成空，否则后续画像丢掉已有评论。
+        if bvid:
+            comments = load_comments(bvid)
+            comment_uid_map = build_comment_uid_map(comments)
+            comment_location_map = build_comment_location_map(comments)
     # 纯 UID 收割并入评论明文映射（收割源同为评论明文，证据等级一致），失败不影响主流程
     if bvid:
         try:
@@ -498,7 +576,7 @@ def phase_comment_cringe(comments: list, video_info: dict) -> dict | None:
 def phase_collect_users(resolved: dict, pool, max_users: int | None = None, force: bool = False,
                          cache_only: bool = False):
     """阶段5: 深度采集用户数据（名单已由阶段4兴趣定员；max_users 为手动硬上限
-    （--max-users 传入时），None 不截断；成功立即落库可断点续采；force=True 跳过缓存强制重采）
+    （--max-users 传入时），None 默认采集100人；成功立即落库可断点续采；force=True 跳过缓存强制重采）
 
     cache_only=True（--skip-collect）：只读库内已采数据，完全不发起网络请求——阶段5
     请求量最大（每人约 21 个请求）、最易触发风控；未采用户本轮不生成画像，去掉参数重跑即续采。
@@ -506,6 +584,8 @@ def phase_collect_users(resolved: dict, pool, max_users: int | None = None, forc
     组合池（ComboPool）：每个请求由池透明接管，风控保留节点并进入出口冷却，
     代理连接故障才切节点；预算耗尽抛 RiskControlError，本 uid 按失败跳过。"""
     print("\n[Phase 5/6] 深度采集用户信息...")
+    if max_users is None:
+        max_users = max(1, int(getattr(config, "PROFILE_DEEP_MAX_USERS", 100)))
 
     # 筛选需要采集的用户（有UID且置信度 acceptable）
     uids_to_collect = []
@@ -794,6 +874,46 @@ class PhaseTimer:
         print(f"[计时] 总耗时: {self._fmt(total)}")
 
 
+def _persist_sessions(pool) -> None:
+    """把池内各账号当前的登录态回写磁盘（失败只警告，绝不影响分析结果）。
+
+    B站会在活跃会话中续期 SESSDATA，但那只体现在内存 session 里；不回写的话文件里
+    永远是登录那一刻的登录态，服务端一到期就彻底作废。save_cookie_if_current 会先比对
+    磁盘上的 refresh_token，避免覆盖其它进程（web.py）刚刷新出的新登录态。"""
+    try:
+        accounts = pool.accounts
+    except AttributeError:
+        return
+    saved = 0
+    for name, client in accounts:
+        try:
+            path = None if name == "主号" else account_cookie_path(name)
+            if save_cookie_if_current(client, path):
+                saved += 1
+        except Exception as e:
+            print(f"[Auth] 账号 {name} 登录态回写失败（忽略）: {e}")
+    if saved:
+        print(f"[Auth] 已回写 {saved} 个账号的登录态（含服务端续期）")
+
+
+def _comment_save_key(comment: dict) -> tuple:
+    """用来判断这条评论是否已经按同样内容落过库。problem 由单独的回写更新，不参与比较。"""
+    return (comment.get("rpid", 0), comment.get("uid"), comment.get("content", ""),
+            comment.get("like", 0) or 0, comment.get("reply_count", 0) or 0,
+            comment.get("ctime", 0) or 0, bool(comment.get("is_sub")),
+            comment.get("root_rpid", 0) or 0, comment.get("parent_rpid", 0) or 0,
+            comment.get("uname") or "", comment.get("location") or "")
+
+
+def _comments_pending_save(bvid: str, comments: list) -> bool:
+    """内存评论里是否有库中还没有的内容。空列表返回假，避免把已有评论当成需要覆盖。"""
+    pending = [_comment_save_key(c) for c in comments if c.get("uid") and c.get("content")]
+    if not pending:
+        return False
+    stored = {_comment_save_key(c) for c in load_comments(bvid)}
+    return any(row not in stored for row in pending)
+
+
 def _deep_enabled(skip_deep: bool = False) -> bool:
     """阶段7（LLM 重点深掘）是否执行：全局开关与单次 --skip-deep 必须同时为真。
 
@@ -869,9 +989,12 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
     # 阶段3: 评论 + 充电名单（comment_location_map 为 uid→IP属地，uid_comments 阶段6贯通进画像）
     comments, comment_uid_map, comment_location_map, charge_uid_map = timer.run(
         "阶段3 评论采集", phase_comment, video_info, pool, resume=not force)
-    # 评论落库（跨视频足迹数据源，幂等去重；失败只警告不中断）
+    # 采集和刷新已经逐页落库。只有本轮内存里真有尚未入库的评论才写回
+    # （例如采集失败前抓在内存里的页）。从库读出来再整表写只会抬修订号和 hit_count。
+    # 空列表不写，正常重跑不会把已有评论清掉。
     try:
-        save_comments(bvid, comments)
+        if _comments_pending_save(bvid, comments):
+            save_comments(bvid, comments)
     except Exception as e:
         print(f"    警告: 评论落库失败（{e}），跨视频足迹将缺评论")
 
@@ -927,32 +1050,32 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
         if mid_hash in cringe_results:
             resolved[mid_hash]["cringe"] = cringe_results[mid_hash]
 
-    # 问题评论作者直引（P0-a）：评论自带明文 UID 无需破解，达阈值的作者以合成键
-    # cmt:{uid} 并入 resolved（danmaku_count=0，身份置信度"高"），并落 senders 表让
-    # web 端画像/跨视频足迹可见；已在解析名单中的 UID 跳过（避免同人双画像）
-    existing_uids = {info["uid"] for info in resolved.values() if info.get("uid")}
-    current_verdicts = {c["rpid"]: {"category": c["problem"], "severity": c.get("problem_severity") or 1}
-                        for c in comments if c.get("problem")}
-    cmt_authors = select_problem_comment_authors(comments, current_verdicts)
-    cmt_added = 0
-    for uid, st in cmt_authors.items():
-        if uid in existing_uids:
-            continue
-        key = f"cmt:{uid}"
-        resolved[key] = {"uid": uid, "confidence": "高", "method": "问题评论",
-                         "user_info": {}, "danmaku_count": 0, "contents": [],
-                         "spam_level": "低", "spam_score": 0.0, "collision_risk": False,
-                         "comment_problem": st}
-        save_sender(bvid=bvid, mid_hash=key, uid=uid, confidence="高", method="问题评论",
-                    danmaku_count=0, contents=[], spam_level="低", spam_score=0.0)
-        cmt_added += 1
-    if cmt_added:
-        print(f"[Phase 4+] 问题评论作者直引: {cmt_added} 人并入画像名单"
-              f"（严重度≥{COMMENT_AUTHOR_MIN_SEVERITY} 或 命中≥{COMMENT_AUTHOR_MIN_HITS} 条，共候选 {len(cmt_authors)} 人）")
+    # 问题评论作者直引：扣误报后再并入，并清掉本轮不再入选的 cmt: 行。
+    sync_problem_comment_authors(bvid, comments, resolved)
+
+    # UID 终审必须在用户采集和画像之前完成：终审可能把歧义候选收敛到新 UID，
+    # 也可能撤销旧 UID。这样本轮阶段5/6只会采集并生成最终归属的画像。
+    try:
+        from candidate_cards import recheck_ambiguous_candidates
+
+        def _save_recheck(h, info):
+            save_sender(bvid, h, info.get("uid"), info.get("confidence", "无"), info.get("method", ""),
+                        info.get("danmaku_count", 0), info.get("contents", []),
+                        info.get("spam_level", "低"), info.get("spam_score", 0.0),
+                        resolution=info.get("resolution"))
+
+        _stats = recheck_ambiguous_candidates(resolved, client, on_progress=_save_recheck)
+        if _stats["targets"]:
+            print(f"[Phase 4+] 歧义候选终审复核: 目标 {_stats['targets']} 人，复核 {_stats['checked']} 次，"
+                  f"调整 {_stats['flipped']}，终审排除 {_stats['finalized']}，待下轮 {_stats['pending']}"
+                  + ("（风控暂停，冷却后下次运行继续）" if _stats["stopped"] else ""))
+    except Exception as e:
+        print(f"[Phase 4+] UID终审复核异常（忽略，不影响后续采集）: {e}")
 
     # 阶段5: 用户采集（组合池透明接管风控轮换）
     user_data_map = timer.run("阶段5 用户采集", phase_collect_users, resolved, pool,
-                              max_users=max_users, force=force, cache_only=skip_collect)
+                              max_users=max_users if max_users is not None else getattr(config, "PROFILE_DEEP_MAX_USERS", 100),
+                              force=force, cache_only=skip_collect)
 
     # 阶段6: 画像分析（评论IP属地/本视频评论/问题弹幕在此贯通进画像）
     profiles = timer.run("阶段6 画像分析", phase_analyze, resolved, spam_results, user_data_map,
@@ -968,6 +1091,11 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
 
     # 空视频或零画像也可能已完成常规分析；与目标模式共享的元信息明确区分。
     set_phase_state(bvid, "report", "ready", "1")
+
+    # 阶段8: 会话回写。B站在会话中下发的续期 Set-Cookie 只存在内存 session 里，
+    # 进程退出即丢；收尾时把仍有效的登录态落盘，让下次运行直接复用（含服务端续期）。
+    _persist_sessions(pool)
+
     # 静态单文件 HTML 报告已被交互式 Web 报告（web.py）完全替换，不再生成 .html
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     export_base = os.path.join(REPORT_DIR, f"report_{bvid}_{ts}")

@@ -612,6 +612,171 @@ def _():
     assert a.gate is b.gate
 
 
+@case("单次请求的代理重试有上限")
+def _():
+    r, c, _ctl = route()
+    pool = cp.ComboPool([("主号", c)], routes={"主号": r})
+    calls = []
+
+    def execute(client, fn, cooldown):
+        calls.append(1)
+        raise pp.RetryProxyError("始终重试")
+
+    r.execute = execute
+    try:
+        pool.run(lambda _: None)
+        raise AssertionError("超过上限应抛出")
+    except pp.RetryProxyError:
+        pass
+    limit = int(getattr(config, "PROXY_REQUEST_RETRIES", None) or getattr(config, "MAX_RETRY", 3))
+    assert len(calls) == limit + 1
+
+
+@case("ReadTimeout 不拉黑节点，分块错误可重试，连接超时才算节点故障")
+def _():
+    c = ac.BiliAPIClient()
+    c._proxy_active = True
+    c._sleep_if_needed = lambda _: None
+    with patch.object(ac.time, "sleep"):
+        c.session.request = Mock(side_effect=requests.ReadTimeout("读超时"))
+        try:
+            c.get_raw("http://127.0.0.1/x", max_attempts=2)
+            raise AssertionError("应抛读超时")
+        except ac.ProxyConnError:
+            raise AssertionError("ReadTimeout 不应判节点死亡")
+        except requests.ReadTimeout:
+            pass
+        assert c.session.request.call_count == 2
+
+        c.session.request = Mock(side_effect=requests.exceptions.ChunkedEncodingError("分块"))
+        try:
+            c.get_raw("http://127.0.0.1/x", max_attempts=2)
+            raise AssertionError("应在重试后抛出原异常")
+        except requests.exceptions.ChunkedEncodingError:
+            pass
+        assert c.session.request.call_count == 2
+
+        c.session.request = Mock(side_effect=requests.ConnectTimeout("连接超时"))
+        try:
+            c.get_raw("http://127.0.0.1/x", max_attempts=2)
+            raise AssertionError("应立即判节点故障")
+        except ac.ProxyConnError:
+            pass
+        assert c.session.request.call_count == 1
+
+
+@case("交互请求遇到出口冷却时快速失败")
+def _():
+    c = ac.BiliAPIClient()
+    gate = pp.EgressGate()
+    gate.cooldown(30)
+    c.set_egress_gate(gate)
+    c.session.request = Mock(return_value=response("{}"))
+    started = time.monotonic()
+    try:
+        c._request_immediate("GET", "http://127.0.0.1/x")
+        raise AssertionError("应快速失败")
+    except ac.RiskControlError:
+        pass
+    assert time.monotonic() - started < 1
+    assert c.session.request.call_count == 0
+
+
+@case("同一次风控只降速一次，下一次独立请求仍降速")
+def _():
+    c = ac.BiliAPIClient()
+    c.raise_on_risk = True
+    c._sleep_if_needed = lambda _url: None
+    c._ensure_buvid3 = lambda: ""
+    c._ensure_bili_ticket = lambda: None
+    hits = []
+    real = c._penalize_throttle
+
+    def penalize(what):
+        hits.append(what)
+        real(what)
+
+    c._penalize_throttle = penalize
+    c.session.request = Mock(return_value=response({"code": -412}))
+    with patch.object(ac.time, "sleep"):
+        for _ in range(2):
+            try:
+                c.get("http://127.0.0.1/x")
+                raise AssertionError("应抛风控")
+            except ac.RiskControlError:
+                pass
+    assert len(hits) == 2
+
+
+@case("没拿到 WBI 密钥时丢掉旧签名且不判风控")
+def _():
+    c = ac.BiliAPIClient()
+    c.raise_on_risk = True
+    c._sleep_if_needed = lambda _url: None
+    c._ensure_buvid3 = lambda: ""
+    c._ensure_bili_ticket = lambda: None
+    seen = {}
+
+    def no_key():
+        seen["fail_ts"] = c._wbi_key_fail_ts
+        c._wbi_key = ""
+        return ""
+
+    c._get_wbi_key = no_key
+    c._wbi_key = "old"
+    c._wbi_key_fail_ts = time.time()
+    c.session.request = Mock(return_value=response({"code": -352, "message": "签名"}))
+    body = c.get("https://api.bilibili.com/x/space/wbi/arc/search",
+                 params={"w_rid": "old", "wts": 1, "mid": 1})
+    assert body["code"] == -352 and "未判定为风控" in body["message"]
+    assert seen.get("fail_ts") == 0.0
+    signed = c._sign_wbi({"w_rid": "old", "wts": 1, "foo": "bar"})
+    assert "w_rid" not in signed and "wts" not in signed and signed["foo"] == "bar"
+
+
+@case("内置核心退出后请求会重新拉起，没有订阅不启动")
+def _():
+    core = Mock()
+    core.sub_urls = ["https://sub.invalid"]
+    core.api_port = 19090
+    core.generation = 2
+    proc = Mock()
+    proc.poll.return_value = 1
+    core._proc = proc
+    core.start.return_value = None
+    with patch.object(config, "SUB_URLS", []), patch.object(pc, "_CORE_INSTANCE", core):
+        r, c, _ctl = route()
+        r.execute(c, lambda _: {"code": 0}, 0)
+    assert not core.start.called
+    core.start.return_value = r.clash
+    r._strip()
+    assert not c._proxy_active
+    with patch.object(config, "SUB_URLS", ["https://sub.invalid"]), patch.object(pc, "_CORE_INSTANCE", core):
+        assert r.execute(c, lambda _: {"code": 0}, 0) == {"code": 0}
+    core.start.assert_called_once_with(allow_download=False)
+    assert c._proxy_active
+
+
+@case("冷却等待不占路由锁")
+def _():
+    r, c, _ctl = route()
+    r.gate.cooldown(0.15)
+    acquired = threading.Event()
+
+    def other():
+        time.sleep(0.02)
+        ok = r.lock.acquire(timeout=0.05)
+        if ok:
+            acquired.set()
+            r.lock.release()
+
+    worker = threading.Thread(target=other)
+    worker.start()
+    assert r.execute(c, lambda _: {"code": 0}, 0) == {"code": 0}
+    worker.join(2)
+    assert acquired.is_set()
+
+
 def main():
     passed = failed = 0
     for name, fn in CASES:

@@ -7,8 +7,11 @@
 """
 import json
 import re
+import time
 import html as _html
 from datetime import datetime
+
+import config
 from collections import Counter
 from urllib.parse import urlparse
 from uid_evidence import confidence_label
@@ -185,12 +188,76 @@ def safe_url(url):
 
 
 def js_json(obj):
-    """json.dumps 后转义 </，防 </script> 截断逃逸"""
-    return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
+    """json.dumps 后把 < 换成 \\u003c。
+
+    只转义 </ 挡不住 <!--：HTML 解析器会把 <script> 里的注释一直吃到页面后面。
+    \\u003c 仍是合法 JSON 转义，JS 解析后还原为 <。"""
+    return json.dumps(obj, ensure_ascii=False).replace("<", "\\u003c")
 
 
-def generate_user_card(profile: dict) -> str:
-    """生成单个用户的画像卡片HTML"""
+# 楼中楼正文开头的「回复 @昵称 :」。昵称本身可能含空格，以冒号收束。
+_REPLY_AT_RE = re.compile(r"^(\s*回复\s*@)(.+?)(\s*[:：])")
+
+
+def mask_reply_prefix(text, mask, mask_name) -> str:
+    """mask 为真时，把正文开头「回复 @昵称」里的昵称按 mask_name 同规则遮蔽。
+
+    mask_name 由调用方传入（与昵称遮蔽同一实现，只留末字、其余用颜文字）。
+    没有该前缀的正文原样返回。"""
+    if text is None:
+        return ""
+    s = str(text)
+    if not mask or mask_name is None:
+        return s
+    m = _REPLY_AT_RE.match(s)
+    if not m:
+        return s
+    nick = m.group(2).strip()
+    if not nick:
+        return s
+    return m.group(1) + mask_name(nick) + m.group(3) + s[m.end():]
+
+
+# 纯 CRC 来源的解析方式：这些 UID 是"算出来的"，必须新鲜核验为存在才允许跳转；
+# 其余（评论区验证/问题评论/评论收割/互动弹幕等）由 B站接口直接给出，必为真实账号。
+_CRC_RESOLVE_METHODS = {"CRC32破解", "CRC32碰撞", "候选歧义", "待验证", "未知", ""}
+
+
+def uid_linkable(profile: dict) -> bool:
+    """该 UID 是否允许渲染成可点击的 B站空间链接。
+
+    硬要求：报告里不能出现点进去 404 的账号。明文来源直接放行；纯 CRC 来源必须满足
+    candidate_status[uid] == "exists" 且核验时间在 UID_VERIFY_EXISTS_TTL 内——过期的
+    账号存在结论也可能早已注销，一律降级为不可点击（纯文本）。"""
+    method = str(profile.get("resolve_method") or "")
+    if method not in _CRC_RESOLVE_METHODS:
+        return True
+    uid = profile.get("uid")
+    resolution = profile.get("_resolution")
+    if not uid or not isinstance(resolution, dict):
+        return False
+    status_map = resolution.get("candidate_status")
+    if not isinstance(status_map, dict) or status_map.get(str(uid)) != "exists":
+        return False
+    checked = resolution.get("candidate_checked_at")
+    # checked_at 是解析时刻，不是名片核验时刻，缺核验时间不得回退、不可点击
+    if not isinstance(checked, dict):
+        return False
+    at = checked.get(str(uid))
+    if at is None:
+        return False
+    try:
+        ttl = getattr(config, "UID_VERIFY_EXISTS_TTL", 7 * 86400)
+        return 0 <= time.time() - float(at) < ttl
+    except (TypeError, ValueError):
+        return False
+
+
+def generate_user_card(profile: dict, mask: bool = False, mask_name=None) -> str:
+    """生成单个用户的画像卡片HTML。
+
+    mask/mask_name：隐藏信息开启时遮蔽评论正文里「回复 @昵称」前缀（与昵称同一规则）。
+    不传则不遮蔽，既有调用保持原样。"""
     uid = profile.get("uid", 0)
     # 隐藏信息（web.py mask Cookie 开启时注入 _uid_disp）：可见 UID 文本用遮蔽值；
     # href/id 锚点/data-* 保持原值（链接仍指向真实 /user/<uid>，属已知取舍）
@@ -394,7 +461,8 @@ def generate_user_card(profile: dict) -> str:
             date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
             sub_mark = '<span class="dm-time">回复</span> ' if c.get("is_sub") else ""
             problem_chip = _category_chips([c["problem"]]) if c.get("problem") else ""
-            items.append(f"<li>{sub_mark}{esc(c.get('content',''))} "
+            content = mask_reply_prefix(c.get("content", ""), mask, mask_name)
+            items.append(f"<li>{sub_mark}{esc(content)} "
                          f"<span class=\"dm-time\">👍{c.get('like',0)} {date}</span>{problem_chip}</li>")
         cmt_section = f'''
             <div class="section">
@@ -425,7 +493,8 @@ def generate_user_card(profile: dict) -> str:
                 date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
                 sub_mark = '<span class="dm-time">回复</span> ' if c.get("is_sub") else ""
                 problem_chip = _category_chips([c["problem"]]) if c.get("problem") else ""
-                cmt_lis.append(f'<li>{sub_mark}{esc(c.get("content", ""))} '
+                content = mask_reply_prefix(c.get("content", ""), mask, mask_name)
+                cmt_lis.append(f'<li>{sub_mark}{esc(content)} '
                                f'<span class="dm-time">👍{c.get("like", 0)} {date}</span>{problem_chip}</li>')
             cmt_html = "".join(cmt_lis) or (
                 '<li class="ov-none">评论未留存（该视频为旧版本分析）</li>'
@@ -447,8 +516,16 @@ def generate_user_card(profile: dict) -> str:
             </div>'''
 
     # 头像 (可点击跳转B站主页；referrerpolicy="no-referrer" 防 hdslb 防盗链拦截导致头像空白)
-    profile_url = safe_url(f"https://space.bilibili.com/{uid}")
-    avatar_html = f'<a href="{profile_url}" target="_blank" rel="noopener"><img src="{safe_url(face)}" alt="{esc(name)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display=\'none\'"></a>' if face else f'<div class="avatar-text">{esc(name[0]) if name else "?"}</div>'
+    # 头像 (可点击跳转B站主页；referrerpolicy="no-referrer" 防 hdslb 防盗链拦截导致头像空白)
+    # 只有能确认账号存在的 UID 才给链接：报告里不得出现点进去 404 的账号
+    profile_url = safe_url(f"https://space.bilibili.com/{uid}") if uid_linkable(profile) else ""
+    img_html = f'<img src="{safe_url(face)}" alt="{esc(name)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display=\'none\'">'
+    if not face:
+        avatar_html = f'<div class="avatar-text">{esc(name[0]) if name else "?"}</div>'
+    elif profile_url:
+        avatar_html = f'<a href="{profile_url}" target="_blank" rel="noopener">{img_html}</a>'
+    else:
+        avatar_html = img_html          # 未确认存在：照常显示头像，但不做跳转
 
     return f'''
     <div class="user-card" id="uid-{esc(uid)}" data-level="{esc(level)}" data-vip="{'true' if profile.get('vip_status',0)==1 else 'false'}" data-spam="{esc(spam_level)}" data-official="{'true' if profile.get('official_type',-1)>=0 else 'false'}" data-is-up="{'true' if profile.get('archive_count',0)>0 else 'false'}" data-spam-score="{spam_score:.2f}" data-danmaku-count="{esc(dm_count)}" data-fans="{esc(follower)}">
@@ -609,8 +686,14 @@ def generate_cringe_board(profiles: list[dict], fp_renderer=None) -> str:
         cr = p["cringe"]
         example = (cr.get("examples") or [{}])[0]
         fp_html = fp_renderer(example.get("content", "")) if fp_renderer else ""
+        # 同样只有能确认存在的 UID 才给链接（未确认则只显示名称，不做跳转）
+        if uid_linkable(p):
+            uid_cell = (f'<a href="https://space.bilibili.com/{esc(p.get("uid", 0))}" '
+                        f'target="_blank" rel="noopener">{esc(p.get("name", "未知"))}</a>')
+        else:
+            uid_cell = esc(p.get("name", "未知"))
         rows.append(
-            f'<tr><td><a href="https://space.bilibili.com/{esc(p.get("uid", 0))}" target="_blank" rel="noopener">{esc(p.get("name", "未知"))}</a></td>'
+            f'<tr><td>{uid_cell}</td>'
             f'<td>{esc(cr["count"])}</td>'
             f'<td>{_category_chips(cr.get("categories", []))}</td>'
             f'<td>{esc(cr.get("max_severity", 0))}</td>'

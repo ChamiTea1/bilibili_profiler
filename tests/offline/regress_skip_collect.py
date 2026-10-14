@@ -69,6 +69,14 @@ except Exception as e:
 check("库内无已采数据时返回空量表且不报错", got2 == {} and err2 is None,
       "(得到 %r, 异常 %r)" % (got2, err2))
 
+# 默认100人限制同样约束缓存读取，显式上限可覆盖。
+from unittest.mock import patch
+many = _resolved(*range(10000, 10105))
+with patch.object(main, "has_user_data", return_value=True), patch.object(main, "load_user_data", return_value=({}, {})):
+    limited = main.phase_collect_users(many, pool, cache_only=True)
+    expanded = main.phase_collect_users(many, pool, max_users=103, cache_only=True)
+check("默认最多深度读取100人，显式上限可覆盖", len(limited) == 100 and len(expanded) == 103)
+
 print("")
 print("==== --skip-collect 只读缓存: %d 项通过, %d 项失败 ====" % (ok, fail))
 sys.exit(1 if fail else 0)

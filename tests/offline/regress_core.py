@@ -89,10 +89,10 @@ check("重跑补齐失败月份后才写 done", len(fds2) == 20 and kv2.get("don
 
 print("=== 2. P0-2 线程池异常路径收尾 ===")
 real = storage.append_danmaku; cnt = {"n": 0}
-def flaky(b, dms, seen):
+def flaky(b, dms, seen, checkpoint=None):
     cnt["n"] += 1
     if cnt["n"] == 2: raise RuntimeError("模拟落库失败")
-    return real(b, dms, seen)
+    return real(b, dms, seen, checkpoint=checkpoint)
 storage.append_danmaku = flaky
 class FC2(FC):
     def shard_pools(s): return [s, s]

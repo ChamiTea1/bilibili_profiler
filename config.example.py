@@ -26,6 +26,14 @@ COOKIE_PATH = os.path.join(DATA_DIR, "cookie.json")
 COOKIES_DIR = os.path.join(DATA_DIR, "cookies")
 REPORT_DIR = os.path.join(DATA_DIR, "reports")
 
+# ========== 登录态续期 ==========
+# 客户端看不到 SESSDATA 的服务端到期时间，只能按"上次成功刷新的时间"记账提前续期：
+# 刷新会旋转 refresh_token（一次性），过频会踩风控，故默认 7 天一次。
+COOKIE_PROACTIVE_REFRESH = os.environ.get("COOKIE_PROACTIVE_REFRESH", "1") not in ("0", "false", "False")
+                                   # 启动时到期前主动续期（关闭则只在验证失败后才尝试刷新）
+COOKIE_REFRESH_INTERVAL_DAYS = int(os.environ.get("COOKIE_REFRESH_INTERVAL_DAYS", "7"))
+                                   # 距上次成功刷新超过该天数就续期一次；无 refresh_token 时自动跳过
+
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(REPORT_DIR, exist_ok=True)
 
@@ -138,6 +146,19 @@ MITM_MAX_UID = 10_000_000_000   # MITM 覆盖 ≤10 位 UID；长 UID 可明文�
 UID_VERIFY_EXISTS_TTL = 7 * 86400  # 存在名片缓存 7 天
 UID_VERIFY_MISSING_TTL = 3600     # 明确 -404 缓存 1 小时，风控/网络/空名片不缓存
 UID_VERIFY_FALLBACK_BUDGET = 50   # 一轮解析的单点补验请求上限，批量缺席也需单点确认
+UID_LEVEL_RETRY_ATTEMPTS = 2      # 存在账号但等级字段缺失时的总读取次数（含首次）
+# 终审复核（阶段9）：一个 mid_hash 解出多个 UID 且无明文可交叉验证时，在流程末尾逐一复核
+# 存在性。若出现"之前 404、现在又不是 404"的账号，说明此前那次 404 不可信（疑似风控），
+# 等待后继续复核，直到一轮内没有任何调整；仍为明确 -404 的候选累计确认达
+# UID_RECHECK_CONFIRMATIONS 次后标 final（彻底判定不存在，报告里不再作为候选展示）。
+# 必须有终止条件：单轮预算 + 最大轮数 + 风控熔断，未收敛的冷却后下次运行继续。
+UID_RECHECK_ENABLED = os.environ.get("UID_RECHECK_ENABLED", "1") not in ("0", "false", "False")
+UID_RECHECK_MAX_ROUNDS = 3          # 同进程最多复核轮数
+UID_RECHECK_INTERVAL = 90           # 轮间隔（秒）；仅在有调整/未查成、需要重试时等待
+UID_RECHECK_BUDGET = 50             # 单轮复核请求上限
+UID_RECHECK_COOLDOWN = 1800         # 未收敛时下次运行再复核的冷却（秒）
+UID_RECHECK_CONFIRMATIONS = 2       # 连续明确 -404 达该次数才判 final
+UID_RECHECK_FINAL_TTL = 30 * 86400  # final 结论 30 天后允许被新的"存在"结论覆盖
 UID_RESOLUTION_CACHE_TTL = 86400  # 解析结论一天复核；版本/证据变化立即失效
 UID_HARVEST_REFRESH_MAX_PAGES = 10  # 已完成 UID 收割后的刷新请求上限，按本视频评论 ID 停止
 UID_REPLY_TOTAL_PAGES = 10        # 每轮面向未关联兴趣 hash 的楼中楼 UID 补采总请求预算，0=关闭
@@ -191,6 +212,7 @@ SPAM_MEDIUM_THRESHOLD = (3, 0.5)   # (弹幕数, 重复率)：>2 条且半数重
 # 动态定员（兴趣命中者全进，仅超上限才按兴趣分截断）：上限随视频发送者规模浮动——
 # 小视频保底 FLOOR，大视频按独立发送者数 × RATIO 上浮，HARD_CAP 为防爆绝对天花板
 ANALYZE_USERS_FLOOR = 300        # 保底名额（小视频的默认上限）
+PROFILE_DEEP_MAX_USERS = 100     # 常规报告默认深度采集人数，其余已解析用户展示发言长条卡片
 ANALYZE_USERS_RATIO = 0.05       # 上限 = max(FLOOR, 独立发送者数 × 该比例)
 MAX_ANALYZE_USERS_HARD_CAP = 1000  # 绝对上限（保险丝；采集成本与风控暴露的硬约束）
 

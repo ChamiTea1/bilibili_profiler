@@ -1,5 +1,6 @@
 """按目标弹幕选人，复用采集/解析/画像流程，结果独立于常规视频报告。"""
 from collections import Counter, defaultdict
+from copy import deepcopy
 from datetime import datetime
 import csv
 import json
@@ -14,7 +15,8 @@ from storage import (init_db, load_senders, load_global_uid_map, save_uid_eviden
 from target_filter import analysis_id, make_selector, match_danmaku
 from target_lookup import collect_target_danmaku, probe_comment_uids
 from uid_evidence import add_uid
-from candidate_cards import prepare_candidate_reports
+from crc_candidates import visible_candidate_uids
+from candidate_cards import prepare_candidate_reports, recheck_ambiguous_candidates
 from uid_resolver import (METHOD_COMMENT_VERIFY, METHOD_AMBIGUOUS, calc_crc32, resolve_all_senders,
                           build_evidence_maps, resolution_is_current)
 
@@ -42,8 +44,26 @@ def resolve_targets(bvid: str, groups: dict, sources: list, pool, previous: dict
     return results
 
 
+def public_target_result(result: dict) -> dict:
+    """导出不包含 404/Lv0 候选资料；内部核验集合保留在命令行快照中用于续采。"""
+    public = deepcopy(result)
+    for sender in public.get("senders", []):
+        values = visible_candidate_uids(sender)
+        sender["candidates"] = values
+        record = sender.get("resolution") or {}
+        record["candidates"] = values
+        keep = {str(u) for u in values}
+        for key in ("candidate_status", "candidate_checked_at", "candidate_cards", "space_samples", "recheck_pending"):
+            if isinstance(record.get(key), dict):
+                record[key] = {k: v for k, v in record[key].items() if str(k) in keep}
+        if record.get("previous_uid") and str(record["previous_uid"]) not in keep:
+            record.pop("previous_uid", None)
+    return public
+
+
 def write_target_csv(result: dict, output) -> None:
     """写出当前快照，供 CLI 文件导出和 Web 即时下载共用。"""
+    result = public_target_result(result)
     profiles = {p["uid"]: p for p in result.get("profiles", [])}
     extra = ["匿名hash", "匹配方式", "筛选条件", "命中条数", "解析方式", "置信度", "候选UID", "状态", "命中样本", "目标评论"]
     writer = csv.DictWriter(output, fieldnames=list(_flatten_profile({})) + extra)
@@ -68,7 +88,7 @@ def export_target(result: dict, prefix: str) -> list[str]:
     with open(prefix + ".csv", "w", newline="", encoding="utf-8-sig") as f:
         write_target_csv(result, f)
     with open(prefix + ".json", "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2, default=str)
+        json.dump(public_target_result(result), f, ensure_ascii=False, indent=2, default=str)
     return [os.path.basename(prefix + ext) for ext in (".csv", ".json")]
 
 
@@ -227,6 +247,15 @@ def run_target_analysis(bvid: str, selector: dict, force: bool = False, max_user
             checkpoint(resolved)
             timer.run("候选报告资料", prepare_candidate_reports, resolved, pool,
                       on_progress=lambda *_: checkpoint(resolved, profiles), cache_only=skip_collect)
+            # 与常规分析相同：终审必须在目标模式的用户采集/画像之前完成，
+            # 否则新收敛的 UID 本轮没有画像，撤销的 UID 仍会被采集。
+            recheck_stats = timer.run(
+                "候选终审复核", recheck_ambiguous_candidates, resolved, pool,
+                on_progress=lambda *_: checkpoint(resolved, profiles))
+            if recheck_stats.get("targets"):
+                print(f"[Target] 候选终审复核：目标 {recheck_stats['targets']}，"
+                      f"复核 {recheck_stats['checked']}，调整 {recheck_stats['flipped']}，"
+                      f"终审排除 {recheck_stats['finalized']}，待下轮 {recheck_stats['pending']}")
             checkpoint(resolved, profiles)
             known_uids = {info["uid"] for info in resolved.values()
                           if info.get("uid") and info.get("confidence") in ("高", "中")}

@@ -54,7 +54,8 @@ from config import (REPORT_DIR, DATA_DIR, LLM_API_KEY, HISTORY_MAX_MONTHS, HISTO
                      REPLY_TREE_MAX_DEPTH, WEB_JOB_MAX_KEPT, ANALYZE_MAX_TARGETS,
                      REPEAT_EVENT_TOP_N, BLOCKLIST_MAX_UIDS,
                      DENSITY_PEAK_MAX, DENSITY_PEAK_MIN_COUNT, DENSITY_PEAK_SAMPLE)
-from auth import load_cookie, verify_cookie, _try_refresh_cookie
+from auth import (load_cookie, verify_cookie, _try_refresh_cookie, _pop_local_fields,
+                  REFRESH_OK, REFRESH_DEAD, REFRESH_NONE)
 from api_client import BiliAPIClient
 import config as _config
 from storage import get_db, init_db, load_video_profile, ensure_video_profiles, load_comments, load_user_data
@@ -63,12 +64,13 @@ from storage import (load_senders, load_global_uid_map,
                      delete_video_data, toggle_false_positive, load_false_positives,
                      load_faces, load_face_cached_uids, save_face,
                      load_llm_cache, save_llm_cache)
-from storage import (load_target_analysis, list_target_analyses, load_uid_space_cache,
+from storage import (load_target_analysis, list_target_analyses,
                      has_normal_report, NORMAL_REPORT_PREDICATE, load_danmaku,
-                     load_danmaku_problems, load_uid_verify_cache, load_uid_candidates, load_uid_verify_times)
+                     load_danmaku_problems, load_uid_verify_verdicts,
+                     load_uid_candidates, load_uid_verify_times)
 from target_report import render_target_report, render_target_list_page, page_number, render_space_assessment
 from candidate_space import candidate_uids, cached_assessments
-from crc_candidates import is_pure_crc, build_crc_groups, render_crc_groups, render_crc_group
+from crc_candidates import visible_candidate_uids, is_pure_crc, build_crc_groups, render_crc_groups, render_crc_group
 from main import run_analysis
 from uid_resolver import (resolve_sender, METHOD_CRC32_CRACK, build_evidence_maps,
                           resolution_is_current, resolution_record, VerificationBudget)
@@ -81,9 +83,10 @@ from spam_detector import batch_detect_spam, detect_repeat_events, pool_distribu
 from cringe_detector import detect_density_peaks, load_cached_danmaku_problems
 from llm_analyzer import LLMAnalyzer
 from up_analyzer import _tokenize
-from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summary_stats,
+from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summary_stats, uid_linkable,
                     generate_chart_data, generate_cringe_board, sort_profiles_by_risk,
-                    up_wordcloud_data, PROBLEM_CATEGORY_COLORS, _category_chips)
+                    up_wordcloud_data, PROBLEM_CATEGORY_COLORS, _category_chips,
+                    mask_reply_prefix)
 from long_image import build_payload, render_long_image
 
 app = Flask(__name__)
@@ -167,10 +170,11 @@ def _db_guard(view):
             return _db_error_page(), 503
     return wrapper
 
-# 报告页整页 HTML 内存缓存：(bvid, 遮蔽开关) → (数据指纹, HTML)。避免每次刷新重跑
-# _load_profiles/_attach_other_videos 逐用户查询串；job 完成/删除/误报标记时主动失效，
-# 指纹比对兜底外部进程（CLI run.py）写入的数据变化
-_PAGE_CACHE: dict[tuple[str, bool], tuple[tuple, str]] = {}
+# 报告页整页 HTML 内存缓存：(bvid, 遮蔽开关) → (数据指纹, HTML, 渲染时刻)。
+# 避免每次刷新重跑 _load_profiles/_attach_other_videos 逐用户查询串；
+# job 完成/删除/误报标记时主动失效，指纹比对兜底外部进程写入。
+# 渲染时刻超过 1 小时（或更短的 UID 存在性核验 TTL）也当未命中，避免过期 UID 仍可点击。
+_PAGE_CACHE: dict[tuple[str, bool], tuple] = {}
 _PAGE_CACHE_LOCK = threading.Lock()
 
 
@@ -189,6 +193,30 @@ def _page_fingerprint(bvid: str) -> tuple:
                                   "ORDER BY scope", (bvid,)).fetchall())
 
 
+def _page_cache_max_age() -> float:
+    """整页缓存最长寿命：1 小时，且不超过 UID 存在性核验 TTL（更短则提前重渲染）。"""
+    try:
+        verify_ttl = float(getattr(_config, "UID_VERIFY_EXISTS_TTL", 3600))
+    except (TypeError, ValueError):
+        verify_ttl = 3600.0
+    return min(3600.0, max(0.0, verify_ttl))
+
+
+def _page_cache_lookup(bvid: str, mask: bool, page_fp: tuple) -> str | None:
+    """命中条件：同一遮蔽版本、数据修订号未变、且未超过缓存寿命。否则当未命中。"""
+    with _PAGE_CACHE_LOCK:
+        cached = _PAGE_CACHE.get((bvid, mask))
+    if not cached or cached[0] != page_fp or len(cached) < 3:
+        return None
+    try:
+        rendered_at = float(cached[2])
+    except (TypeError, ValueError):
+        return None
+    if time.time() - rendered_at >= _page_cache_max_age():
+        return None
+    return cached[1]
+
+
 # ========== 手动勾选分析 job（spec B；状态存内存 dict，服务重启即失效——spec 已接受） ==========
 
 JOBS: dict[str, dict] = {}
@@ -202,14 +230,14 @@ class CookieInvalidError(Exception):
     """Cookie 缺失/失效：POST 返回 503，job 启动即整体终止"""
 
 
-def _get_client() -> BiliAPIClient:
+def _get_client(*, mark_failed: bool = True) -> BiliAPIClient:
     """懒加载创建带登录态的 BiliAPIClient（auth.load_cookie 读 data/cookie.json +
     verify_cookie 联网校验）；失败抛 CookieInvalidError（携带 503 文案），由路由按 503 处理。
 
-    失效判定（对齐 auth.login_by_qrcode 口径）：Cookie 文件缺失/损坏直接判定失效；
-    验证失败但有 refresh_token 时先 _try_refresh_cookie 刷新再重验——verify_cookie 对
-    网络抖动也返回 False，刷新路径本身是一次额外联网确认，只有刷新后仍失败（或无
-    refresh_token）才置 _client_failed 粘性标记，避免单次抖动误判为永久失效。"""
+    verify_cookie 在网络异常时也返回 False，_try_refresh_cookie 的 REFRESH_RETRY
+    在布尔上下文里同样为假。这两类都不得置粘性 _client_failed，下次请求再试。
+    只有 REFRESH_DEAD，或确实没有可用登录态（无 SESSDATA，或 REFRESH_NONE 且验证失败）
+    才置粘性标记。mark_failed=False 供启动热身使用：热身失败一律不置粘性标记。"""
     global _client, _client_failed
     with _CLIENT_LOCK:
         if _client is not None:
@@ -218,24 +246,41 @@ def _get_client() -> BiliAPIClient:
             raise CookieInvalidError("Cookie 失效，请先运行 python login.py")
         cookie_dict = load_cookie()
         if not cookie_dict or not cookie_dict.get("SESSDATA"):
-            _client_failed = True
+            if mark_failed:
+                _client_failed = True
             raise CookieInvalidError("Cookie 失效，请先运行 python login.py")
-        refresh_token = cookie_dict.pop("_refresh_token", None)
+        # 本地伪字段必须弹出，不能进 session；时间戳留给续期节流
+        refresh_token, stamp = _pop_local_fields(cookie_dict)
         client = BiliAPIClient()
         client.update_cookies(cookie_dict)
         if refresh_token:
             client._refresh_token = refresh_token
+        if stamp:
+            client._refreshed_at = stamp
         if verify_cookie(client):
             _client = client
             return _client
-        # 验证失败但 refresh_token 可能仍有效：先尝试刷新再重验
-        if refresh_token and _try_refresh_cookie(client) and verify_cookie(client):
+        # 验证失败：有令牌才尝试刷新。网络失败是 REFRESH_RETRY，不得当成令牌作废。
+        result = _try_refresh_cookie(client) if refresh_token else REFRESH_NONE
+        if result == REFRESH_OK and verify_cookie(client):
             _client = client
             return _client
-        _client_failed = True
-        if refresh_token:
+        sticky = result == REFRESH_DEAD or result == REFRESH_NONE
+        if sticky and mark_failed:
+            _client_failed = True
+        if result == REFRESH_DEAD:
             raise CookieInvalidError("Cookie 失效且刷新失败，请先运行 python login.py")
-        raise CookieInvalidError("Cookie 失效，请先运行 python login.py")
+        if result == REFRESH_NONE:
+            raise CookieInvalidError("Cookie 失效，请先运行 python login.py")
+        raise CookieInvalidError("登录态暂时无法确认（网络异常），请稍后重试")
+
+
+def _warm_client():
+    """启动热身：提前拉 buvid3/bili_ticket/WBI。失败（含网络抖动）不得置粘性失效标记。"""
+    try:
+        _get_client(mark_failed=False).get(NAV_URL, immediate=True)
+    except Exception:
+        pass
 
 
 # 账号×IP 组合池懒加载单例：小号池发现/（配 SUB_URLS 时）IP 池探测与 mihomo 核心
@@ -314,8 +359,13 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
 
     cached = {r["mid_hash"]: r for r in load_senders(bvid)}
     video_info = load_video_info(bvid) or {}
+    # 评论只读一次，按 uid 分组供循环内取「TA 的评论」；不要在每个 mid_hash 里再 load_comments
+    all_comments = load_comments(bvid)
     plain_uid_map, method_map = build_evidence_maps(bvid,
-        [("评论区验证", build_comment_uid_map(load_comments(bvid)))], load_global_uid_map())
+        [("评论区验证", build_comment_uid_map(all_comments))], load_global_uid_map())
+    comments_by_uid: dict[int, list] = {}
+    for c in all_comments:
+        comments_by_uid.setdefault(c["uid"], []).append(c)
     # LLM 深掘器：未配置 LLM_API_KEY 时跳过（spec 3.3）；初始化失败也只跳过深掘
     analyzer = None
     if LLM_API_KEY:
@@ -362,7 +412,7 @@ def _run_analysis_job(job_id: str, bvid: str, mid_hashes: list[str]):
                 continue
             user_data = dict(user_data)
             user_data.pop("ip_location", None)
-            mine_comments = [c for c in load_comments(bvid) if c["uid"] == uid]
+            mine_comments = comments_by_uid.get(uid, [])
             location = next((c["location"] for c in mine_comments if c.get("location")), "")
             if location:
                 user_data["ip_location"] = location
@@ -459,6 +509,7 @@ def _load_profiles(bvid: str) -> list[dict]:
         p["resolve_method"] = r["method"] or ""
         p["resolve_confidence"] = r["confidence"] or ""
         resolution = json.loads(r["resolution_json"] or "{}")
+        p["_resolution"] = resolution      # 供 report.uid_linkable 判定该 UID 能否给跳转
         p["collision_risk"] = resolution.get("collision_risk", r["method"] == METHOD_CRC32_CRACK)
         p["resolve_reason"] = resolution.get("reason", "")
         p["collected_at"] = r["collected_at"] or ""
@@ -638,9 +689,11 @@ def _sender_meta(bvid: str) -> dict:
         spam_level = r["spam_level"]
         if fp_spam and r["mid_hash"] in fp_spam:
             spam_level = "低"   # 刷屏判定人工误报：展示层降级（与用户卡片/统计图同口径）
-        # 隐藏信息（mask Cookie）：昵称只留末字（影响弹幕浏览器 Top10 与 API 行内昵称）
-        name = _mask_name(r["name"]) if _mask_on() else r["name"]
-        meta[r["mid_hash"]] = {"uid": r["uid"], "name": name,
+        # 隐藏信息（mask Cookie）：展示名只留末字。raw_name 只留在服务端供搜索比对，
+        # 不得放进响应 JSON（否则遮蔽形同虚设）。
+        raw_name = r["name"]
+        name = _mask_name(raw_name) if _mask_on() else raw_name
+        meta[r["mid_hash"]] = {"uid": r["uid"], "name": name, "raw_name": raw_name,
                                "spam_level": spam_level, "categories": categories}
     return meta
 
@@ -657,8 +710,10 @@ def _danmaku_panel_stats(bvid: str) -> dict:
             (bvid,)).fetchone()[0]
         senders_total = conn.execute(
             "SELECT COUNT(DISTINCT mid_hash) FROM danmaku WHERE bvid = ?", (bvid,)).fetchone()[0]
+        # 与解析质量区块同口径：cmt: 合成键是问题评论作者，不是弹幕发送者
         resolved = conn.execute(
-            "SELECT COUNT(*) FROM senders WHERE bvid = ? AND uid IS NOT NULL", (bvid,)).fetchone()[0]
+            "SELECT COUNT(*) FROM senders WHERE bvid = ? AND uid IS NOT NULL "
+            "AND mid_hash NOT LIKE 'cmt:%'", (bvid,)).fetchone()[0]
         top10 = conn.execute('''
             SELECT mid_hash, COUNT(*) AS cnt FROM danmaku WHERE bvid = ?
             GROUP BY mid_hash ORDER BY cnt DESC LIMIT 10
@@ -1015,6 +1070,38 @@ def _danmaku_density(bvid: str, duration, video_info: dict | None = None) -> dic
             "pages": pages, "default": default}
 
 
+_PEAK_FLIGHT_GUARD = threading.Lock()
+_PEAK_FLIGHTS: dict[str, dict] = {}
+
+
+def _detect_density_peaks_once(bvid: str, peaks_payload: list, video_info: dict) -> dict:
+    """按 bvid 单飞：同一视频同时只有一次 detect_density_peaks。失败返回空 dict，不标注。"""
+    with _PEAK_FLIGHT_GUARD:
+        flight = _PEAK_FLIGHTS.get(bvid)
+        if flight is None:
+            flight = {"event": threading.Event(), "result": {}}
+            _PEAK_FLIGHTS[bvid] = flight
+            owner = True
+        else:
+            owner = False
+    if not owner:
+        flight["event"].wait()
+        return flight["result"] if isinstance(flight.get("result"), dict) else {}
+    try:
+        try:
+            result = detect_density_peaks(bvid, peaks_payload, video_info)
+        except Exception as e:
+            print(f"[Web] 高能点标注失败（{bvid}）: {e}")
+            result = {}
+        flight["result"] = result if isinstance(result, dict) else {}
+        return flight["result"]
+    finally:
+        flight["event"].set()
+        with _PEAK_FLIGHT_GUARD:
+            if _PEAK_FLIGHTS.get(bvid) is flight:
+                _PEAK_FLIGHTS.pop(bvid, None)
+
+
 def _annotate_density_peaks(bvid: str, density: dict | None, video_info: dict) -> dict | None:
     """密度时间轴高能点标注：峰值桶取弹幕样本喂 LLM 判断爆发原因，原地挂到各 page。
 
@@ -1061,7 +1148,8 @@ def _annotate_density_peaks(bvid: str, density: dict | None, video_info: dict) -
                                   "_page": pi, "_bucket": b})
 
     # 3) LLM 标注（cringe_detector：缓存/降级/幻觉编号过滤都在里面）
-    verdicts = detect_density_peaks(bvid, peaks_payload, video_info) if peaks_payload else {}
+    # 同一视频并发打开报告时合并为一次调用；失败仍不标注
+    verdicts = _detect_density_peaks_once(bvid, peaks_payload, video_info) if peaks_payload else {}
     for p in peaks_payload:
         v = verdicts.get(p["idx"])
         if not v:
@@ -1100,6 +1188,11 @@ def _danmaku_attr_stats(bvid: str) -> dict | None:
     }
 
 
+def _comment_author_key(mid_hash) -> bool:
+    """问题评论作者的合成键 cmt:{uid}。弹幕面板「已解析发送者」与解析质量区块都要排除。"""
+    return str(mid_hash or "").startswith("cmt:")
+
+
 def _resolve_quality(bvid: str) -> dict | None:
     """概览页「解析质量」区块：用户身份可信度——解析方式分布（评论验证/全局库/CRC32反查
     等）、置信度分布、碰撞风险人数（CRC32 反查存在撞库误识别风险）。
@@ -1132,10 +1225,10 @@ def _resolve_quality(bvid: str) -> dict | None:
         "conf_labels": [c for c in conf_order if c in confs],
         "conf_data": [confs[c] for c in conf_order if c in confs],
         "collision": collision,
-        "resolved": sum(r["uid"] is not None and not r["mid_hash"].startswith("cmt:") for r in rows),
+        "resolved": sum(r["uid"] is not None and not _comment_author_key(r["mid_hash"]) for r in rows),
         "ambiguous": sum(r["method"] == "候选歧义" for r in rows),
         "pending": sum(r["method"] == "待验证" for r in rows),
-        "comment_authors": sum(r["mid_hash"].startswith("cmt:") for r in rows),
+        "comment_authors": sum(_comment_author_key(r["mid_hash"]) for r in rows),
         "total_senders": total_senders,
     }
 
@@ -1277,6 +1370,20 @@ def _apply_danmaku_fp(profiles: list[dict], fp_dm: set[str]) -> list[str]:
         cr["items"] = kept
         p["cringe"] = cr
     return used
+
+
+def _apply_spam_fp(profiles: list[dict], fp_spam: set[str]) -> None:
+    """刷屏判定人工误报：展示层把命中发送者降为低风险（库内原始值不动）。
+
+    网页报告与分享长图共用，保证高风险刷屏人数和用户卡徽标一致。"""
+    if not fp_spam:
+        return
+    for p in profiles:
+        mh = (p.get("danmaku") or {}).get("mid_hash") or p.get("_mid_hash") or ""
+        if mh and mh in fp_spam:
+            dm = p.setdefault("danmaku", {})
+            dm["spam_level"] = "低"
+            dm["spam_fp"] = True
 
 
 def _fp_dm_block(fp_contents: list[str]) -> str:
@@ -1462,6 +1569,49 @@ def _truncate(text: str, limit: int = 80) -> str:
 
 # ========== 隐藏信息开关（Cookie mask=1，全站展示层遮蔽昵称/UID） ==========
 
+def _light_user_cards(bvid: str, profiles: list, mask: bool, fp: set) -> str:
+    """未生成深度画像的已解析用户展示本视频发言，只读数据库，不补采。"""
+    covered = {p.get("uid") for p in profiles}
+    grouped = {}
+    for sender in load_senders(bvid):
+        uid = sender.get("uid")
+        if not uid or uid in covered:
+            continue
+        item = grouped.setdefault(uid, {"sender": sender, "contents": [], "count": 0})
+        item["contents"].extend(sender.get("contents") or [])
+        item["count"] += sender.get("danmaku_count", 0)
+    if not grouped:
+        return ""
+    comments = {}
+    for comment in load_comments(bvid):
+        if comment["uid"] in grouped:
+            comments.setdefault(comment["uid"], []).append(comment)
+    result = []
+    for uid, item in sorted(grouped.items(), key=lambda pair: pair[1]["count"], reverse=True):
+        sender = item["sender"]
+        record = sender.get("resolution") or {}
+        card = (record.get("candidate_cards") or {}).get(str(uid)) or {}
+        replies = comments.get(uid, [])
+        name = card.get("name") or next((c.get("uname") for c in replies if c.get("uname")), None) or f"用户 {uid}"
+        shown_name = _mask_name(name) if mask else name
+        shown_uid = _mask_uid(uid) if mask else uid
+        linkable = uid_linkable({"uid": uid, "resolve_method": sender.get("method"), "_resolution": record})
+        tag = "a" if linkable else "div"
+        attrs = f' href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener noreferrer"' if linkable else ""
+        texts = list(dict.fromkeys(item["contents"]))[:10]
+        replies = replies[:10]
+        dm = "".join(f"<li>{esc(text)}</li>" for text in texts)
+        cmt = "".join(f"<li>{esc(mask_reply_prefix(c['content'], mask, _mask_name))}</li>" for c in replies)
+        spam = "低" if ("spam", sender["mid_hash"]) in fp else sender.get("spam_level", "低")
+        result.append(f'''<article class="user-card light-user-card" id="uid-{uid}"
+            data-danmaku-count="{item['count']}" data-spam="{esc(spam)}" data-spam-score="{sender.get('spam_score', 0)}">
+            <{tag}{attrs} class="light-user-link"><strong class="username">{esc(shown_name)}</strong>
+            <span class="uid">UID:{esc(shown_uid)}</span><span>未深度采集 · 弹幕 {item['count']} 条 · 评论 {len(replies)} 条</span>
+            <h4>弹幕</h4><ul>{dm or '<li>无弹幕记录</li>'}</ul>
+            <h4>评论</h4><ul>{cmt or '<li>本视频已采评论中无记录</li>'}</ul></{tag}></article>''')
+    return "".join(result)
+
+
 def _mask_on() -> bool:
     """隐藏信息开关是否开启（Cookie mask=1）；无请求上下文（后台线程/直调）时不遮蔽"""
     try:
@@ -1485,6 +1635,11 @@ def _mask_uid(uid) -> str:
     if len(s) <= 3:
         return s
     return s[:3] + "*" * (len(s) - 3)
+
+
+def _mask_reply_text(text) -> str:
+    """隐藏信息开启时，遮蔽楼中楼正文开头「回复 @昵称」里的昵称（规则同 _mask_name）。"""
+    return mask_reply_prefix(text, _mask_on(), _mask_name)
 
 
 def _attack_focus_html(data: dict) -> str:
@@ -1593,11 +1748,12 @@ def _attack_focus_html(data: dict) -> str:
     </div>'''
 
 
-def _problem_comment_board(bvid: str, fp_cmt: set[str]) -> tuple[list[dict], list[dict]]:
+def _problem_comment_board(bvid: str, fp_cmt: set[str]) -> tuple[list[dict], list[dict], int]:
     """问题评论榜（P1-b）：全部问题评论按热度（点赞 + 回复数×权重）降序，高热度优先。
 
     楼中楼评论（is_sub）附被回复的父评论原文/作者，供判断语境。
-    返回 (未标记误报的 Top N 条目, 已标记误报的条目)；后者供底部撤销入口。"""
+    返回 (未标记误报的 Top N 条目, 已标记误报的条目, 扣除误报后的总数)；
+    后者供底部撤销入口，总数给长图总览（不能用截断后的列表长度）。"""
     with closing(get_db()) as conn:
         rows = conn.execute('''
             SELECT c.rpid, c.uid, c.uname, c.content, c.ctime, c.like, c.reply_count,
@@ -1628,7 +1784,9 @@ def _problem_comment_board(bvid: str, fp_cmt: set[str]) -> tuple[list[dict], lis
         (marked if str(r["rpid"]) in fp_cmt else items).append(it)
     items.sort(key=lambda x: -x["heat"])
     marked.sort(key=lambda x: -x["heat"])
-    return items[:PROBLEM_COMMENT_TOP_N], marked
+    # 总数是扣除误报后的全量，榜单仍只返回前 N 条（长图总览用总数，不能用截断长度）
+    total = len(items)
+    return items[:PROBLEM_COMMENT_TOP_N], marked, total
 
 
 def _problem_comment_board_html(items: list[dict], marked: list[dict], aid, up_mid: int) -> str:
@@ -1651,7 +1809,7 @@ def _problem_comment_board_html(items: list[dict], marked: list[dict], aid, up_m
                title="查看该用户在已分析视频中的互动时间线">{esc(it["name"])}</a>{_role_badges(it["uid"], 0, up_mid)}
             {_problem_chip(it["problem"], is_marked)}{_fp_btn("cmt", it["rpid"], is_marked)}
             <span class="dm-time">热度 {it["heat"]:,}（👍{it["like"]:,} + 💬{it["reply_count"]:,}×{COMMENT_HEAT_REPLY_WEIGHT}）· {date}</span>
-            {origin}{parent_html}<br>{sub_mark}{esc(it["content"])}</li>'''
+            {origin}{parent_html}<br>{sub_mark}{esc(_mask_reply_text(it["content"]))}</li>'''
 
     body = "".join(_row(it, False) for it in items)
     marked_html = ""
@@ -1896,7 +2054,7 @@ def _reply_tree_html(subs: list[dict], root_uid: int, up_mid: int, fp_cmt: set[s
         fp = _fp_btn("cmt", node["rpid"], marked) if node["problem"] else ""
         return (f'<li><div class="hot-reply"><span class="hot-sub-author">{esc(node["name"])}</span>'
                 f'{_role_badges(node["uid"], root_uid, up_mid)}'
-                f'：{esc(node["content"])} <span class="dm-time">👍{node["like"]:,}</span>'
+                f'：{esc(_mask_reply_text(node["content"]))} <span class="dm-time">👍{node["like"]:,}</span>'
                 f'{_problem_chip(node["problem"], marked)}{fp}</div>{sub_ul}</li>')
 
     html = "".join(render(s, 0) for s in roots)
@@ -1923,7 +2081,8 @@ def _cmt_war_html(bvid: str, aid: int | None, fp_cmt: set[str] = frozenset()) ->
         up_mid = int((json.loads(vrow["video_info_json"]).get("owner") or {}).get("mid", 0)) if vrow else 0
     except Exception:
         up_mid = 0
-    return _problem_comment_board_html(*_problem_comment_board(bvid, fp_cmt), aid, up_mid) \
+    items, marked, _total = _problem_comment_board(bvid, fp_cmt)
+    return _problem_comment_board_html(items, marked, aid, up_mid) \
         or '<p class="empty-note">本视频无问题评论命中</p>'
 
 
@@ -2001,7 +2160,7 @@ def _hot_comments_html(bvid: str, aid: int | None, fp_cmt: set[str] = frozenset(
                     {_fp_btn("cmt", it["rpid"], it_marked) if it["problem"] else ""}
                     {origin}
                 </div>
-                <div class="hot-content">{esc(it["content"])}</div>
+                <div class="hot-content">{esc(_mask_reply_text(it["content"]))}</div>
                 {subs_html}
             </div>''')
     problem_note = f' · 其中问题评论 {problem_total} 条已标注' if problem_total else ""
@@ -2267,10 +2426,15 @@ def _low_conf_tab_html(bvid: str) -> tuple[str, int]:
     for r in rows:
         uid = r["uid"]
         uid_disp = _mask_uid(uid) if mask else str(uid)
-        uid_html = (f'<a href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener">UID:{esc(uid_disp)}</a>'
-                    if uid is not None else '<span>尚未确定 UID</span>')
-        record = json.loads(r["resolution_json"] or "{}")
-        candidate_html = "、".join(esc(_mask_uid(u) if mask else str(u)) for u in record.get("candidates", []))
+        record = json.loads(r["resolution_json"] or "{}")   # 先解析，链接判定要用它
+        # 只有能确认账号存在的 UID 才给跳转——报告里不得出现点进去 404 的账号
+        if uid is None:
+            uid_html = '<span>尚未确定 UID</span>'
+        elif uid_linkable({"uid": uid, "resolve_method": r["method"], "_resolution": record}):
+            uid_html = f'<a href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener">UID:{esc(uid_disp)}</a>'
+        else:
+            uid_html = f'<span title="存在性未确认或核验已过期，不提供跳转">UID:{esc(uid_disp)}</span>'
+        candidate_html = "、".join(esc(_mask_uid(u) if mask else str(u)) for u in visible_candidate_uids({"mid_hash": r["mid_hash"], "resolution": record}))
         reason_html = f'<div class="chart-hint">{esc(record.get("reason", ""))}'
         if candidate_html:
             reason_html += f' · 候选（未确认身份）：{candidate_html}'
@@ -2326,8 +2490,10 @@ def _crc_candidate_data(bvid: str, target_record: dict | None = None,
             groups.setdefault(dm["mid_hash"], {"contents": []})["contents"].append(dm["content"])
         problems = load_cached_danmaku_problems(rows, groups, bvid)
     uids = sorted({u for s in senders if is_pure_crc(s) for u in candidate_uids(s)})
-    verifications = load_uid_verify_cache(uids, getattr(_config, "UID_VERIFY_EXISTS_TTL", 604800),
-                                        getattr(_config, "UID_VERIFY_MISSING_TTL", 3600))
+    # 展示用"全部结论"（含已过期）：过期只标待复核，绝不把"已确认不存在"当成未知，
+    # 否则它会被重新渲染成可点击名片 → 点进去 404。
+    verifications = load_uid_verify_verdicts(uids, getattr(_config, "UID_VERIFY_EXISTS_TTL", 604800),
+                                             getattr(_config, "UID_VERIFY_MISSING_TTL", 3600))
     groups = build_crc_groups(senders, rows, problems, load_false_positives(bvid), verifications,
                               target_record["result"].get("matches", []) if target_record else None,
                               load_uid_verify_times(uids), include_resolved=include_resolved)
@@ -2361,10 +2527,9 @@ def video_page(bvid: str):
         return redirect("/targets")
     page_fp = _page_fingerprint(bvid)
     mask = _mask_on()   # 隐藏信息开关：开/关两版页面分开缓存，防串味
-    with _PAGE_CACHE_LOCK:
-        cached = _PAGE_CACHE.get((bvid, mask))
-    if cached is not None and cached[0] == page_fp:
-        return cached[1]
+    cached_html = _page_cache_lookup(bvid, mask, page_fp)
+    if cached_html is not None:
+        return cached_html
 
     row = _load_video_row(bvid)
     if row is None:
@@ -2385,18 +2550,13 @@ def video_page(bvid: str):
     fp_dm_used = _apply_danmaku_fp(profiles, fp_dm)
     # 刷屏判定人工误报（kind=spam，粒度=该视频该发送者）：展示层降级为低风险，
     # 统计图/筛选/排序随之不计入（与 dm/cmt 误报同口径），库内原始值不动
-    fp_spam = {t for k, t in fp if k == "spam"}
-    if fp_spam:
-        for p in profiles:
-            mh = (p.get("danmaku") or {}).get("mid_hash") or p.get("_mid_hash") or ""
-            if mh and mh in fp_spam:
-                dm = p.setdefault("danmaku", {})
-                dm["spam_level"] = "低"
-                dm["spam_fp"] = True
+    _apply_spam_fp(profiles, {t for k, t in fp if k == "spam"})
     profiles = sort_profiles_by_risk(profiles)
     stats = generate_summary_stats(profiles)
     chart = generate_chart_data(profiles)
-    cards_html = "".join(generate_user_card(p) for p in profiles) or '<p class="empty-note">暂无画像数据</p>'
+    cards_html = "".join(generate_user_card(p, mask=mask, mask_name=_mask_name) for p in profiles)
+    cards_html += _light_user_cards(bvid, profiles, mask, fp)
+    cards_html = cards_html or '<p class="empty-note">暂无已解析用户数据</p>'
     hot_tab = _hot_comments_html(bvid, row["aid"], fp_cmt)   # 高回复评论页（潜在争执热点）
     attack_tab = _attack_focus_tab_html(bvid, fp_cmt)        # 争执焦点页（谁攻击谁+连线）
     cmtwar_tab = _cmt_war_html(bvid, row["aid"], fp_cmt)     # 问题评论榜（热度加权）
@@ -2721,7 +2881,7 @@ def video_page(bvid: str):
     with _PAGE_CACHE_LOCK:
         # 不设条目上限：缓存规模随使用者浏览过的视频数增长，由使用者自行取舍；
         # 正确性不依赖淘汰——每条都带数据指纹，落后即重渲染，job/删除/误报也会主动失效
-        _PAGE_CACHE[(bvid, mask)] = (page_fp, html)
+        _PAGE_CACHE[(bvid, mask)] = (page_fp, html, time.time())
     return html
 
 
@@ -2762,7 +2922,7 @@ def user_page(uid: int):
                 '<li class="ov-none">弹幕明细未留存（该视频为旧版本分析）</li>'
                 if it["dm_count"] else '<li class="ov-none">无弹幕样本</li>')
             cmt_html = "".join(
-                f'<li>{esc(s["content"])} <span class="tl-time">{_fmt_ts(s["ts"])}</span></li>'
+                f'<li>{esc(_mask_reply_text(s["content"]))} <span class="tl-time">{_fmt_ts(s["ts"])}</span></li>'
                 for s in it["cmt_samples"]) or '<li class="ov-none">无评论</li>'
             items.append(f'''
                 <div class="tl-item">
@@ -2902,18 +3062,28 @@ def api_delete_video(bvid: str):
     """删除该视频的全部分析数据与导出文件（spec 9：含共享缓存，不可恢复；有任务在跑则 409）"""
     if _load_video_row(bvid) is None:
         return jsonify({"error": "未知视频"}), 404
-    if _has_running_job(bvid):
-        return jsonify({"error": "该视频有正在运行的任务，请等待完成后再删除"}), 409
-    counts = delete_video_data(bvid)
-    _invalidate_page_cache(bvid)
-    removed_files = 0
-    for ext in ("csv", "json"):
-        # bvid 来自路由参数：glob.escape 防通配符注入匹配到他视频文件
-        for prefix in ("report", "target"):
-            for f in glob.glob(os.path.join(REPORT_DIR, f"{prefix}_{glob.escape(bvid)}_*.{ext}")):
-                os.remove(f)
-                removed_files += 1
-    return jsonify({"ok": True, "removed_files": removed_files, **counts})
+    # 与分析/重跑同一把锁内占位，消除「先查运行中再删除」的窗口
+    job_id, reject = _try_register_job("delete", bvid, total=1, current="删除中")
+    if job_id is None:
+        return jsonify({"error": reject or "该视频有正在运行的任务，请等待完成后再删除"}), 409
+    try:
+        counts = delete_video_data(bvid)
+        _invalidate_page_cache(bvid)
+        removed_files = 0
+        for ext in ("csv", "json"):
+            # bvid 来自路由参数：glob.escape 防通配符注入匹配到他视频文件
+            for prefix in ("report", "target"):
+                for f in glob.glob(os.path.join(REPORT_DIR, f"{prefix}_{glob.escape(bvid)}_*.{ext}")):
+                    os.remove(f)
+                    removed_files += 1
+        return jsonify({"ok": True, "removed_files": removed_files, **counts})
+    finally:
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if job is not None:
+                job["finished"] = True
+                job["done"] = 1
+                job["current"] = ""
 
 
 def _run_regen_job(job_id: str, bvid: str):
@@ -2978,7 +3148,9 @@ def api_false_positive(bvid: str):
     报告页缓存即时失效。llm_cache 不动——误报是人工覆盖层，跨 --force 重跑保留。"""
     if _load_video_row(bvid) is None:
         return jsonify({"error": "未知视频"}), 404
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "参数错误：请求体须为 JSON 对象"}), 400
     kind = data.get("kind")
     target = str(data.get("target") or "")
     if kind not in ("dm", "cmt", "spam") or not target:
@@ -3166,6 +3338,7 @@ def api_longimage(bvid: str):
     # 注意：_apply_danmaku_fp 是**就地**扣除误报弹幕，返回的是"被扣除的误报内容列表"
     # （供榜单底部撤销入口），不能拿返回值当 profiles——否则画像/榜单会整段消失
     _apply_danmaku_fp(profiles, fp_dm)
+    _apply_spam_fp(profiles, {t for k, t in fp if k == "spam"})
     profiles = sort_profiles_by_risk(profiles)
     stats = generate_summary_stats(profiles)
     chart = generate_chart_data(profiles)
@@ -3177,11 +3350,13 @@ def api_longimage(bvid: str):
     cringe_entries.sort(key=lambda p: ((p.get("cringe") or {}).get("max_severity", 0),
                                        (p.get("cringe") or {}).get("count", 0)), reverse=True)
     attack = _attack_focus(bvid, fp_cmt)
-    problem_comments, _marked = _problem_comment_board(bvid, fp_cmt)
+    problem_comments, _marked, comment_total = _problem_comment_board(bvid, fp_cmt)
     repeat_events, _dist = _repeat_events_data(bvid)
     low_conf = _low_conf_tab_html(bvid)[1]
     payload = build_payload(bvid, video_info, profiles, stats, chart, cringe_entries,
-                            attack, problem_comments, repeat_events, low_conf)
+                            attack, problem_comments, repeat_events, low_conf,
+                            mask=_mask_on(), mask_name=_mask_name,
+                            comment_total=comment_total)
     try:
         img = render_long_image(payload)
     except Exception as e:
@@ -3263,7 +3438,10 @@ def api_danmaku(bvid: str):
         if len(sender) == 8 and all(c in "0123456789abcdef" for c in sender.lower()):
             hashes.add(sender.lower())
         for h, m in meta.items():
-            if m["name"] == sender or (m["uid"] is not None and str(m["uid"]) == sender):
+            # 比对原始昵称：展示名在 mask 下已遮蔽，拿它去比会让真名搜索失效。
+            # raw_name 只存在服务端 meta，不会写入下面的响应 JSON。
+            if (sender == m.get("name") or sender == m.get("raw_name")
+                    or (m["uid"] is not None and str(m["uid"]) == sender)):
                 hashes.add(h)
         if not hashes:
             return jsonify({"rows": [], "total": 0, "page": page})
@@ -3476,7 +3654,7 @@ def download(filename: str):
 @_db_guard
 def export_target_snapshot(target_id: str, kind: str):
     """下载最新目标快照，避免存在性核验后仍导出旧 UID。"""
-    from target_analysis import write_target_csv
+    from target_analysis import write_target_csv, public_target_result
     record = load_target_analysis(target_id)
     if record is None or kind not in ("csv", "json"):
         abort(404)
@@ -3486,7 +3664,7 @@ def export_target_snapshot(target_id: str, kind: str):
         write_target_csv(result, output)
         body, mime = "\ufeff" + output.getvalue(), "text/csv"
     else:
-        body, mime = json.dumps(result, ensure_ascii=False, indent=2), "application/json"
+        body, mime = json.dumps(public_target_result(result), ensure_ascii=False, indent=2), "application/json"
     filename = re.sub(r"[^0-9A-Za-z_.-]", "_", f"target_{record['bvid']}_{target_id}.{kind}")
     return Response(body, mimetype=mime, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
@@ -3746,12 +3924,8 @@ if __name__ == "__main__":
     atexit.register(lambda: _clear_pid(port))
 
     # 鉴权威胁热身（后台线程，不阻塞启动）：BiliAPIClient 首次请求的 buvid3/
-    # bili_ticket/WBI 密钥获取约 2-3s，提前完成让首次悬停词云也是 ~0.2s
-    def _warm_client():
-        try:
-            _get_client().get(NAV_URL, immediate=True)
-        except Exception:
-            pass
+    # bili_ticket/WBI 密钥获取约 2-3s，提前完成让首次悬停词云也是 ~0.2s。
+    # 热身失败不得把登录态粘成失效（见 _warm_client）。
     threading.Thread(target=_warm_client, daemon=True).start()
 
     def _on_term(signum, frame):

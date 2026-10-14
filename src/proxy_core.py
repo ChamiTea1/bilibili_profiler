@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import platform
+import queue
 import re
 import secrets
 import signal
@@ -170,6 +171,156 @@ def _go_platform() -> tuple[str, str]:
     return goos, goarch
 
 
+# Linux 的 PR_SET_PDEATHSIG 绑的是调用 fork 的那个线程，不是整个进程。
+# 符号必须在 fork 之前解析完：preexec_fn 里再碰 ctypes 会在子进程里 dlsym。
+_PR_SET_PDEATHSIG = 1
+_LIBC = None
+_PRCTL = None
+if sys.platform.startswith("linux"):
+    _LIBC = ctypes.CDLL(None, use_errno=True)
+    _PRCTL = _LIBC.prctl
+    _PRCTL.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    _PRCTL.restype = ctypes.c_int
+
+
+def _set_pdeathsig():
+    """子进程里只调用 fork 前已绑定的 prctl，不再解析符号。"""
+    if _PRCTL is not None:
+        _PRCTL(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+
+
+# 常驻线程名：测试据此确认 Popen 不发生在临时任务线程上。
+_SPAWN_THREAD_NAME = "mihomo-spawn"
+_SPAWN_LOCK = threading.Lock()
+_SPAWN_QUEUE: queue.Queue | None = None
+_SPAWN_THREAD: threading.Thread | None = None
+
+
+def _spawn_loop():
+    """进程级常驻线程：循环直到进程退出，避免 PDEATHSIG 跟着任务线程一起把核心杀掉。"""
+    assert _SPAWN_QUEUE is not None
+    while True:
+        item = _SPAWN_QUEUE.get()
+        if not item:
+            continue
+        fn, args, kwargs, box = item
+        try:
+            box.put((True, fn(*args, **kwargs)))
+        except BaseException as exc:  # noqa: BLE001 - 原样交还调用方
+            box.put((False, exc))
+
+
+def _ensure_spawn_thread() -> threading.Thread:
+    """守护线程可以，但它必须一直活到进程退出（非守护线程会把解释器挂住）。"""
+    global _SPAWN_QUEUE, _SPAWN_THREAD
+    with _SPAWN_LOCK:
+        if _SPAWN_THREAD is not None and _SPAWN_THREAD.is_alive():
+            return _SPAWN_THREAD
+        _SPAWN_QUEUE = queue.Queue()
+        _SPAWN_THREAD = threading.Thread(
+            target=_spawn_loop, name=_SPAWN_THREAD_NAME, daemon=True)
+        _SPAWN_THREAD.start()
+        return _SPAWN_THREAD
+
+
+def _popen_on_spawn_thread(*args, **kwargs) -> subprocess.Popen:
+    """所有 Popen 都丢给常驻线程执行，fork 的父线程不会随 Web 任务线程结束。"""
+    _ensure_spawn_thread()
+    assert _SPAWN_QUEUE is not None
+    box: queue.Queue = queue.Queue(1)
+    # 在常驻线程里再取 subprocess.Popen，这样测试打的补丁在调用当下生效。
+    def _call():
+        return subprocess.Popen(*args, **kwargs)
+    _SPAWN_QUEUE.put((_call, (), {}, box))
+    ok, value = box.get()
+    if not ok:
+        raise value
+    return value
+
+
+def _pid_alive(pid: int) -> bool:
+    """pid 是否仍有进程。权限不足视为存活，避免误删别人的运行目录。"""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _reap_stale_runtimes():
+    """删除已退出进程留下的运行目录（名如 {pid}-{secret}）。不删活进程的目录，不打印目录内容。"""
+    if not os.path.isdir(_RUNTIME_DIR):
+        return
+    removed = 0
+    for name in os.listdir(_RUNTIME_DIR):
+        path = os.path.join(_RUNTIME_DIR, name)
+        if not os.path.isdir(path):
+            continue
+        pid_text, sep, rest = name.partition("-")
+        if not sep or not rest or not pid_text.isdigit():
+            continue
+        if _pid_alive(int(pid_text)):
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        removed += 1
+    if removed:
+        print(f"[ProxyCore] 已清理 {removed} 个已退出进程残留的核心运行目录")
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sidecar_path(binary: str) -> str:
+    return binary + ".sha256"
+
+
+def _write_sidecar(binary: str, digest: str):
+    """下载校验通过后记下解压后文件的摘要，启动时再比对，避免静默执行被换掉的二进制。"""
+    path = _sidecar_path(binary)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(digest + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _binary_digest_ok(path: str) -> bool:
+    """有 sidecar 则必须一致才允许执行；没有 sidecar 的手动放置二进制仍允许，但给出警告。"""
+    side = _sidecar_path(path)
+    if not os.path.isfile(side):
+        print(f"[ProxyCore] 警告：核心文件没有校验摘要，按手动放置的二进制继续执行（{os.path.basename(path)}）")
+        return True
+    try:
+        with open(side, encoding="utf-8") as f:
+            text = f.read().strip()
+        expected = text.split()[0].lower() if text else ""
+    except OSError:
+        print("[ProxyCore] 校验摘要读取失败，拒绝执行，请重新下载核心")
+        return False
+    if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        print("[ProxyCore] 校验摘要格式无效，拒绝执行，请重新下载核心")
+        return False
+    if _sha256_file(path) != expected:
+        print("[ProxyCore] 核心文件与校验摘要不符，拒绝执行，请删除后重新下载")
+        return False
+    return True
+
+
 def _manual_hint(dest: str):
     """自动下载不可用时的手动放置指引（凭证不落日志，此处仅打印版本与路径）"""
     print(f"[ProxyCore] 请从 https://github.com/MetaCubeX/mihomo/releases/tag/{_MIHOMO_VERSION} "
@@ -232,6 +383,8 @@ def _download_binary(dest: str) -> bool:
                     f.write(data)
                 os.chmod(tmp, 0o755)
                 os.replace(tmp, dest)   # 原子替换：不存在半成品 dest
+                # sidecar 记的是解压后文件的摘要，启动时比对磁盘上的二进制
+                _write_sidecar(dest, hashlib.sha256(data).hexdigest())
                 return True
             except Exception as e:
                 print(f"[ProxyCore] 下载失败（{name}）: {e}")
@@ -249,7 +402,10 @@ def ensure_binary(allow_download: bool = True) -> str | None:
     candidates += [os.path.join(BASE_DIR, "vendor", exe), os.path.join(DATA_DIR, exe)]
     for p in candidates:
         if p and os.path.isfile(p):
-            return os.path.abspath(p)
+            path = os.path.abspath(p)
+            if _binary_digest_ok(path):
+                return path
+            # 摘要不符的候选不执行，继续找下一个或重新下载
     if not allow_download:
         return None
     dest = os.path.join(DATA_DIR, exe)
@@ -271,14 +427,9 @@ class ProxyCore:
         可能成为孤儿进程继续监听随机端口——正常退出（含 Ctrl+C）仍由 atexit→stop()
         回收；Windows 上如需彻底清理可手动结束 mihomo.exe 进程。"""
 
-        if not sys.platform.startswith("linux"):
+        if _PRCTL is None:
             return {}
-        libc = ctypes.CDLL(None, use_errno=True)
-        PR_SET_PDEATHSIG = 1
-
-        def _set_pdeathsig():
-            libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
-
+        # argtypes/restype 已在模块导入时设好，这里只把回调交给 Popen
         return {"preexec_fn": _set_pdeathsig}
 
     def __init__(self, sub_urls: list[str], group: str = "profiler", account_names=None):
@@ -479,6 +630,7 @@ class ProxyCore:
         整段在锁内：并发调用者阻塞等待首个调用拉起完成后走复用分支。
         """
         with self._start_lock:
+            _reap_stale_runtimes()
             if self._proc is not None:
                 if self._proc.poll() is None:
                     print(f"[ProxyCore] 内置核心已在运行，复用 {len(self._listeners)} 个账号入口")
@@ -509,7 +661,7 @@ class ProxyCore:
                 return None
             try:
                 self._diagnostics = _CoreDiagnostics()
-                self._proc = subprocess.Popen(
+                self._proc = _popen_on_spawn_thread(
                     [bin_path, "-d", self._runtime_dir, "-f", cfg_path],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, encoding="utf-8", errors="replace",

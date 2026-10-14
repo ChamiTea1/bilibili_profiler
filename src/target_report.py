@@ -6,8 +6,9 @@ from urllib.parse import urlencode
 import config
 from report import REPORT_CSS, esc, js_json, generate_user_card
 from candidate_space import candidate_uids
-from crc_candidates import build_crc_groups, render_crc_groups, render_candidate_card
-from storage import load_uid_verify_cache
+from crc_candidates import (visible_candidate_uids, build_crc_groups, render_crc_groups, render_candidate_card,
+                            strip_self_space_links)
+from storage import load_uid_verify_verdicts
 from uid_resolver import UID_VERIFY_EXISTS_TTL, UID_VERIFY_MISSING_TTL
 from uid_evidence import confidence_label
 
@@ -88,8 +89,9 @@ def render_target_report(record: dict, args, mask: bool, mask_name, mask_uid,
     disp_uid = mask_uid if mask else str
     disp_name = mask_name if mask else str
     profile_pages = {p["uid"]: i // user_size + 1 for i, p in enumerate(profiles)}
-    verifications = load_uid_verify_cache(sorted({u for s in senders for u in candidate_uids(s)}),
-                                         UID_VERIFY_EXISTS_TTL, UID_VERIFY_MISSING_TTL)
+    # 展示用全部结论（含过期）：过期只标待复核，不把"已确认不存在"当未知而重新给出链接
+    verifications = load_uid_verify_verdicts(sorted({u for s in senders for u in candidate_uids(s)}),
+                                             UID_VERIFY_EXISTS_TTL, UID_VERIFY_MISSING_TTL)
 
     def pager(key, current, pages, tab):
         def link(n, label):
@@ -103,17 +105,31 @@ def render_target_report(record: dict, args, mask: bool, mask_name, mask_uid,
         label = (f'{esc(disp_name(sender.get("name") or ""))} UID:{esc(disp_uid(uid))}' if uid else "未解析")
         if uid in profile_pages:
             label = f'<a href="?users_page={profile_pages[uid]}#uid-{uid}">{label}</a>'
-        candidates = "、".join(disp_uid(u) for u in sender.get("candidates", [])) or "无"
+        candidates = "、".join(disp_uid(u) for u in visible_candidate_uids(sender)) or "无"
         reason = sender.get("resolution", {}).get("reason", "")
         space_items = []
         if sender.get("confidence") not in ("高", "中"):
-            for candidate in candidate_uids(sender):
-                status, info = verifications.get(candidate, ("unknown", {}))
-                if status == "not_exists":
+            for candidate in visible_candidate_uids(sender):
+                verdict = verifications.get(candidate) or {}
+                if isinstance(verdict, dict) and verdict.get("status"):
+                    status = verdict.get("status", "unknown")
+                    info = verdict.get("info") if isinstance(verdict.get("info"), dict) else {}
+                    fresh = bool(verdict.get("fresh"))
+                elif isinstance(verdict, (tuple, list)) and verdict:
+                    # 旧二元组来自已按 TTL 过滤的缓存，exists 视为新鲜。
+                    status = verdict[0]
+                    info = verdict[1] if len(verdict) > 1 and isinstance(verdict[1], dict) else {}
+                    fresh = status == "exists"
+                else:
+                    status, info, fresh = "unknown", {}, False
+                if status in ("not_exists", "not_eligible") or (type(info.get("level")) is int and info["level"] == 0):
                     continue
                 assessment = (candidate_checks or {}).get((sender["mid_hash"], candidate))
                 result_html = render_space_assessment(assessment, mask, mask_name, mask_uid) if assessment else ""
-                c = {**info, "uid": candidate, "status": status,
+                clickable = status == "exists" and fresh
+                if not clickable:
+                    result_html = strip_self_space_links(result_html, candidate)
+                c = {**info, "uid": candidate, "status": status, "fresh": fresh, "clickable": clickable,
                      "card_ready": status == "exists" and "sign" in info}
                 space_items.append(render_candidate_card(c, sender["mid_hash"], f"/api/target/{target_id}/candidate-space",
                                                          mask, mask_name, mask_uid, result_html, auto_load=False))

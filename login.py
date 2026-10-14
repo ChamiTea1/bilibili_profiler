@@ -19,8 +19,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 sys.stdout.reconfigure(line_buffering=True)
 
 from auth import (get_qrcode, poll_qrcode, save_cookie, verify_cookie, load_cookie,
-                  account_cookie_path, generate_qrcode_image, COOKIE_PATH)
+                  _try_refresh_cookie, _pop_local_fields, _due_for_refresh,
+                  refresh_result_text, account_cookie_path, generate_qrcode_image, COOKIE_PATH)
 from api_client import BiliAPIClient
+import config
 
 MAX_WAIT_SECONDS = 300   # 二维码轮询总时长上限（5 分钟，覆盖扫码+确认）
 
@@ -50,16 +52,37 @@ def main():
     client = BiliAPIClient()
     cookie_dict = load_cookie(cookie_path)
     if cookie_dict:
-        # _refresh_token 是本地保存的伪 cookie，需先弹出，避免注入 session 发给B站
-        refresh_token = cookie_dict.pop("_refresh_token", None)
+        # 本地伪字段（_refresh_token/_refreshed_at）必须先弹出，避免注入 session 发给 B站
+        refresh_token, stamp = _pop_local_fields(cookie_dict)
         client.update_cookies(cookie_dict)
         if refresh_token:
             client._refresh_token = refresh_token
+        if stamp:
+            client._refreshed_at = stamp
         if verify_cookie(client):
             print("\n[✓] 已有有效Cookie，无需重新登录")
+            # 顺手做一次到期前主动续期（失败不影响当前登录态）
+            if refresh_token and getattr(config, "COOKIE_PROACTIVE_REFRESH", True) \
+                    and _due_for_refresh(cookie_path):
+                result = _try_refresh_cookie(client, cookie_path)
+                if result:
+                    print("[✓] 登录态已主动续期")
+                elif verify_cookie(client):
+                    print(f"[!] {refresh_result_text(result)}，继续使用现有登录态")
             print(f"    Cookie文件: {cookie_path}")
             return
-        print("\n[!] 已有Cookie已过期，重新登录...")
+        # 主号流程会先尝试使用持久化 refresh_token；小号也必须走同一路径，
+        # 否则每次 SESSDATA 到期都会直接要求重新扫码，浪费仍然有效的刷新令牌。
+        if refresh_token:
+            print("\n[!] Cookie验证失败，先尝试自动刷新登录态...")
+            result = _try_refresh_cookie(client, cookie_path)
+            if result and verify_cookie(client):
+                print("[✓] Cookie自动刷新成功，无需重新扫码")
+                print(f"    Cookie文件: {cookie_path}")
+                return
+            if not result:
+                print(f"[!] {refresh_result_text(result)}，需要重新扫码")
+        print("\n[!] Cookie已过期或自动刷新失败，重新登录...")
 
     # 生成二维码（路径按账号名区分，主号保持 data/qrcode.png，小号 qrcode_{name}.png）
     print("\n[1] 正在获取登录二维码...")
@@ -83,10 +106,17 @@ def main():
         code = (result.get("data") or {}).get("code", -1)
 
         if code == 0:
-            # 从扫码响应中提取 refresh_token（用于后续 cookie 自动刷新）
+            # 先清掉旧的刷新令牌和时间戳，响应没有新令牌就不要把失效令牌写回
+            for attr in ("_refresh_token", "_refreshed_at"):
+                if hasattr(client, attr):
+                    delattr(client, attr)
             refresh_token = (result.get("data") or {}).get("refresh_token", "")
             if refresh_token:
                 client._refresh_token = refresh_token
+                client._refreshed_at = time.time()
+            else:
+                print("[!] 警告: 本次登录未获得 refresh_token（B站未下发），"
+                      "该账号到期后无法自动续期，只能重新扫码")
             print("\n[✓] 登录成功!")
             save_cookie(client, cookie_path)
             print(f"\n  Cookie已保存到: {cookie_path}")

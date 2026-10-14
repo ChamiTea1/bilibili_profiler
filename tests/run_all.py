@@ -67,6 +67,10 @@ SCRIPTS = [
     "tests/offline/regress_env_proxy.py",       # 环境代理不得劫持本机调用 6 项
     "tests/offline/regress_llm_proxy.py",       # LLM 客户端不继承环境代理 6 项
     "tests/offline/regress_cli_switches.py",    # 命令行开关 --skip-deep 判定与接线 5 项
+    "tests/offline/regress_auth_refresh.py",    # 主号/小号 Cookie 自动刷新接线 4 项
+    "tests/offline/regress_cookie_refresh.py",  # 续期记账/三态/回写/公钥完整性 14 项
+    "tests/offline/regress_uid_recheck.py",     # 候选三态与终审复核（不可点击 404 账号）20 项
+    "tests/offline/regress_web_review.py",      # Web 报告审查：回复前缀遮蔽、页缓存、删除互斥等
 ]
 SUMMARY_RE = re.compile(r"(\d+) 项通过,\s*(\d+) 项失败")
 

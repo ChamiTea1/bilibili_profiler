@@ -180,6 +180,24 @@ def init_db():
             ("page", "ALTER TABLE danmaku ADD COLUMN page INTEGER NOT NULL DEFAULT 1"),
         ):
             _migrate_col(cursor, col, dm_cols, ddl)
+        # dmid<>0 时 (bvid, dmid) 唯一。重复清理是一次性迁移；如果每次 init_db
+        # 都执行关联子查询，大库启动会从毫秒级退化到秒级甚至更久。
+        # dmid=0 无法判重，不进索引，仍允许多行。
+        dmid_key = "danmaku_bvid_dmid_v1"
+        if not cursor.execute("SELECT 1 FROM uid_schema_state WHERE key=?", (dmid_key,)).fetchone():
+            cursor.execute('''DELETE FROM danmaku WHERE rowid IN (
+                SELECT d.rowid FROM danmaku d
+                WHERE d.dmid <> 0 AND EXISTS (
+                    SELECT 1 FROM danmaku k
+                    WHERE k.bvid = d.bvid AND k.dmid = d.dmid AND k.rowid < d.rowid))''')
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_danmaku_bvid_dmid ON danmaku(bvid, dmid) WHERE dmid<>0")
+            cursor.execute("INSERT OR IGNORE INTO uid_schema_state VALUES (?, '1')", (dmid_key,))
+        else:
+            # 标记存在时索引一定已由上面的迁移创建；IF NOT EXISTS 只做轻量兜底，
+            # 兼容曾手动删除索引但没有删除迁移标记的本地库。
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_danmaku_bvid_dmid ON danmaku(bvid, dmid) WHERE dmid<>0")
 
         # 评论表（跨视频足迹 + 高回复评论页数据源；reply_count 只对主评论有意义，
         # root_rpid 记录子评论所属主评论的 rpid，供「高回复评论」页关联争议主楼与回复）
@@ -374,9 +392,19 @@ def _upgrade_local_plain_confidence(cursor):
 
 
 def _upgrade_verified_crc_confidence(cursor):
-    """仅凭完整数学缓存及未过期的逐UID验证升级旧低分级，不新建明文证据。"""
+    """仅凭完整数学缓存及未过期的逐UID验证升级旧低分级，不新建明文证据。
+
+    对照 _upgrade_local_plain_confidence：跑过一次就用 uid_schema_state 跳过全扫，
+    判定规则不变。空库先不写标记——离线回归会在首次 init 之后插入旧行再 init，
+    空跑就盖章的话那些旧行升不上去；库里已有 senders 或 target_analyses 时扫完即盖章。
+    """
+    key = "verified_crc_high_v1"
+    if cursor.execute("SELECT 1 FROM uid_schema_state WHERE key=?", (key,)).fetchone():
+        return
     if not cursor.connection.in_transaction:
         cursor.execute("BEGIN IMMEDIATE")
+    if cursor.execute("SELECT 1 FROM uid_schema_state WHERE key=?", (key,)).fetchone():
+        return
     now = time.time()
 
     def eligible(sender):
@@ -445,6 +473,10 @@ def _upgrade_verified_crc_confidence(cursor):
                            (json.dumps(result, ensure_ascii=False), json.dumps(summary, ensure_ascii=False), row["id"]))
         except (ValueError, TypeError, AttributeError):
             continue
+    has_rows = (cursor.execute("SELECT 1 FROM senders LIMIT 1").fetchone()
+                or cursor.execute("SELECT 1 FROM target_analyses LIMIT 1").fetchone())
+    if has_rows:
+        cursor.execute("INSERT OR IGNORE INTO uid_schema_state VALUES (?, '1')", (key,))
 
 
 def save_target_analysis(target_id: str, bvid: str, selector: dict, result: dict) -> None:
@@ -689,6 +721,30 @@ def load_senders(bvid: str) -> list[dict]:
     } for r in rows]
 
 
+def delete_senders_by_mid_hash(bvid: str, mid_hashes: list[str]) -> int:
+    """按 bvid + mid_hash 删除发送者。同一事务内，若该 uid 在本视频已无其他发送者，
+    一并删除对应 video_profiles。不按 uid 误删仍被其他 mid_hash 引用的画像。"""
+    hashes = [h for h in dict.fromkeys(mid_hashes) if h]
+    if not bvid or not hashes:
+        return 0
+    with closing(get_db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        marks = ",".join("?" * len(hashes))
+        uids = [row[0] for row in conn.execute(
+            f"SELECT uid FROM senders WHERE bvid=? AND mid_hash IN ({marks}) AND uid IS NOT NULL",
+            (bvid, *hashes)) if row[0]]
+        deleted = conn.execute(
+            f"DELETE FROM senders WHERE bvid=? AND mid_hash IN ({marks})",
+            (bvid, *hashes)).rowcount
+        for uid in set(uids):
+            still = conn.execute(
+                "SELECT 1 FROM senders WHERE bvid=? AND uid=? LIMIT 1", (bvid, uid)).fetchone()
+            if still is None:
+                conn.execute("DELETE FROM video_profiles WHERE bvid=? AND uid=?", (bvid, uid))
+        conn.commit()
+    return deleted
+
+
 # ========== 用户数据 ==========
 
 def _put_video_profile(conn, bvid: str, uid: int, profile: dict):
@@ -826,10 +882,16 @@ def has_user_data(uid: int) -> bool:
 
 # ========== 全量弹幕（Web 弹幕浏览器数据源） ==========
 
-def append_danmaku(bvid: str, danmaku_list: list[dict], seen_dmids: set) -> int:
+def append_danmaku(bvid: str, danmaku_list: list[dict], seen_dmids: set,
+                   checkpoint: dict | None = None) -> int:
     """增量落库（断点续采用）：按 dmid 去重——已见过的 dmid（含库中已有与本次新插入）
     跳过，dmid=0 无法判重直接插入（历史快照 dmid 恒非 0，实时池个别为 0）。
-    seen_dmids 由调用方持有并在调用间复用；返回实际插入条数。"""
+    dmid<>0 另有 (bvid, dmid) 部分唯一索引，INSERT OR IGNORE 兜住并发重复行。
+    seen_dmids 由调用方持有并在调用间复用；返回准备插入的条数（冲突被忽略时库内仍只留一行）。
+    提交失败不污染 seen_dmids。
+
+    checkpoint 可选：与当日弹幕同一事务写入 phase_state（phase 固定为 danmaku）。
+    不传时行为与原来一样，只提交弹幕。"""
     rows = []
     new_dmids = set()
     for dm in danmaku_list:
@@ -841,13 +903,20 @@ def append_danmaku(bvid: str, danmaku_list: list[dict], seen_dmids: set) -> int:
         rows.append((bvid, dm["mid_hash"], dm["content"], dm["time"], dm["timestamp"],
                      dm.get("mode", 1), dm.get("color", ""), dm.get("pool", 0), dmid,
                      dm.get("page", 1)))
-    if rows:
-        with closing(get_db()) as conn:
+    if not rows and not checkpoint:
+        return 0
+    with closing(get_db()) as conn:
+        if rows:
             conn.executemany(
-                "INSERT INTO danmaku (bvid, mid_hash, content, time, timestamp, mode, color, pool, dmid, page) "
+                "INSERT OR IGNORE INTO danmaku (bvid, mid_hash, content, time, timestamp, mode, color, pool, dmid, page) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows)
-            conn.commit()
+        if checkpoint:
+            conn.executemany(
+                "INSERT INTO phase_state(bvid, phase, key, value) VALUES(?, 'danmaku', ?, ?) "
+                "ON CONFLICT(bvid, phase, key) DO UPDATE SET value=excluded.value",
+                [(bvid, key, str(value)) for key, value in checkpoint.items()])
+        conn.commit()
     seen_dmids.update(new_dmids)
     return len(rows)
 
@@ -1243,14 +1312,88 @@ def load_uid_verify_cache(uids: list[int], exists_ttl: float, missing_ttl: float
     return result
 
 
-def save_uid_verify_cache(uid: int, status: str, info: dict, verified_at: float | None = None):
+def load_uid_verify_verdicts(uids: list, exists_ttl: float, missing_ttl: float) -> dict:
+    """读取**全部**存在性结论（含已过期），供报告展示与终审复核使用。
+
+    与 load_uid_verify_cache 的分工：
+      - load_uid_verify_cache：只返回"仍然有效"的结论 → 用于**判定**（能否作为
+        "唯一存在→升高 UID"的证据；过期证据不可用，语义不变）；
+      - 本函数：结论一律返回，并附带 verified_at / fresh / final → 用于**展示**。
+    展示层若因 TTL 把"已确认不存在"当成"未知"，就会把它重新渲染成可点击名片，
+    这正是"报告里点进去是 404"的根因（账号不存在结论此前只缓存 1 小时）。
+    """
+    result, now = {}, time.time()
+    with closing(get_db()) as conn:
+        for start in range(0, len(uids), 500):
+            chunk = uids[start:start + 500]
+            marks = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT * FROM uid_verify_cache WHERE uid IN ({marks})", chunk).fetchall()
+            for row in rows:
+                if row["status"] not in ("exists", "not_exists"):
+                    continue
+                try:
+                    info = json.loads(row["info_json"])
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(info, dict):
+                    continue
+                # exists 必须与记录的 uid 自洽（防损坏记录被当成有效名片）
+                if row["status"] == "exists" and info.get("uid") != row["uid"]:
+                    continue
+                ttl = exists_ttl if row["status"] == "exists" else missing_ttl
+                result[row["uid"]] = {"status": row["status"], "info": info,
+                                      "verified_at": row["verified_at"],
+                                      "fresh": 0 <= now - row["verified_at"] < ttl,
+                                      "final": bool(info.get("final"))}
+    return result
+
+
+def save_uid_verify_cache(uid: int, status: str, info: dict, verified_at: float | None = None,
+                          respect_final: bool = True):
+    """写入存在性缓存。
+
+    respect_final=True（常规核验，含名片与空间回写）时：
+      - 终审 final 的 not_exists 仍拒绝被没有 UID 自洽信息的空 exists 覆盖；
+        带同 UID 的有效名片可以推翻旧的 final 账号不存在；
+      - 写入 not_exists 且新 info 没带 miss_count/final 时，保留库里已累计的确认次数与终审标记。
+    终审复核传 respect_final=False，调整仍可写成 exists。
+    """
     if status not in ("exists", "not_exists"):
         return
+    payload = dict(info or {})
+    stamp = time.time() if verified_at is None else verified_at
+    final_ttl = max(3600, int(getattr(config, "UID_RECHECK_FINAL_TTL", 30 * 86400)))
     with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT status, info_json, verified_at FROM uid_verify_cache WHERE uid=?", (uid,)).fetchone()
+        if row is not None:
+            try:
+                old = json.loads(row["info_json"])
+            except (TypeError, ValueError):
+                old = {}
+            if not isinstance(old, dict):
+                old = {}
+            # final 只是当时连续 404 的审计结论，不能压过之后带有同 UID 的
+            # 有效名片。没有 UID 自洽信息的 exists 仍不能覆盖 final，避免空名片
+            # 或异常响应把明确账号不存在静默翻成账号存在。
+            if (respect_final and status == "exists" and row["status"] == "not_exists"
+                    and old.get("final") and payload.get("uid") != uid):
+                try:
+                    age = time.time() - float(row["verified_at"] or 0)
+                except (TypeError, ValueError):
+                    age = final_ttl
+                if 0 <= age < final_ttl:
+                    return
+            if status == "not_exists":
+                if "miss_count" not in payload and "miss_count" in old:
+                    payload["miss_count"] = old["miss_count"]
+                if "final" not in payload and "final" in old:
+                    payload["final"] = old["final"]
         conn.execute("INSERT INTO uid_verify_cache VALUES(?, ?, ?, ?) "
             "ON CONFLICT(uid) DO UPDATE SET status=excluded.status, info_json=excluded.info_json, "
-            "verified_at=excluded.verified_at WHERE excluded.verified_at >= uid_verify_cache.verified_at", (uid, status, json.dumps(info, ensure_ascii=False),
-                                                 time.time() if verified_at is None else verified_at))
+            "verified_at=excluded.verified_at WHERE excluded.verified_at >= uid_verify_cache.verified_at",
+                     (uid, status, json.dumps(payload, ensure_ascii=False), stamp))
         conn.commit()
 
 

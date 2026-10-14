@@ -193,6 +193,37 @@ def _save_date_set(bvid: str, key: str, dates: set[str], page: int = 1):
     set_phase_state(bvid, "danmaku", _state_key(key, page), ",".join(sorted(dates)))
 
 
+def history_done_before(bvid: str, page: int = 1) -> bool:
+    """该分P的历史弹幕是否已经完成（读取入口调用一次，不在逐日请求里清状态）。
+
+    done=1 且 fetched_dates 非空：历史模块写过的完成标记，进入滚动补采。
+    done=1 但 fetched_dates 为空：多半是关闭历史采集时主流程写的 done，不能当成
+    分P1 历史已完成，否则之后打开历史只会补最近几天。这种伪 done 只清一次
+    （spurious_done_cleared）；清过之后历史模块若对空窗口再次写成 done=1，就保留。
+    """
+    from storage import get_db, get_phase_state
+    done_key = _state_key("done", page)
+    if get_phase_state(bvid, "danmaku", done_key) != "1":
+        return False
+    if _load_date_set(bvid, "fetched_dates", page):
+        return True
+    mark_key = _state_key("spurious_done_cleared", page)
+    if get_phase_state(bvid, "danmaku", mark_key) == "1":
+        return True
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM phase_state WHERE bvid=? AND phase='danmaku' AND key=?",
+                     (bvid, done_key))
+        conn.execute(
+            "INSERT INTO phase_state (bvid, phase, key, value) VALUES (?, 'danmaku', ?, '1') "
+            "ON CONFLICT(bvid, phase, key) DO UPDATE SET value='1'",
+            (bvid, mark_key))
+        conn.commit()
+    finally:
+        conn.close()
+    return False
+
+
 def _fetch_month_dates(cid: int, month: str, client: BiliAPIClient) -> list[str] | None:
     """查询某月有弹幕的日期列表；失败返回 None（该月按失败处理，与"本月无弹幕"的空列表区分）"""
     data = client.get(DANMAKU_HISTORY_INDEX_URL, params={"type": 1, "oid": cid, "month": month})
@@ -260,7 +291,7 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         from storage import (append_danmaku, get_phase_state, load_danmaku,
                              set_phase_state)
         last_date = get_phase_state(bvid, "danmaku", _state_key("last_date", page)) or None
-        done_before = get_phase_state(bvid, "danmaku", _state_key("done", page)) == "1"
+        done_before = history_done_before(bvid, page)
         fetched_dates = _load_date_set(bvid, "fetched_dates", page)
         failed_dates = _load_date_set(bvid, "failed_dates", page)
         failed_months = _load_date_set(bvid, "failed_months", page)
@@ -278,10 +309,12 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     # 已达 HISTORY_MAX_DAYS 上限的视频会在天数检查处直接 break——滚动窗口一天也补不进，
     # 新增弹幕永久冻结（refresh_mode 豁免上限，见下方建清单处）
     refresh_mode = done_before
+    refresh_cutoff_month = None
     if refresh_mode:
         cutoff = (today - timedelta(days=HISTORY_RECENT_REFRESH_DAYS)).isoformat()
         fetched_dates = {d for d in fetched_dates if d <= cutoff}
         last_date = cutoff
+        refresh_cutoff_month = cutoff[:7]
         refresh_from = today - timedelta(days=HISTORY_RECENT_REFRESH_DAYS - 1)
         print(f"[历史弹幕] {tag}已采集完成，滚动补采最近 {HISTORY_RECENT_REFRESH_DAYS} 天"
               f"（{refresh_from.isoformat()} ~ {today.isoformat()}，弹幕池每日滚动，dmid 幂等去重）")
@@ -329,7 +362,13 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
     #    refresh_mode 豁免天数上限：滚动补采窗口固定为 cutoff 之后的几天（≤3 天），
     #    上限管的是"回溯多早"而非"补采几条"；已达上限的 done 视频不豁免则永远补不进新弹幕
     work_dates: list[str] = []
-    months = sorted(set(months) | failed_months)
+    # refresh_mode 只拉截止日期所在月及之后的月份索引。更早的月份一旦索引失败被记进
+    # failed_months，下一轮会因豁免天数上限把被截断的旧月份整月补采。窗口内的失败日
+    # 仍走下面的 failed_dates 补采，不在这里丢掉。
+    if refresh_cutoff_month:
+        months = sorted(m for m in set(months) | failed_months if m >= refresh_cutoff_month)
+    else:
+        months = sorted(set(months) | failed_months)
     for month in reversed(months):
         if not refresh_mode and fetched_days + len(work_dates) >= HISTORY_MAX_DAYS:
             truncated = True
@@ -413,16 +452,17 @@ def fetch_history_danmaku(cid: int, client: BiliAPIClient, pubdate: Optional[int
         failed_dates.discard(date)
         all_danmaku.extend(dms)
         if bvid:
-            # 逐日增量落库 + 检查点：中断后重跑按已采日期集续采
+            # 当日弹幕与检查点同一事务：中断后重跑按已采日期集续采，不会只落下其中一半
             fetched_dates.add(date)
             fetched_days = len(fetched_dates)   # 唯一已采日数：滚动补采的重采日不重复计数
-            append_danmaku(bvid, dms, seen_dmids)
             if not last_date or date > last_date:
                 last_date = date   # 高水位线
-            set_phase_state(bvid, "danmaku", _state_key("last_date", page), last_date)
-            set_phase_state(bvid, "danmaku", _state_key("fetched_days", page), str(fetched_days))
-            _save_date_set(bvid, "fetched_dates", fetched_dates, page)
-            _save_date_set(bvid, "failed_dates", failed_dates, page)
+            append_danmaku(bvid, dms, seen_dmids, checkpoint={
+                _state_key("last_date", page): last_date,
+                _state_key("fetched_days", page): str(fetched_days),
+                _state_key("fetched_dates", page): ",".join(sorted(fetched_dates)),
+                _state_key("failed_dates", page): ",".join(sorted(failed_dates)),
+            })
         else:
             fetched_days += 1
         print(f"[历史弹幕] {tag}{date}: {len(dms)} 条（已采日数 {fetched_days}，本轮新采 {len(all_danmaku)} 条）")

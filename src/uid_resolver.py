@@ -25,8 +25,9 @@ METHOD_AMBIGUOUS = "候选歧义"
 METHOD_PENDING = "待验证"
 VERIFY_EXISTS = "exists"
 VERIFY_NOT_EXISTS = "not_exists"
+VERIFY_NOT_ELIGIBLE = "not_eligible"  # 当前 Lv0，不具备普通视频弹幕权限
 VERIFY_UNKNOWN = "unknown"
-RESOLVER_VERSION = "evidence-v4"
+RESOLVER_VERSION = "evidence-v5"
 CANDIDATE_VERSION = "mitm-v1"
 UID_VERIFY_EXISTS_TTL = getattr(config, "UID_VERIFY_EXISTS_TTL", 7 * 86400)
 UID_VERIFY_MISSING_TTL = getattr(config, "UID_VERIFY_MISSING_TTL", 3600)
@@ -129,7 +130,7 @@ def resolution_record(mid_hash: str, result: tuple, mapping: dict, methods: dict
             "evidence": [{"uid": u, **ev} for u, ev in sorted(_evidence(mid_hash, mapping, methods).items())]}
     if method == METHOD_CRC32_CRACK:
         cached = _cached_verifications(candidates)
-        record["candidate_status"] = {str(u): cached.get(u, (VERIFY_UNKNOWN, {}))[0] for u in candidates}
+        record["candidate_status"] = {str(u): candidate_eligibility(*cached.get(u, (VERIFY_UNKNOWN, {}))) for u in candidates}
         try:
             record["candidate_checked_at"] = load_uid_verify_times(candidates)
         except sqlite3.Error:
@@ -144,9 +145,9 @@ def resolution_is_current(row: dict, mid_hash: str, mapping: dict, methods: dict
     if row.get("method") == METHOD_CRC32_CRACK:
         uids = candidates_of(record.get("candidates"))
         cached = _cached_verifications(sorted(uids))
-        # 高置信度依赖所有阴性结论；其中一条过期，即须重验，不能按一天缓存跳过。
+        # 高置信度依赖所有账号不存在结论；其中一条过期，即须重验，不能按一天缓存跳过。
         if (row.get("confidence") != "高" or not uids or set(cached) != uids
-                or {u for u, (status, _) in cached.items() if status == VERIFY_EXISTS} != {row.get("uid")}):
+                or {u for u, (status, info) in cached.items() if candidate_eligibility(status, info) == VERIFY_EXISTS} != {row.get("uid")}):
             return False
     return (record.get("version") == RESOLVER_VERSION
             and record.get("fingerprint") == evidence_fingerprint(mid_hash, mapping, methods)
@@ -173,8 +174,11 @@ def _card_info(uid: int, card: dict, batch: bool = False) -> dict:
               "vip_status": (card.get("vip") or {}).get("status", 0)}
     official = card.get("official" if batch else "official_verify") or {}
     result["official_type"] = official.get("type", -1)
+    level = (card.get("level_info") or {}).get("current_level")
+    if type(level) is int and 0 <= level <= 6:
+        result["level"] = level
     if not batch:
-        result.update(sign=card.get("sign", ""), level=(card.get("level_info") or {}).get("current_level", 0),
+        result.update(sign=card.get("sign", ""),
                       sex=card.get("sex", ""), follower=card.get("fans", 0), following=card.get("attention", 0))
     return result
 
@@ -211,7 +215,7 @@ def verify_uid_exists(uid: int, client: BiliAPIClient) -> Tuple[str, dict]:
 
 def _batch_verify_uids(uids: list[int], client: BiliAPIClient,
                        budget: VerificationBudget | None = None) -> Tuple[dict, set]:
-    """批量阳性可确认存在；缺席需单点 -404 确认，降级请求有整轮预算。
+    """批量存在状态可确认；缺席需单点 -404 确认，降级请求有整轮预算。
 
     预算耗尽或风控时保持未知，下轮使用已确认的缓存接续，绝不展开风控请求风暴。
     """
@@ -280,15 +284,25 @@ def _plain_result(evidence: dict[int, dict]):
     return uid, ("高" if ev["local"] else "低"), ev["source"], None, True, candidates
 
 
+def candidate_eligibility(status: str, info: dict) -> str:
+    """存在性确认后才使用明确的 Lv0 排除；缺失等级、空值和布尔值不能代替零级。"""
+    level = info.get("level") if isinstance(info, dict) else None
+    if status == VERIFY_EXISTS and type(level) is int and level == 0:
+        return VERIFY_NOT_ELIGIBLE
+    return status
+
+
 def _finalize(mid_hash: str, danmaku_count: int, plain_uid: Optional[int],
               candidates: list, method_map: dict | None, status_of, info_of):
-    """全部候选核验完成且唯一存在时按实用分级标高，未知及多名存在不选人。"""
+    """全部候选核验完成且唯一存在时按实用分级标高；404 和 Lv0 均为排除状态，未知及多名存在不选人。"""
     if plain_uid is not None:
         return _plain_result({plain_uid: {"source": (method_map or {}).get(mid_hash, METHOD_COMMENT_VERIFY), "local": True}})
     if not candidates:
         return None, "无", METHOD_UNKNOWN, None, False, []
-    existing = [u for u in candidates if status_of(u) == VERIFY_EXISTS]
-    unknown = [u for u in candidates if status_of(u) not in (VERIFY_EXISTS, VERIFY_NOT_EXISTS)]
+    statuses = {u: candidate_eligibility(status_of(u), info_of(u)) for u in candidates}
+    existing = [u for u in candidates if statuses[u] == VERIFY_EXISTS]
+    unknown = [u for u in candidates if statuses[u] not in (
+        VERIFY_EXISTS, VERIFY_NOT_EXISTS, VERIFY_NOT_ELIGIBLE)]
     if len(existing) > 1:
         return None, "无", METHOD_AMBIGUOUS, None, True, candidates
     if unknown:
@@ -313,7 +327,7 @@ def _resolve_many(sender_groups: dict, mapping: dict, client, max_search: int, m
             universe.update(candidates)
     found, unknown = _batch_verify_uids(sorted(universe), client, budget) if universe else ({}, set())
     def status_of(uid):
-        return VERIFY_EXISTS if uid in found else VERIFY_UNKNOWN if uid in unknown else VERIFY_NOT_EXISTS
+        return candidate_eligibility(VERIFY_EXISTS, found[uid]) if uid in found else VERIFY_UNKNOWN if uid in unknown else VERIFY_NOT_EXISTS
     result = {}
     for h, group in sender_groups.items():
         verdict = plain[h] if h in plain else _finalize(h, group["count"], None, candidate_map[h], methods, status_of, found.get)

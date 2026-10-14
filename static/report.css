@@ -258,3 +258,11 @@
 /* 弹幕浏览器：「刷屏」列不换行（fix）；卡片内小节标题 */
 .dm-table th:last-child, .dm-table td:last-child { white-space:nowrap; }
 .dm-sub-h { font-size:13px; color:#888; margin:14px 0 8px; font-weight:500; }
+
+/* 未深度采集的用户以长条卡片展示本视频发言。 */
+.light-user-card { grid-column: 1 / -1; }
+.light-user-link { display: block; padding: 16px; color: inherit; text-decoration: none; }
+.light-user-link .uid { margin: 0 14px; }
+.light-user-link ul { margin: 8px 0; max-height: 200px; overflow: auto; overflow-wrap: anywhere; }
+.light-user-link h4 { margin: 12px 0 4px; }
+a.light-user-link:hover { background: #f3f8fc; }

@@ -102,14 +102,15 @@ def main():
 
     # 采样数据不落库：弹幕采样只调用了 collect_danmaku_data 的解析与 group_by_sender 聚合，
     # 全程未调用任何弹幕落库函数；评论采样同样只做内存统计（无 phase_state 哨兵的采样落库
-    # 会被 run.py 断点续采误判为"旧版完整落库"而跳过全量评论采集）。视频信息落库对齐主流程口径：先在内存合并
-    # 库内旧行的 danmaku_coverage，避免裸 API 返回整行覆盖把弹幕覆盖率冲掉
+    # 会被 run.py 断点续采误判为"旧版完整落库"而跳过全量评论采集）。从没分析过的 BV
+    # 不新建 videos 行，否则首页会出现空报告；库里已有该视频时才合并覆盖率后更新。
     try:
         init_db()
-        prev_info = load_video_info(bvid) or {}
-        if prev_info.get("danmaku_coverage"):
-            video_info["danmaku_coverage"] = prev_info["danmaku_coverage"]
-        save_video_info(bvid, video_info)
+        prev_info = load_video_info(bvid)
+        if prev_info:
+            if prev_info.get("danmaku_coverage"):
+                video_info["danmaku_coverage"] = prev_info["danmaku_coverage"]
+            save_video_info(bvid, video_info)
     except Exception as e:
         print(f"   警告: 视频信息落库失败（{e}）")
 

@@ -158,6 +158,18 @@ check("API 返回 multi_page 与逐行 first_page（不再跨分P 比 time）",
       and [r["content"] for r in data["rows"]] == ["早", "晚"],
       "(顺序 %r)" % ([r["content"] for r in data["rows"]],))
 
+print("=== 6. 关闭历史采集留下的 done 不能当成历史已完成 ===")
+storage.set_phase_state("BVnodates1", "danmaku", "done", "1")
+check("无 fetched_dates 的 done=1 不当作历史完成",
+      dh.history_done_before("BVnodates1") is False)
+check("伪 done 已清掉，打开历史后不会只补最近 3 天",
+      storage.get_phase_state("BVnodates1", "danmaku", "done") != "1")
+storage.set_phase_state("BVhasdates", "danmaku", "done", "1")
+storage.set_phase_state("BVhasdates", "danmaku", "fetched_dates", "2026-08-01")
+check("历史模块写过日期集的 done 仍算完成",
+      dh.history_done_before("BVhasdates") is True
+      and storage.get_phase_state("BVhasdates", "danmaku", "done") == "1")
+
 print("")
 print("==== 多分P 口径（历史采集 + 样本标注）: %d 项通过, %d 项失败 ====" % (ok, fail))
 sys.exit(1 if fail else 0)

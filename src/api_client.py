@@ -110,11 +110,11 @@ class BiliAPIClient:
 
     def _sign_wbi(self, params: dict) -> dict:
         """为 WBI 接口参数添加签名（规范：过滤 !'()*，urlencode 大写百分号，空格 %20）"""
+        # 没拿到密钥也要剔掉旧 w_rid/wts，避免负缓存期间带着失效签名再发
+        params = {k: v for k, v in params.items() if k not in ("w_rid", "wts")}
         key = self._get_wbi_key()
         if not key:
             return params
-        # 剔除残留的旧签名参数，避免旧 w_rid/wts 混入签名串导致重签无效（-352/-403 恢复路径会传入旧值）
-        params = {k: v for k, v in params.items() if k not in ("w_rid", "wts")}
         params["wts"] = int(time.time())
         items = []
         for k in sorted(params.keys()):
@@ -194,6 +194,39 @@ class BiliAPIClient:
         if self._throttle > old:
             print(f"[API] {what}，自适应降速: 请求间隔倍率 {old:.2f} → {self._throttle:.2f}")
 
+    def _note_risk(self, what: str, state: dict):
+        """raise_on_risk 下同一次 get/post 只降速一次。
+
+        attempt 0 短退避和 attempt 1 确认是同一次风控，不能连扣两次。
+        本轮还没扣过就第一次看到风控（前面只是网络重试）仍然要扣。
+        下一次独立请求有自己的 state，不会漏扣。旧模式每次命中都降速。
+        """
+        if self.raise_on_risk:
+            if state.get("done"):
+                return
+            state["done"] = True
+        self._penalize_throttle(what)
+
+    def _is_node_fault(self, exc: BaseException) -> bool:
+        """代理错误、连接失败、连接超时、SSL 错误算节点死亡；ReadTimeout 不算。"""
+        if isinstance(exc, requests.exceptions.ProxyError):
+            return True
+        return bool(self._proxy_active and isinstance(exc, (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ConnectTimeout,
+            requests.exceptions.SSLError,
+        )))
+
+    def _retry_transport(self, exc: BaseException, attempt: int, attempts: int) -> bool:
+        """节点故障立即抛 ProxyConnError；其余传输错误指数退避。返回是否还应重试。"""
+        if self._is_node_fault(exc):
+            raise ProxyConnError(str(exc)) from exc
+        if attempt < attempts - 1:
+            wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
+            time.sleep(wait)
+            return True
+        return False
+
     def _reward_throttle(self):
         """业务成功请求：倍率缓慢衰减回 1.0（约40次成功回落一半）"""
         self._throttle = max(1.0, self._throttle * ADAPTIVE_THROTTLE_DECAY)
@@ -239,29 +272,33 @@ class BiliAPIClient:
             return self._send_request(method, url, **kwargs)
 
     def _request_immediate(self, method: str, url: str, **kwargs) -> requests.Response:
-        """交互式单次请求通道：跳过随机限速间隔（人点一下不属批量行为），但
-        -412 风控冷却是全局语义（所有请求一起暂停）仍生效——锁外读共享截止时刻
-        等待（float 读写靠 GIL 原子，与锁内写的竞态最多多等/少等一瞬，可接受）。
-        交互请求之间用 _immediate_lock 串行（防连点连发绕过"单次"语义）。
+        """交互式单次请求通道：跳过随机限速间隔（人点一下不属批量行为）。
+
+        出口门控正在冷却时直接失败，不持锁睡到冷却结束。全局 -412 冷却同样
+        快速失败（交互请求不该排队数百秒）。交互请求之间用 _immediate_lock
+        串行（防连点连发绕过"单次"语义）。出口间隔限速仍然保留。
         残留竞态：与凭证明置（buvid3/bili_ticket 首次注入，持 _lock）并发的
         jar 迭代理论上可抛 RuntimeError——窗口仅凭据首置一次，且失败方有调用方
         兜底降级（词云悬停失败显示空态），可接受。"""
         remaining = self._risk_cooldown_until - time.time()
         if remaining > 0:
-            if remaining > 1:
-                print(f"[API] 风控冷却中，交互请求等待 {remaining:.0f} 秒...")
-            time.sleep(remaining)
+            raise RiskControlError(f"风控冷却中（约 {remaining:.0f}s），交互请求快速失败")
         with self._immediate_lock:
             kwargs.setdefault("timeout", 15)
-            return self._send_request(method, url, **kwargs)
+            return self._send_request(method, url, immediate=True, **kwargs)
 
-    def _send_request(self, method, url, **kwargs):
+    def _send_request(self, method, url, *, immediate=False, **kwargs):
         """出口限速覆盖重试、WBI/凭证嵌套请求和交互通道，不只约束最外层调用。"""
         gate = self._egress_gate
         if gate is None:
             return self.session.request(method, url, **kwargs)
+        if immediate and gate.cooldown_remaining() > 0:
+            raise RiskControlError("出口冷却中，交互请求快速失败")
         lo, hi = REQUEST_DELAY_LONG if self._is_risk_api(url) else REQUEST_DELAY
-        with gate.request(random.uniform(lo, hi) * self._throttle):
+        # 普通请求必须在每次实际发出前检查共享出口冷却。路由层可能在一次
+        # fn(client) 中发出多个请求，不能只在 fn 开始前检查一次。
+        wait_cooldown = not immediate
+        with gate.request(random.uniform(lo, hi) * self._throttle, wait_cooldown=wait_cooldown):
             self._last_request_time = time.time()
             return self.session.request(method, url, **kwargs)
 
@@ -277,6 +314,7 @@ class BiliAPIClient:
         if self._is_wbi_api(url):
             params = self._sign_wbi(params)
 
+        risk_state: dict = {"done": False}
         for attempt in range(MAX_RETRY):
             try:
                 resp = self._request_locked("GET", url, params=params, headers=merged_headers,
@@ -284,10 +322,10 @@ class BiliAPIClient:
                 resp.raise_for_status()
                 data = resp.json()
                 if data.get("code") == -412:
-                    self._penalize_throttle("触发风控-412")
+                    self._note_risk("触发风控-412", risk_state)
                     if self.raise_on_risk:
                         # 编排层模式：一次短退避原地重试（防瞬时抖动），仍失败抛信号
-                        if attempt == 0:
+                        if attempt == 0 and MAX_RETRY > 1:
                             print("[API] 触发风控-412，短退避后原地重试一次...")
                             time.sleep(RETRY_BACKOFF)
                             continue
@@ -307,7 +345,7 @@ class BiliAPIClient:
                         # 非 WBI 端点不附加 w_rid/wts，重签无意义：直接按风控流程处理
                         # （对齐下方"重签后仍 -352/-403"的风控语义，跳过清缓存+重签）
                         if attempt < MAX_RETRY - 1:
-                            self._penalize_throttle(f"非WBI接口返回 {data.get('code')}")
+                            self._note_risk(f"非WBI接口返回 {data.get('code')}", risk_state)
                             if self.raise_on_risk:
                                 # 编排层模式：与 -412 同口径，先一次短退避原地重试（防瞬时抖动白换号）
                                 if attempt == 0:
@@ -321,19 +359,21 @@ class BiliAPIClient:
                             time.sleep(wait)
                             continue
                         if self.raise_on_risk:
+                            self._note_risk(f"非WBI接口 {data['code']} 重试耗尽", risk_state)
                             raise RiskControlError(f"非WBI接口 {data['code']} 重试耗尽")
                         return {"code": data["code"], "message": "非WBI接口风控拦截，重试已耗尽"}
-                    # 末次 attempt 不再清缓存+退避+重签（重签也是白做）：
-                    # 编排层模式抛信号；旧模式返回降级 dict 保留 -352/-403 语义
+                    # 清负缓存并强制重拉密钥。没拿到密钥不当风控，不切账号。
+                    resigned, had_key = self._resign_wbi(params)
+                    if not self._wbi_key:
+                        return {"code": data["code"], "message": "WBI密钥获取失败，未判定为风控"}
+                    params = resigned
                     if attempt < MAX_RETRY - 1:
-                        self._wbi_key = None
-                        self._wbi_key_date = None
-                        if attempt == 0:
-                            # 首次：按真签名失效处理，短退避后重签重发
+                        if attempt == 0 or not had_key:
+                            # 首次按签名失效处理；上次根本没签上的，拿到密钥后再试，仍不当风控
                             time.sleep(RETRY_BACKOFF)
                         else:
                             # 重签后仍 -352/-403：实为风控拦截（与签名无关，实测重签无效）
-                            self._penalize_throttle(f"重签后仍 {data.get('code')}")
+                            self._note_risk(f"重签后仍 {data.get('code')}", risk_state)
                             if self.raise_on_risk:
                                 raise RiskControlError(f"重签后仍 {data['code']}，判定为风控")
                             # 旧行为：与 -412 同等处理，全局冷却后再做最后一次尝试
@@ -341,30 +381,19 @@ class BiliAPIClient:
                             self._risk_cooldown_until = time.time() + wait
                             print(f"[API] 重签后仍 {data.get('code')}，判定为风控，冷却 {wait:.0f} 秒后重试...")
                             time.sleep(wait)
-                        params = self._sign_wbi(dict(params))
                         continue
-                    if self.raise_on_risk:
+                    if had_key and self.raise_on_risk:
+                        self._note_risk(f"{data['code']} 重签重试耗尽", risk_state)
                         raise RiskControlError(f"{data['code']} 重签重试耗尽")
+                    if not had_key:
+                        return {"code": data["code"], "message": "WBI密钥获取失败，未判定为风控"}
                     return {"code": data["code"], "message": "WBI签名失效/风控拦截，重试已耗尽"}
                 # 业务成功（非风控码）：自适应倍率缓慢回落
                 self._reward_throttle()
                 return data
-            except requests.exceptions.ProxyError as e:
-                # 代理连接失败是 IP 池故障而非目标站风控：立即上报，不消耗重试
-                raise ProxyConnError(str(e)) from e
-            except (requests.exceptions.SSLError,
-                    requests.Timeout, requests.ConnectionError) as e:
-                # 代理激活时隧道级失败（上游节点死亡多表现为 SSL EOF/连接重置/超时），
-                # 按 IP 池故障抛 ProxyConnError 触发切节点；直连时维持原重试降级
-                if self._proxy_active:
-                    raise ProxyConnError(str(e)) from e
-                if attempt < MAX_RETRY - 1:
-                    wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
-                    time.sleep(wait)
-                else:
-                    return {"code": -1, "message": f"请求异常: {e}"}
             except ValueError as e:
-                # ValueError 含 resp.json() 解析失败（风控 HTML 错误页等非 JSON 响应）
+                # ValueError 含 resp.json() 解析失败（风控 HTML 错误页等非 JSON 响应）。
+                # 必须先于 RequestException：requests 的 JSONDecodeError 同时是 ValueError。
                 if attempt < MAX_RETRY - 1:
                     wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
                     time.sleep(wait)
@@ -373,9 +402,9 @@ class BiliAPIClient:
             except requests.HTTPError as e:
                 status = e.response.status_code if e.response is not None else 0
                 if status == 412:
-                    self._penalize_throttle("触发风控HTTP412")
+                    self._note_risk("触发风控HTTP412", risk_state)
                     if self.raise_on_risk:
-                        if attempt == 0:
+                        if attempt == 0 and MAX_RETRY > 1:
                             print("[API] 触发风控HTTP412，短退避后原地重试一次...")
                             time.sleep(RETRY_BACKOFF)
                             continue
@@ -393,9 +422,24 @@ class BiliAPIClient:
                     time.sleep(wait)
                 else:
                     return {"code": -1, "message": f"HTTP错误 {status}"}
+            except requests.RequestException as e:
+                # ProxyError/ConnectTimeout/SSLError 才是节点故障；ReadTimeout、
+                # ChunkedEncodingError、ContentDecodingError 以及未知子类都按可重试传输错误处理。
+                if self._retry_transport(e, attempt, MAX_RETRY):
+                    continue
+                return {"code": -1, "message": f"请求异常: {e}"}
         return {"code": -1, "message": "重试次数耗尽"}
 
-    def post(self, url: str, data: dict = None, params: dict = None, **kwargs) -> dict:
+    def _resign_wbi(self, params: dict) -> tuple[dict, bool]:
+        """清掉 WBI 负缓存并强制重拉密钥。返回 (新参数, 重拉前是否已有密钥)。"""
+        had_key = bool(self._wbi_key)
+        self._wbi_key = None
+        self._wbi_key_date = None
+        self._wbi_key_fail_ts = 0.0
+        return self._sign_wbi(dict(params)), had_key
+
+    def post(self, url: str, data: dict = None, params: dict = None, *,
+             max_attempts: int | None = None, **kwargs) -> dict:
         """POST 请求（限速+重试），返回解析后的 JSON dict
 
         与 get() 同款限速/指数退避重试，耗尽降级返回 {"code": -1, ...} 不 raise。
@@ -403,25 +447,28 @@ class BiliAPIClient:
         计自适应降速、raise_on_risk 模式一次短退避原地重试后抛 RiskControlError、
         旧模式长冷却后重试、耗尽降级返回；不做 WBI 重签（post 本就不签）。
         任何模式遇代理连接失败抛 ProxyConnError（IP 池故障，立即上报不重试）。
+        max_attempts 默认 None 时仍用 MAX_RETRY；cookie 刷新传 1，避免一次性令牌被自动重试烧掉。
         不走 WBI 签名，也不调用 _ensure_buvid3（cookie 刷新等接口不需要，
         且避免在 buvid3 获取路径中嵌套 POST 造成递归）。
         """
-        for attempt in range(MAX_RETRY):
+        attempts = MAX_RETRY if max_attempts is None else max(1, min(MAX_RETRY, max_attempts))
+        risk_state: dict = {"done": False}
+        for attempt in range(attempts):
             try:
                 resp = self._request_locked("POST", url, data=data, params=params, **kwargs)
                 resp.raise_for_status()
                 body = resp.json()
                 if body.get("code") in (-412, -352, -403):
                     # 与 get() 相同的风控处理：计圈（自适应降速）、抛信号或冷却重试
-                    self._penalize_throttle(f"触发风控{body.get('code')}(post)")
+                    self._note_risk(f"触发风控{body.get('code')}(post)", risk_state)
                     if self.raise_on_risk:
                         # 编排层模式：一次短退避原地重试（防瞬时抖动），仍失败抛信号
-                        if attempt == 0:
+                        if attempt == 0 and attempts > 1:
                             print(f"[API] 触发风控{body.get('code')}(post)，短退避后原地重试一次...")
                             time.sleep(RETRY_BACKOFF)
                             continue
                         raise RiskControlError(f"{body['code']} 风控拦截(post)")
-                    if attempt < MAX_RETRY - 1:
+                    if attempt < attempts - 1:
                         wait = RISK_COOLDOWN + random.uniform(0, 60)
                         self._risk_cooldown_until = time.time() + wait
                         print(f"[API] 触发风控{body.get('code')}(post)，冷却 {wait:.0f} 秒后重试...")
@@ -431,22 +478,9 @@ class BiliAPIClient:
                 # POST 成功：自适应倍率缓慢回落
                 self._reward_throttle()
                 return body
-            except requests.exceptions.ProxyError as e:
-                # 代理连接失败是 IP 池故障而非目标站风控：立即上报，不消耗重试
-                raise ProxyConnError(str(e)) from e
-            except (requests.exceptions.SSLError,
-                    requests.Timeout, requests.ConnectionError) as e:
-                # 代理激活时隧道级失败按 IP 池故障处理（同 get()）
-                if self._proxy_active:
-                    raise ProxyConnError(str(e)) from e
-                if attempt < MAX_RETRY - 1:
-                    wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
-                    time.sleep(wait)
-                else:
-                    return {"code": -1, "message": f"请求异常: {e}"}
             except ValueError as e:
                 # ValueError 含 resp.json() 解析失败（非 JSON 响应）
-                if attempt < MAX_RETRY - 1:
+                if attempt < attempts - 1:
                     wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
                     time.sleep(wait)
                 else:
@@ -454,27 +488,31 @@ class BiliAPIClient:
             except requests.HTTPError as e:
                 status = e.response.status_code if e.response is not None else 0
                 if status == 412:
-                    self._penalize_throttle("触发风控HTTP412(post)")
+                    self._note_risk("触发风控HTTP412(post)", risk_state)
                     if self.raise_on_risk:
                         # 对齐 get()：一次短退避原地重试（防瞬时抖动），仍失败抛信号
-                        if attempt == 0:
+                        if attempt == 0 and attempts > 1:
                             print("[API] 触发风控HTTP412(post)，短退避后原地重试一次...")
                             time.sleep(RETRY_BACKOFF)
                             continue
                         raise RiskControlError("HTTP 412 风控拦截(post)")
                     # 旧模式：与 get() 同等处理，长冷却重试，耗尽后降级返回
-                    if attempt < MAX_RETRY - 1:
+                    if attempt < attempts - 1:
                         wait = RISK_COOLDOWN + random.uniform(0, 60)
                         self._risk_cooldown_until = time.time() + wait
                         print(f"[API] 触发风控HTTP412(post)，冷却 {wait:.0f} 秒后重试...")
                         time.sleep(wait)
                         continue
                     return {"code": -412, "message": "风控拦截"}
-                if attempt < MAX_RETRY - 1 and status >= 500:
+                if attempt < attempts - 1 and status >= 500:
                     wait = RETRY_BACKOFF * (2 ** attempt)
                     time.sleep(wait)
                 else:
                     return {"code": -1, "message": f"HTTP错误 {status}"}
+            except requests.RequestException as e:
+                if self._retry_transport(e, attempt, attempts):
+                    continue
+                return {"code": -1, "message": f"请求异常: {e}"}
         return {"code": -1, "message": "重试次数耗尽"}
 
     def get_raw(self, url: str, params: dict = None, *, max_attempts: int | None = None,
@@ -494,9 +532,6 @@ class BiliAPIClient:
                 # 原始响应成功：自适应倍率缓慢回落
                 self._reward_throttle()
                 return resp
-            except requests.exceptions.ProxyError as e:
-                # 代理连接失败：立即上报，不消耗重试
-                raise ProxyConnError(str(e)) from e
             except requests.HTTPError as e:
                 if (self.raise_on_risk and e.response is not None
                         and e.response.status_code == 412):
@@ -506,10 +541,9 @@ class BiliAPIClient:
                 if attempt < attempts - 1:
                     wait = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0, 1)
                     time.sleep(wait)
-            except (requests.exceptions.SSLError,
-                    requests.Timeout, requests.ConnectionError) as e:
-                # 代理激活时隧道级失败按 IP 池故障处理（同 get()）
-                if self._proxy_active:
+            except requests.RequestException as e:
+                # 节点故障立即上报；ReadTimeout / 分块与解码错误按可重试传输错误留下，未知子类也不穿透。
+                if self._is_node_fault(e):
                     raise ProxyConnError(str(e)) from e
                 last_exc = e
                 if attempt < attempts - 1:

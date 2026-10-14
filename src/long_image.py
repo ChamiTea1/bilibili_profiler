@@ -20,7 +20,7 @@ import time
 
 from PIL import Image, ImageDraw, ImageFont
 
-from report import PROBLEM_CATEGORY_COLORS as CATEGORY_COLORS
+from report import PROBLEM_CATEGORY_COLORS as CATEGORY_COLORS, mask_reply_prefix
 from config import (LONG_IMAGE_WIDTH, LONG_IMAGE_MIN_WIDTH, LONG_IMAGE_MAX_PIXELS,
                     LONG_IMAGE_FONT, LONG_IMAGE_SCALE, LONG_IMAGE_CRADLE_TOP_N,
                     LONG_IMAGE_ATTACK_TOP_N, LONG_IMAGE_COMMENT_TOP_N,
@@ -648,15 +648,24 @@ def _block_footer(p: Painter, x, y, w, spec: tuple) -> float:
 def build_payload(bvid: str, video_info: dict, profiles: list, stats: dict,
                   chart: dict, cringe_entries: list, attack: dict,
                   comments: list, repeat_events: list, low_conf: int,
-                  repeat_pool: dict | None = None) -> dict:
+                  repeat_pool: dict | None = None, *,
+                  mask: bool = False, mask_name=None,
+                  comment_total: int | None = None) -> dict:
     """把各阶段已装配好的数据整成渲染 payload。
 
     调用方（web.py）负责查库与误报扣除，本函数只做取字段/排序/截断，
     不再触碰数据源，便于离线测试直接喂字典。
+    mask/mask_name：遮蔽楼中楼正文「回复 @昵称」前缀（与昵称同一规则）。
+    comment_total：扣除误报后的问题评论总数；榜单仍只画前 N 条。
+    不传则沿用 comments 的长度（调用方未截断时与总数相同）。
     """
     stat = video_info.get("stat") or {}
     owner = video_info.get("owner") or {}
     danmaku = profiles[0].get("danmaku") if profiles else {}
+
+    def _vis(text) -> str:
+        """原文上图前：先遮蔽回复前缀里的昵称，再折叠空白。"""
+        return _clean(mask_reply_prefix(text or "", bool(mask), mask_name))
 
     spam_high = sum(1 for p in profiles
                     if (p.get("danmaku") or {}).get("spam_level") == "高")
@@ -668,7 +677,7 @@ def build_payload(bvid: str, video_info: dict, profiles: list, stats: dict,
     for p in cringe_entries[:LONG_IMAGE_CRADLE_TOP_N]:
         cr = p.get("cringe") or {}
         ex = (cr.get("examples") or [{}])[0] or {}
-        quote = _clean(ex.get("content") or "")
+        quote = _vis(ex.get("content") or "")
         reason = _clean(ex.get("reason") or "")
         if reason:
             quote = f"{quote}（{_clean(ex.get('category') or '')}: {reason}）" if quote else reason
@@ -685,16 +694,17 @@ def build_payload(bvid: str, video_info: dict, profiles: list, stats: dict,
                           "name": a.get("name") or "未知",
                           "cats": list(a.get("categories") or []),
                           "right": f"{a.get('count', 0)} 次",
-                          "quote": _clean(ex.get("content") or "")})
+                          "quote": _vis(ex.get("content") or "")})
     victims = []
     for v in (attack.get("victims") or [])[:LONG_IMAGE_ATTACK_TOP_N]:
         cm = list((v.get("comments") or {}).values())
         quote = ""
         if cm:
-            quote = _clean(cm[0].get("parent") or "")
+            quote = _vis(cm[0].get("parent") or "")
             atk = (cm[0].get("attacks") or [{}])[0] or {}
-            if atk.get("attack"):
-                quote = f"原评「{quote}」← {_clean(atk['attack'])}"
+            attack_text = _vis(atk.get("attack") or "")
+            if attack_text:
+                quote = f"原评「{quote}」← {attack_text}"
         victims.append({"rank": len(victims) + 1,
                         "name": v.get("name") or "未知",
                         "cats": [],
@@ -710,7 +720,7 @@ def build_payload(bvid: str, video_info: dict, profiles: list, stats: dict,
                    "name": c.get("name") or "未知",
                    "cats": [c["problem"]] if c.get("problem") else [],
                    "right": right,
-                   "quote": _clean(c.get("content") or ""),
+                   "quote": _vis(c.get("content") or ""),
                    "_heat": heat})
 
     # 复读事件：按发送者数降序
@@ -745,7 +755,7 @@ def build_payload(bvid: str, video_info: dict, profiles: list, stats: dict,
         "user_count": len(profiles),
         "spam_high": spam_high,
         "cringe_count": cringe_count,
-        "comment_problem": len(comments),
+        "comment_problem": len(comments) if comment_total is None else int(comment_total),
         "repeat_events": len(repeat_events or []),
         "low_conf": low_conf,
         "categories": cats,

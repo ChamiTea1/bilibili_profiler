@@ -125,6 +125,28 @@ rc = RefreshClient()
 n_new = C.refresh_comments(1, rc, bvid="BVC7")
 check("新增计数等于实际新增条数", n_new == 2, "(返回 %s)" % n_new)
 
+print("=== 8. 空页且 is_end 为假不写 done ===")
+class EmptyOpen:
+    def get(self, url, params=None, **kw):
+        return {"code": 0, "data": {"replies": [], "cursor": {
+            "is_end": False, "pagination_reply": {"next_offset": "more"}}}}
+C._fetch_comments_wbi(1, EmptyOpen(), 5, bvid="BVC8")
+kv8 = {r["key"]: r["value"] for r in storage.get_db().execute(
+    "SELECT key, value FROM phase_state WHERE bvid='BVC8' AND phase='comment'")}
+check("wbi 空页 is_end 为假时 done 不是 1", kv8.get("done") != "1", "done=%s" % kv8.get("done"))
+C._fetch_comments_legacy(1, EmptyOpen(), 5, bvid="BVC8L")
+kv8l = {r["key"]: r["value"] for r in storage.get_db().execute(
+    "SELECT key, value FROM phase_state WHERE bvid='BVC8L' AND phase='comment'")}
+check("legacy 空页 is_end 为假时 done 不是 1", kv8l.get("done") != "1", "done=%s" % kv8l.get("done"))
+
+class EmptyEnd:
+    def get(self, url, params=None, **kw):
+        return {"code": 0, "data": {"replies": [], "cursor": {"is_end": True}}}
+C._fetch_comments_wbi(1, EmptyEnd(), 5, bvid="BVC8E")
+kv8e = {r["key"]: r["value"] for r in storage.get_db().execute(
+    "SELECT key, value FROM phase_state WHERE bvid='BVC8E' AND phase='comment'")}
+check("空页且 is_end 为真仍算自然结束", kv8e.get("done") == "1")
+
 print("")
 print("==== 评论路径: %d 项通过, %d 项失败 ====" % (ok, fail))
 sys.exit(1 if fail else 0)

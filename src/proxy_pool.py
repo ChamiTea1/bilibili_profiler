@@ -27,14 +27,20 @@ class EgressGate:
         self.counts = {"ok": 0, "risk": 0, "proxy_error": 0, "api_error": 0}
         self.latencies = deque(maxlen=getattr(config, "PROXY_METRICS_WINDOW", 200))
 
+    def cooldown_remaining(self) -> float:
+        with self._state_lock:
+            return max(0.0, self.cooldown_until - time.monotonic())
+
     @contextmanager
-    def request(self, delay):
+    def request(self, delay, wait_cooldown=True):
+        """出口间隔始终等待。wait_cooldown=False 时不为冷却睡眠（调用方已在路由锁外等过，或交互请求要快速失败）。"""
         with self.lock:
             while True:
                 with self._state_lock:
                     now = time.monotonic()
-                    wait = max(self.cooldown_until - now,
-                               self.last_request + delay - now)
+                    cool = (self.cooldown_until - now) if wait_cooldown else 0.0
+                    rate = self.last_request + delay - now
+                    wait = max(cool, rate, 0.0)
                 if wait <= 0:
                     break
                 time.sleep(min(wait, 30))
@@ -112,6 +118,22 @@ class ProxyRoute:
         self.fail_streak = 0
         self.ready = not bool(proxy_url)
         self.generation = None
+
+    def note_core_restarted(self, generation):
+        """核心重新拉起后恢复代理绑定，避免请求静默一直直连。调用方不得已持有本锁以外的核心锁。"""
+        with self.lock:
+            if self.proxy_url:
+                self.active_proxy = self.proxy_url
+                self.stripped_at = None
+                self.fail_streak = 0
+                for client in list(self.clients):
+                    client.set_proxy(self.proxy_url)
+            self.generation = generation
+            self.ready = False
+            self.node = self.ip = None
+            self.probe_at = None
+            self._reset_connections()
+            self._set_gate("unknown")
 
     def sync_generation(self, generation):
         """内置核心重启/热加载后重新确认选择与出口，旧账号连接池同时失效。"""
@@ -258,38 +280,58 @@ class ProxyRoute:
             self._strip()
 
     def execute(self, client, fn, cooldown):
-        with self.lock:
-            self.prepare(client)
-            self._restore(client)
-            self._probe_ip(client)
-            failed_node, gate = self.node, self.gate
-            started = time.monotonic()
-            try:
-                result = fn(client)
-            except ProxyConnError as e:
-                gate.record("proxy_error", time.monotonic() - started)
-                if not self.active_proxy:
-                    raise
-                self.fail_streak += 1
-                if self.managed and self.clash and failed_node:
-                    self.clash.mark_dead(failed_node)
-                if self.fail_streak >= getattr(config, "PROXY_FAIL_STRIP_THRESHOLD", 3):
-                    self._strip()
-                else:
-                    self._rotate()
-                raise RetryProxyError("代理入口已处理，重试当前账号") from e
-            except RiskControlError:
-                gate.record("risk", time.monotonic() - started)
-                gate.cooldown(cooldown)
-                # 风控只降速/冷却，不以跨地区跳转替代等待，也不进入节点死名单。
+        # 核心是否还活着要在路由锁外看：start() 与热加载的锁序是先核心锁再路由锁。
+        _revive_builtin_core()
+        while True:
+            remaining = self.gate.cooldown_remaining()
+            if remaining > 0:
+                # 冷却睡眠不占路由锁，热加载和切节点不用干等冷却结束。
+                time.sleep(min(remaining, 30))
+                continue
+            with self.lock:
+                remaining = self.gate.cooldown_remaining()
+                if remaining > 0:
+                    continue
+                self.prepare(client)
+                self._restore(client)
+                self._probe_ip(client)
+                remaining = self.gate.cooldown_remaining()
+                if remaining > 0:
+                    continue
+                # _send_request 仍会在每个实际请求前等待共享出口冷却；一次
+                # fn(client) 可能包含多个请求，不能在这里永久跳过门控。
+                return self._execute_locked(client, fn, cooldown)
+
+    def _execute_locked(self, client, fn, cooldown):
+        """调用方已持有 route.lock。故障归因仍用请求开始时的节点。"""
+        failed_node, gate = self.node, self.gate
+        started = time.monotonic()
+        try:
+            result = fn(client)
+        except ProxyConnError as e:
+            gate.record("proxy_error", time.monotonic() - started)
+            if not self.active_proxy:
                 raise
-            except Exception:
-                gate.record("api_error", time.monotonic() - started)
-                raise
-            self.fail_streak = 0
-            kind = "api_error" if isinstance(result, dict) and result.get("code", 0) else "ok"
-            gate.record(kind, time.monotonic() - started)
-            return result
+            self.fail_streak += 1
+            if self.managed and self.clash and failed_node:
+                self.clash.mark_dead(failed_node)
+            if self.fail_streak >= getattr(config, "PROXY_FAIL_STRIP_THRESHOLD", 3):
+                self._strip()
+            else:
+                self._rotate()
+            raise RetryProxyError("代理入口已处理，重试当前账号") from e
+        except RiskControlError:
+            gate.record("risk", time.monotonic() - started)
+            gate.cooldown(cooldown)
+            # 风控只降速/冷却，不以跨地区跳转替代等待，也不进入节点死名单。
+            raise
+        except Exception:
+            gate.record("api_error", time.monotonic() - started)
+            raise
+        self.fail_streak = 0
+        kind = "api_error" if isinstance(result, dict) and result.get("code", 0) else "ok"
+        gate.record(kind, time.monotonic() - started)
+        return result
 
     def snapshot(self):
         with self.lock:
@@ -320,3 +362,28 @@ def pause_core_routes(api_url, secret):
 def risk_cooldown(single_account):
     base = config.SINGLE_ACCOUNT_RISK_COOLDOWN if single_account else config.RISK_COOLDOWN
     return base + random.uniform(0, 60)
+
+
+def _revive_builtin_core():
+    """请求路径上若内置核心进程已退出，重新 start()。没有订阅或还没创建过核心时不启动。
+
+    必须在路由锁外调用：start() 持有核心锁，热加载则是先核心锁再路由锁。
+    """
+    if not getattr(config, "SUB_URLS", None):
+        return
+    import proxy_core
+    core = proxy_core._CORE_INSTANCE
+    if core is None or not getattr(core, "sub_urls", None):
+        return
+    proc = getattr(core, "_proc", None)
+    if proc is None or proc.poll() is None:
+        return
+    ctl = core.start(allow_download=False)
+    if ctl is None:
+        return
+    api = f"http://127.0.0.1:{core.api_port}"
+    with _REGISTRY_LOCK:
+        routes = [r for r in _ROUTES.values()
+                  if r.clash and getattr(r.clash, "api_url", None) == api]
+    for route in routes:
+        route.note_core_restarted(core.generation)

@@ -88,11 +88,11 @@ def unknown():
     assert out[0]["candidates"][1]["status"] == "unknown"
 
 
-@case("明确不存在单独折叠，完整数学候选集仍保留")
+@case("404 候选不展示，内部完整数学候选集用于判定")
 def missing():
     out = groups(verifications={A: ("exists", {}), B: ("not_exists", {})})
     html = crc.render_crc_groups(out, "/endpoint", False, str, str)
-    assert "已排除账号" in html and str(A) in html and str(B) in html
+    assert "已排除账号" not in html and str(A) in html and str(B) not in html
     assert html.count('class="space-candidate"') == 1
 
 
@@ -144,7 +144,12 @@ def recorded_status():
     row["resolution"]["candidate_status"] = {str(A): "exists", str(B): "not_exists"}
     assert [c["status"] for c in groups(row=row)[0]["candidates"]] == ["exists", "not_exists"]
     row["resolution"]["checked_at"] = time.time() - 8 * 86400
-    assert all(c["status"] == "unknown" for c in groups(row=row)[0]["candidates"])
+    out = groups(row=row)[0]
+    # 新语义：过期只降级为"待复核/不可点击"，不把结论抹成未知——否则它会被重新
+    # 渲染成可点击名片，点进去就是 404（这正是本用例要防的回归）。
+    assert [c["status"] for c in out["candidates"]] == ["exists", "not_exists"]
+    assert not any(c["clickable"] for c in out["candidates"])
+    assert f"space.bilibili.com/{A}" not in crc.render_crc_groups([out], "/endpoint", False, str, str)
 
 
 @case("新解析保留全部候选的验证状态，不改变原置信度规则")
@@ -350,7 +355,10 @@ def long_card():
     out = groups(verifications={A: ("exists", {"name": "离线昵称甲", "face": "http://i0.hdslb.com/test.png", "sign": "公开签名"})})
     root = parser.fromstring(crc.render_crc_groups(out, "/endpoint", False, str, str))
     anchors = root.xpath('//a[@class="candidate-card"]')
-    assert len(anchors) == 2 and anchors[0].get("href") == f"https://space.bilibili.com/{A}"
+    # 只有 A 有核验结论；B 未核验 → 必须不可点击（旧版会把未核验候选也渲染成链接）
+    assert len(anchors) == 1 and anchors[0].get("href") == f"https://space.bilibili.com/{A}"
+    plain = crc.render_crc_groups(out, "/endpoint", False, str, str)
+    assert f"space.bilibili.com/{B}" not in plain and "待复核账号" in plain
     assert "公开签名" in anchors[0].text_content() and str(A) in anchors[0].text_content()
     assert anchors[0].xpath('.//img')[0].get("src") == "https://i0.hdslb.com/test.png"
     assert not anchors[0].xpath('.//button') and not root.xpath('//details[@class="space-candidate"]')
@@ -376,7 +384,7 @@ def card_only_api():
     assert storage.load_user_data(A) is None and storage.load_global_uid_map() == {}
 
 
-@case("完整名片和明确阴性命中缓存，不需要Cookie或API客户端")
+@case("完整名片和明确账号不存在命中缓存，不需要Cookie或API客户端")
 def card_cache_api():
     setup_video()
     storage.save_uid_verify_cache(A, "exists", {"uid": A, "name": "缓存昵称", "face": "", "sign": ""})
@@ -446,17 +454,17 @@ def multiple_existing():
     assert row["uid"] is None and row["method"] == "候选歧义"
 
 
-@case("全部候选明确不存在仍保留匿名及排除清单，不产生最终UID")
+@case("全部候选明确不存在只保留匿名，不展示排除清单")
 def all_missing():
     setup_video()
     for uid in (A, B):
         response = card_post(uid, CardClient({uid: {"code": -404}}))
     row = storage.load_senders(BV)[0]
     assert row["uid"] is None and row["method"] == "CRC32碰撞" and row["confidence"] == "无"
-    assert "候选均不存在" in response.json["group_html"] and "candidate-card\"" not in response.json["group_html"]
+    assert "没有可行 UID" in response.json["group_html"] and "candidate-card\"" not in response.json["group_html"]
 
 
-@case("名片风控响应和异常向前端传递停止信号，未知不写阴性缓存")
+@case("名片风控响应和异常向前端传递停止信号，未知不写账号不存在缓存")
 def card_risk():
     setup_video()
     for value in ({"code": -412}, RiskControlError("离线风控")):
@@ -473,7 +481,7 @@ def card_mismatch():
     assert not storage.load_uid_verify_cache([A], 100, 100)
 
 
-@case("回写候选时沿用每个原核验时间，不延长即将过期的阴性结论")
+@case("回写候选时沿用每个原核验时间，不延长即将过期的账号不存在结论")
 def negative_age():
     setup_video()
     at = time.time() - cards.UID_VERIFY_MISSING_TTL + 3
@@ -484,7 +492,10 @@ def negative_age():
     out = groups(row=row, verifications={A: ("exists", {"uid": A})})
     with patch.object(crc.time, "time", return_value=at + cards.UID_VERIFY_MISSING_TTL + 1):
         out = groups(row=row, verifications={A: ("exists", {"uid": A})})
-    assert out[0]["candidates"][1]["status"] == "unknown"
+    # 账号不存在结论过期后保留（只降级为不可点击），不再退回"未知"——否则会被重新渲染成
+    # 可点击名片，点进去就是 404
+    assert out[0]["candidates"][1]["status"] == "not_exists"
+    assert out[0]["candidates"][1]["clickable"] is False
 
 
 @case("旧空间样本不覆盖较新的-404存在性结论")
@@ -560,7 +571,7 @@ def refreshed_report():
     assert response.status_code == 200 and "离线昵称甲" in response.text and "公开签名" in response.text
 
 
-@case("核验后的目标CSV和JSON即时下载采用最新UID，保留完整候选审计")
+@case("核验后的目标CSV和JSON使用最新UID，不包含排除候选")
 def latest_export():
     import csv
     item = target_record()
@@ -573,7 +584,7 @@ def latest_export():
         assert response.status_code == 200 and response.json["senders"][0]["uid"] == A
         response = client.get('/api/target/crc-offline/export/csv')
         row = next(csv.DictReader(io.StringIO(response.text.lstrip('\ufeff'))))
-        assert row["UID"] == str(A) and row["置信度"] == "高" and str(B) in row["候选UID"]
+        assert row["UID"] == str(A) and row["置信度"] == "高" and str(B) not in row["候选UID"]
 
 
 @case("即时导出拒绝不存在报告及未知格式，CSV单元格仍防公式注入")
@@ -646,7 +657,7 @@ def upgrade_old_crc():
     assert result["stats"]["low_confidence_count"] == 0
 
 
-@case("旧低分级缺少有效阴性缓存或候选集不完整时不得迁移为高")
+@case("旧低分级缺少有效账号不存在缓存或候选集不完整时不得迁移为高")
 def incomplete_upgrade():
     row = sender(uid=A, confidence="低", method="CRC32破解")
     setup_video(row)
@@ -671,7 +682,7 @@ def restore_missing_candidate():
     assert updated["candidates"] == [A, B] and updated["uid"] is None and updated["method"] == "待验证"
 
 
-@case("高分级解析缓存有一个阴性结论过期即失效，不沿用默认一天的解析缓存")
+@case("高分级解析缓存有一个账号不存在结论过期即失效，不沿用默认一天的解析缓存")
 def high_cache_expiry():
     storage.save_uid_verify_cache(A, "exists", {"uid": A})
     storage.save_uid_verify_cache(B, "not_exists", {})
@@ -679,12 +690,12 @@ def high_cache_expiry():
     row = sender(uid=A, confidence="高", method="CRC32破解", resolution=resolver.resolution_record(H, verdict, {}))
     assert resolver.resolution_is_current(row, H, {})
     storage.save_uid_verify_cache(B, "not_exists", {}, time.time() - cards.UID_VERIFY_MISSING_TTL - 1)
-    # 新结论不能被旧写入回滚；模拟时间推进让既有阴性到期。
+    # 新结论不能被旧写入回滚；模拟时间推进让既有账号不存在到期。
     with patch.object(resolver.time, "time", return_value=time.time() + cards.UID_VERIFY_MISSING_TTL + 1):
         assert not resolver.resolution_is_current(row, H, {})
 
 
-@case("解析命中存在性缓存保留真实核验时间，不能刷新阴性有效期")
+@case("解析命中存在性缓存保留真实核验时间，不能刷新账号不存在有效期")
 def resolver_keeps_verification_time():
     at = time.time() - cards.UID_VERIFY_MISSING_TTL + 2
     storage.save_uid_verify_cache(A, "exists", {"uid": A})
@@ -694,7 +705,7 @@ def resolver_keeps_verification_time():
     assert out["confidence"] == "高" and out["resolution"]["candidate_checked_at"][str(B)] == at
 
 
-@case("较新的阴性已过期时不能复活更旧的阳性快照，继续保留未知")
+@case("较新的账号不存在已过期时不能复活更旧的账号存在快照，继续保留未知")
 def expired_negative_does_not_revive_positive():
     old_at = time.time() - 10000
     row = sender(uid=A, confidence="低", method="CRC32破解")
@@ -704,8 +715,12 @@ def expired_negative_does_not_revive_positive():
     latest = time.time() - cards.UID_VERIFY_MISSING_TTL - 1
     storage.save_uid_verify_cache(A, "not_exists", {}, latest)
     storage.save_uid_verify_cache(B, "not_exists", {})
-    out = groups(row=row, verifications={B: ("not_exists", {})}, verification_times={str(A): latest})
-    assert out[0]["candidates"][0]["status"] == "unknown"
+    # 页面按"全部结论"读取（load_uid_verify_verdicts），与真实调用链一致
+    verdicts = storage.load_uid_verify_verdicts([A, B], 7 * 86400, 3600)
+    out = groups(row=row, verifications=verdicts, verification_times={str(A): latest})
+    # 较新的账号不存在（虽已过期）作准，不复活更旧的账号存在快照；且不可点击
+    assert out[0]["candidates"][0]["status"] == "not_exists"
+    assert out[0]["candidates"][0]["clickable"] is False
     updated = cards.reconcile_crc_sender(BV, H)
     assert updated["uid"] is None and updated["method"] == "待验证"
 
@@ -732,7 +747,8 @@ def stale_high_retained():
     row["resolution"].update(candidate_version="mitm-v1", candidate_status={str(A): "exists", str(B): "not_exists"},
                              candidate_checked_at={str(A): time.time(), str(B): time.time() - cards.UID_VERIFY_MISSING_TTL - 1})
     out = groups(row=row, verifications={A: ("exists", {"uid": A})})
-    assert len(out) == 1 and out[0]["candidates"][1]["status"] == "unknown"
+    assert len(out) == 1 and out[0]["candidates"][1]["status"] == "not_exists"
+    assert out[0]["candidates"][1]["clickable"] is False   # 旧核验过期 → 待复核，不给跳转
 
 
 @case("已有完整缓存但尚未同步高分级的条目仍显示，回写完成才移除")
@@ -768,7 +784,7 @@ def resolved_routes_keep_data():
         target_html = client.get('/target/crc-offline').text
         assert "CRC32破解 · 高（存在性排除）" in target_html
         exported = client.get('/api/target/crc-offline/export/json').json
-        assert exported["senders"][0]["uid"] == A and exported["senders"][0]["resolution"]["candidates"] == [A, B]
+        assert exported["senders"][0]["uid"] == A and exported["senders"][0]["resolution"]["candidates"] == [A]
     assert storage.load_senders(BV) == before and len(storage.load_danmaku(BV)) == 2
     assert storage.load_video_profile(BV, A)["name"] == "已解析昵称"
     assert storage.load_uid_candidates(H, config.MITM_MAX_UID, "mitm-v1") == [A, B]
@@ -812,7 +828,8 @@ class ReportClient:
             return {"code": -412}
         if url == config.USER_CARD_URL:
             return {"code": 0, "data": {"card": {"mid": uid, "name": f"离线用户{uid}",
-                   "face": "https://i0.hdslb.com/test.png", "sign": "命令行保存的签名"}}}
+                   "face": "https://i0.hdslb.com/test.png", "sign": "命令行保存的签名",
+                   "level_info": {"current_level": 2}}}}
         field = {config.USER_VIDEOS_URL: "archives", config.USER_DYNAMICS_URL: "items",
                  config.USER_FOLLOWINGS_URL: "list"}[url]
         return {"code": 0, "data": {field: []}}
@@ -921,6 +938,75 @@ def readonly_script():
     assert 'fetch(' not in script and 'IntersectionObserver' not in script
 
 
+def _space_assessment(uid):
+    return {"uid": uid, "name": "甲", "verdict": "有弱关联线索，身份仍未确认",
+            "evidence": [
+                {"label": "公开名片", "source": "公开名片", "text": "相同发言",
+                 "url": f"https://space.bilibili.com/{uid}"},
+                {"label": "投稿", "source": "投稿首页", "text": "某视频",
+                 "url": "https://www.bilibili.com/video/BV1xx411c7mD"},
+                {"label": "关注", "source": "关注首页", "text": "他人", "kind": "following",
+                 "url": f"https://space.bilibili.com/{B}"},
+            ],
+            "examples": [], "coverage": [{"source": "公开名片", "status": "ok", "count": 1}],
+            "checked_at": "2026-01-01 00:00:00", "limit_note": "只检查公开首页"}
+
+
+@case("缺省 clickable 不可点，非可点击名片去掉本人空间链接并保留其他外链")
+def missing_clickable_not_linked():
+    row = {"uid": A, "status": "exists", "name": "甲", "sign": "签名", "card_ready": True}
+    blocked = (f'<a href="https://space.bilibili.com/{A}" target="_blank" rel="noopener">查看原文</a>'
+               f'<a href="https://www.bilibili.com/video/BV1xx411c7mD">视频</a>'
+               f'<a href="https://space.bilibili.com/{B}">他人</a>')
+    text = crc.render_candidate_card(row, H, "/endpoint", False, str, str, blocked)
+    assert f"space.bilibili.com/{A}" not in text
+    assert "BV1xx411c7mD" in text and f"space.bilibili.com/{B}" in text and "查看原文" in text
+    row["clickable"] = True
+    linked = crc.render_candidate_card(row, H, "/endpoint", False, str, str, blocked)
+    assert f'href="https://space.bilibili.com/{A}"' in linked and "BV1xx411c7mD" in linked
+
+
+@case("待复核分组与目标报告的过期存在候选不链向本人空间")
+def stale_exists_drops_self_link():
+    import target_report
+    group = {"mid_hash": H, "method": "候选歧义", "reason": "离线", "danmaku_count": 1,
+             "spam_level": "低", "problems": [], "samples": [], "matches": [], "matched_count": 0,
+             "candidate_complete": False, "reconcile_needed": False,
+             "candidates": [{"uid": A, "status": "exists", "fresh": False, "final": False, "clickable": False,
+                             "name": "甲", "face": "", "sign": "签名", "card_ready": True, "note": "结论已过期"}]}
+    html = crc.render_crc_group(group, "/endpoint", False, str, str, {(H, A): _space_assessment(A)},
+                                target_report.render_space_assessment)
+    assert f"space.bilibili.com/{A}" not in html
+    assert "BV1xx411c7mD" in html and f"space.bilibili.com/{B}" in html
+    storage.save_uid_verify_cache(A, "exists", {"uid": A, "name": "甲", "sign": "签名", "face": ""},
+                                  time.time() - 8 * 86400)
+    storage.save_uid_verify_cache(B, "exists", {"uid": B, "name": "乙", "sign": "签名", "face": "https://i0.hdslb.com/b.png"})
+    item = target_record()
+    page = target_report.render_target_report(item, {}, False, str, str, candidate_checks={(H, A): _space_assessment(A)})
+    assert f"space.bilibili.com/{A}" not in page
+    assert f"space.bilibili.com/{B}" in page and "BV1xx411c7mD" in page
+
+
+@case("不完整候选不得升高，且只有与 crack_crc32 全集一致才写 candidate_version")
+def incomplete_not_promoted():
+    row = sender(uid=A, method="CRC32破解", confidence="低")
+    row["resolution"]["candidates"] = [A]
+    row["resolution"].pop("candidate_version", None)
+    storage.save_uid_verify_cache(A, "exists", {"uid": A, "name": "甲", "sign": "签名", "face": "https://i0.hdslb.com/a.png"})
+    with patch.object(cards, "crack_crc32", return_value=[A, B]):
+        cards.prepare_candidate_reports({H: row}, None, cache_only=True)
+    assert row["uid"] is None and row["confidence"] != "高" and row["method"] == "待验证"
+    assert row["resolution"]["candidates"] == [A, B]
+    assert row["resolution"].get("candidate_version") == resolver.CANDIDATE_VERSION
+    other = sender(method="候选歧义")
+    other["resolution"].pop("candidate_version", None)
+    storage.save_uid_verify_cache(B, "exists", {"uid": B, "name": "乙", "sign": "签", "face": "https://i0.hdslb.com/b.png"})
+    with patch.object(cards, "crack_crc32", return_value=[A]):
+        cards.prepare_candidate_reports({H: other}, None, cache_only=True)
+    assert other["resolution"].get("candidate_version") != resolver.CANDIDATE_VERSION
+    assert other["confidence"] != "高"
+
+
 @case("缓存模式下候选资料准备零网络，缺失字段明确标注而不是在报告补采")
 def cli_cache_only():
     for uid in (A, B):
@@ -954,6 +1040,64 @@ def target_cli_pipeline():
         key = target.run_target_analysis(BV, make_selector("问题原文"), launch_web=False, skip_deep=True)
     saved = storage.load_target_analysis(key)["result"]["senders"][0].get("resolution", {})
     assert saved.get("candidate_cards", {}).get(str(A), {}).get("sign")
+
+
+@case("404 后明确 Lv0 排除，只保留唯一可行 UID；不采 Lv0 空间")
+def lv0_exclusion():
+    row = sender()
+    for uid, level in ((A, 0), (B, 2)):
+        storage.save_uid_verify_cache(uid, "exists", {"uid": uid, "name": "等级测试", "sign": "", "face": "", "level": level})
+    client = ReportClient()
+    cards.prepare_candidate_reports({H: row}, client)
+    assert row["uid"] == B and row["confidence"] == "高"
+    assert row["resolution"]["candidate_status"][str(A)] == "not_eligible"
+    assert all(uid != A for _, uid in client.calls)
+    assert str(A) not in row["resolution"].get("space_samples", {})
+    rendered = crc.render_crc_groups(groups(row=row), "/endpoint", False, str, str)
+    assert str(A) not in rendered
+    from target_analysis import public_target_result
+    exported = public_target_result({"senders": [row]})
+    assert exported["senders"][0]["candidates"] == [B]
+    assert str(A) not in json.dumps(exported)
+
+
+@case("全部 404 不查等级，不采空间，不产生 UID")
+def all_404_no_level():
+    row = sender()
+    for uid in (A, B):
+        storage.save_uid_verify_cache(uid, "not_exists", {})
+    client = ReportClient()
+    cards.prepare_candidate_reports({H: row}, client)
+    assert not client.calls and row["uid"] is None
+    rendered = crc.render_crc_groups(groups(row=row), "/endpoint", False, str, str)
+    assert str(A) not in rendered and str(B) not in rendered
+    assert "没有可行 UID" in rendered
+
+
+@case("等级缺失、空值、布尔值不误判 Lv0，明确整数零才排除")
+def strict_lv0():
+    for value in (None, False, "0"):
+        assert resolver.candidate_eligibility("exists", {"level": value}) == "exists"
+    assert resolver.candidate_eligibility("exists", {"level": 0}) == "not_eligible"
+    assert "level" not in resolver._card_info(A, {"mid": A})
+    result = resolver._finalize(H, 1, None, [A, B], None,
+        lambda u: "exists", lambda u: {"level": 0, "uid": u})
+    assert result[0] is None
+
+
+@case("终审新确认存在但 Lv0 时仍排除，不恢复名片或错误 UID")
+def lv0_recheck():
+    row = sender()
+    row["resolution"].update(candidate_status={str(A): "exists", str(B): "unknown"},
+        candidate_cards={str(A): {"uid": A, "status": "exists", "level": 2, "name": "可行"}},
+        candidate_checked_at={str(A): time.time()})
+    with patch.object(cards, "_verify_single", return_value=("exists", {"uid": B, "level": 0, "name": "不应保存"}, False)):
+        cards.recheck_ambiguous_candidates({H: row}, None)
+    assert row["uid"] == A and row["confidence"] == "高"
+    assert row["resolution"]["candidate_status"][str(B)] == "not_eligible"
+    assert "name" not in row["resolution"]["candidate_cards"][str(B)]
+    from target_analysis import public_target_result
+    assert str(B) not in json.dumps(public_target_result({"senders": [row]}))
 
 
 def main():

@@ -429,7 +429,7 @@ def index_links():
 @case("CSV包含未解析者及防公式注入，JSON保留原文与筛选")
 def export():
     result = {"selector": make_selector("=危险", "literal"), "profiles": [], "matches": [{"content": "=危险"}],
-              "senders": [{"mid_hash": "hash", "uid": None, "name": "+名字", "danmaku_count": 9,
+              "senders": [{"mid_hash": flow.calc_crc32(123456789), "uid": None, "name": "+名字", "danmaku_count": 9,
                            "matched_count": 2, "status": "未解析", "samples": ["=危险"], "candidates": [123456789]}]}
     prefix = str(Path(TMP.name) / "target_export")
     target.export_target(result, prefix)

@@ -186,6 +186,109 @@ if HAS_FONT:
           masked[:8] == b"\x89PNG\r\n\x1a\n" and masked != body,
           "(%d KB vs %d KB)" % (len(masked) // 1024, len(body) // 1024))
 
+
+# ---------- 4) 回复前缀遮蔽 / 刷屏误报降级 / 问题评论总数不被截断 ----------
+NICK = "被回复者完整昵称甲"
+REPLY = "回复 @%s :你在说什么" % NICK
+atk_mask = {"attackers": [{"name": "甲", "categories": ["引战阴阳"], "count": 1,
+                           "examples": [{"content": REPLY}]}],
+            "victims": [{"name": "乙", "count": 1, "comments": {"1": {
+                "parent": "原评", "attacks": [{"attack": REPLY}]}}}]}
+cmt_mask = [{"name": "丙", "like": 3, "reply_count": 1, "problem": "引战阴阳", "content": REPLY}]
+masked_pl = li.build_payload("BVmasknick1", video_info, profs[:1], stats, chart, [],
+                             atk_mask, cmt_mask, [], 0,
+                             mask=True, mask_name=web._mask_name)
+masked_blob = json.dumps(masked_pl, ensure_ascii=False)
+check("mask 开启时 payload 不含被回复者完整昵称",
+      NICK not in masked_blob and "（￣▽￣）甲" in masked_blob
+      and masked_pl["attackers"][0]["quote"].startswith("回复 @")
+      and "你在说什么" in masked_pl["problem_comments"][0]["quote"],
+      "(%s)" % masked_pl["attackers"][0]["quote"][:24])
+
+plain_pl = li.build_payload("BVmasknick1", video_info, profs[:1], stats, chart, [],
+                            atk_mask, cmt_mask, [], 0, mask=False, mask_name=web._mask_name)
+check("mask 关闭时回复前缀里的昵称保留",
+      NICK in plain_pl["attackers"][0]["quote"] and NICK in plain_pl["victims"][0]["quote"]
+      and NICK in plain_pl["problem_comments"][0]["quote"])
+
+if HAS_FONT:
+    from PIL import ImageDraw
+    drawn = []
+    _orig_text = ImageDraw.ImageDraw.text
+    def _spy_text(self, xy, text, *a, **k):
+        drawn.append(text if isinstance(text, str) else str(text))
+        return _orig_text(self, xy, text, *a, **k)
+    ImageDraw.ImageDraw.text = _spy_text
+    try:
+        li.render_long_image(masked_pl)
+    finally:
+        ImageDraw.ImageDraw.text = _orig_text
+    painted = "\n".join(drawn)
+    check("mask 开启时图上不出现被回复者的完整昵称",
+          NICK not in painted and "（￣▽￣）甲" in painted,
+          "(绘制 %d 段)" % len(drawn))
+
+hi = _prof(9, "刷屏样本", "高", 12)
+hi["_mid_hash"] = "abcd1234"
+web._apply_spam_fp([hi], {"abcd1234"})
+spam_pl = li.build_payload("BVspamfp01", video_info, [hi], stats, chart, [],
+                           {"attackers": [], "victims": []}, [], [], 0)
+badge = web.generate_user_card(hi)
+check("刷屏误报降级后长图高风险人数为 0、用户卡徽标为低",
+      spam_pl["spam_high"] == 0 and spam_pl["users"][0]["spam"] == "低"
+      and "低·已标误报" in badge and "高风险" not in badge,
+      "(spam_high=%s)" % spam_pl["spam_high"])
+
+short = [{"name": "丁", "like": 1, "reply_count": 0, "problem": "广告引流", "content": "广告"}]
+total_pl = li.build_payload("BVcmtcnt01", video_info, profs[:1], stats, chart, [],
+                            {"attackers": [], "victims": []}, short, [], 0,
+                            comment_total=37)
+check("问题评论总数用扣除误报后的全量，榜单仍只取前 N",
+      total_pl["comment_problem"] == 37 and len(total_pl["problem_comments"]) == 1,
+      "(total=%s shown=%s)" % (total_pl["comment_problem"], len(total_pl["problem_comments"])))
+
+# 路由：长图与网页共用降级，总览数字不被 PROBLEM_COMMENT_TOP_N 截断
+BV2 = "BVlimg00002"
+storage.save_video_info(BV2, {"bvid": BV2, "title": "长图口径", "cid": 1, "duration": 60,
+                              "owner": {"name": "UP"}, "stat": {"view": 1, "danmaku": 1, "reply": 1}})
+storage.save_sender(BV2, "abcd1234", 501, "高", "评论区验证", 12, ["滚"], "高", 9.0)
+storage.save_user_data(501, "刷屏高手", 4, {"uid": 501, "name": "刷屏高手"},
+                       {"uid": 501, "name": "刷屏高手", "level": 4,
+                        "danmaku": {"count": 12, "spam_level": "高", "spam_score": 9.0},
+                        "tags": []}, bvid=BV2)
+storage.toggle_false_positive(BV2, "spam", "abcd1234")
+cmt_rows = [{"uid": 8000 + i, "uname": "评%d" % i, "rpid": 3000 + i,
+             "content": ("回复 @%s :问题正文%d" % (NICK, i)),
+             "ctime": 1700000000, "like": 40 - i, "is_sub": 1, "reply_count": 0}
+            for i in range(32)]
+storage.save_comments(BV2, cmt_rows)
+storage.update_comment_problems(
+    BV2, {3000 + i: {"category": "引战阴阳", "severity": 1} for i in range(32)},
+    judged_rpids=[3000 + i for i in range(32)])
+storage.toggle_false_positive(BV2, "cmt", "3000")
+held = {}
+def _grab_render(payload, width=None):
+    held["payload"] = payload
+    return Image.new("RGB", (8, 8), "white")
+_orig_render = web.render_long_image
+web.render_long_image = _grab_render
+try:
+    cl2 = web.app.test_client()
+    cl2.set_cookie("mask", "1")
+    rr = cl2.get("/api/video/%s/longimage" % BV2)
+finally:
+    web.render_long_image = _orig_render
+got = held.get("payload") or {}
+check("长图路由扣除刷屏误报且问题评论总数不被截断",
+      rr.status_code == 200 and got.get("spam_high") == 0
+      and (got.get("users") or [{}])[0].get("spam") == "低"
+      and got.get("comment_problem") == 31
+      and len(got.get("problem_comments") or []) <= li.LONG_IMAGE_COMMENT_TOP_N
+      and NICK not in json.dumps(got, ensure_ascii=False),
+      "(status=%s spam=%s cmt=%s shown=%s)" % (
+          rr.status_code, got.get("spam_high"), got.get("comment_problem"),
+          len(got.get("problem_comments") or [])))
+
 print("")
 print("==== 分享长图导出: %d 项通过, %d 项失败 ====" % (ok, fail))
 sys.exit(1 if fail else 0)

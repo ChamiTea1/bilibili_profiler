@@ -186,9 +186,10 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
 
     bvid 提供时启用断点续采：每页落库 + phase_state 记录游标/页码/模式，
     中断后重跑从 resume_offset 继续翻页（已入库评论靠 UNIQUE 约束去重）。
-    自然终止（is_end/无新评论/真重复页）才写 done=1；中途失败、页数耗尽
-    截断（另写 truncated=1 供查询）、本轮 0 请求（resume_page 已达上限）
-    均不写 done，下次重跑仍从最后游标续采。"""
+    自然终止（is_end 为真，或有评论且接口不再给下一页游标）才写 done=1。
+    code=0 但 replies 为空、且 is_end 不为真时不算结束：风控降级也会返回空列表。
+    中途失败、页数耗尽截断（另写 truncated=1 供查询）、本轮 0 请求
+    （resume_page 已达上限）均不写 done，下次重跑仍从最后游标续采。"""
     all_comments = []
     offset = resume_offset
     natural_end = True   # 错误中断/截断/零请求时不写 done，下次重跑续采
@@ -237,6 +238,10 @@ def _fetch_comments_wbi(oid: int, client: BiliAPIClient, max_pages: int,
         page_data = data.get("data") or {}
         replies = page_data.get("replies") or []
         if not replies:
+            # 空列表且 is_end 不为真：不能把 natural_end 留成 True。对齐 UID 收割对
+            # 「空结构且非 is_end」的处理，风控降级同样会给出这种空页。
+            if not (page_data.get("cursor") or {}).get("is_end"):
+                natural_end = False
             break
 
         # 本轮重复页终止；数据库已有页可能是旧版中断重放，仍须继续推进游标。
@@ -321,6 +326,9 @@ def _fetch_comments_legacy(oid: int, client: BiliAPIClient, max_pages: int,
         page_data = data.get("data") or {}
         replies = page_data.get("replies") or []
         if not replies:
+            # 与 wbi 路径相同：空 replies 只有 is_end 才算自然结束。
+            if not (page_data.get("cursor") or {}).get("is_end"):
+                natural_end = False
             break
 
         page_comments = _collect_page(replies, oid, client, executor=executor)

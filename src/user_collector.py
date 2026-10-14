@@ -7,7 +7,7 @@
 维度4: 行为模式分析
 """
 from datetime import datetime, timezone, timedelta
-from api_client import BiliAPIClient
+from api_client import BiliAPIClient, ProxyConnError, RiskControlError
 from config import (
     USER_CARD_URL, USER_CARDS_BATCH_URL, USER_SPACE_URL, USER_VIDEOS_URL,
     USER_VIDEOS_LEGACY_URL,
@@ -382,12 +382,9 @@ def get_bangumi_list(uid: int, client: BiliAPIClient, btype: int = 1) -> list[di
     获取用户追番/追剧列表
     btype: 1=番剧, 2=追剧
     """
-    try:
-        data = client.get(USER_BANGUMI_URL, params={
-            "vmid": uid, "type": btype, "pn": 1, "ps": 15
-        })
-    except Exception:
-        return []
+    data = client.get(USER_BANGUMI_URL, params={
+        "vmid": uid, "type": btype, "pn": 1, "ps": 15
+    })
     if data.get("code") != 0:
         return []
 
@@ -465,6 +462,16 @@ def collect_user_data(uid: int, client: BiliAPIClient, log=None) -> dict:
         log = print
     log(f"  [Collect] UID:{uid} 开始采集...")
 
+    def _or_empty(label, fn, empty):
+        """其它异常降级为空并打一行警告；风控和代理故障必须上抛，避免被当成采集成功落库。"""
+        try:
+            return fn()
+        except (RiskControlError, ProxyConnError):
+            raise
+        except Exception as e:
+            log(f"  [Collect] 警告: UID:{uid} {label}采集失败（{type(e).__name__}），降级为空")
+            return empty
+
     # 维度1：主页信息
     card = get_user_card(uid, client)
     if "error" in card:
@@ -474,56 +481,31 @@ def collect_user_data(uid: int, client: BiliAPIClient, log=None) -> dict:
     user_data = {**card, **space}
 
     # 追番
-    try:
-        user_data["bangumi"] = get_bangumi_list(uid, client, btype=1)
-    except Exception:
-        user_data["bangumi"] = []
-    try:
-        user_data["dramas"] = get_bangumi_list(uid, client, btype=2)
-    except Exception:
-        user_data["dramas"] = []
+    user_data["bangumi"] = _or_empty("追番", lambda: get_bangumi_list(uid, client, btype=1), [])
+    user_data["dramas"] = _or_empty("追剧", lambda: get_bangumi_list(uid, client, btype=2), [])
 
     # 收藏夹
-    try:
-        folders = get_favorite_folders(uid, client)
-        user_data["favorite_folders"] = folders
-    except Exception:
-        folders = []
-        user_data["favorite_folders"] = []
+    folders = _or_empty("收藏夹", lambda: get_favorite_folders(uid, client), [])
+    user_data["favorite_folders"] = folders
     if folders:
-        try:
-            user_data["favorite_contents"] = get_favorite_contents(folders[0]["id"], client)
-        except Exception as e:
-            # 收藏夹内容采集失败降级为空列表，不连累已采的主页/追番/收藏夹数据
-            log(f"  [Collect] 警告: UID:{uid} 收藏夹内容采集失败（{e}），降级为空列表")
-            user_data["favorite_contents"] = []
+        user_data["favorite_contents"] = _or_empty(
+            "收藏夹内容", lambda: get_favorite_contents(folders[0]["id"], client), [])
     else:
         user_data["favorite_contents"] = []
 
     log(f"  [Collect] UID:{uid} 维度1(主页/收藏)完成，采集互动足迹...")
 
     # 维度2：互动足迹
-    try:
-        user_data["videos"] = get_user_videos(uid, client)
-    except Exception:
-        user_data["videos"] = []
-    try:
-        user_data["dynamics"] = get_user_dynamics(uid, client)
-    except Exception:
-        user_data["dynamics"] = []
+    user_data["videos"] = _or_empty("投稿", lambda: get_user_videos(uid, client), [])
+    user_data["dynamics"] = _or_empty("动态", lambda: get_user_dynamics(uid, client), [])
 
     log(f"  [Collect] UID:{uid} 维度2(互动足迹)完成，采集社交关系...")
 
     # 维度3：社交网络
-    try:
-        user_data["followings"] = get_followings(uid, client)
-    except Exception:
-        user_data["followings"] = []
-    try:
-        user_data["followers"] = get_followers(uid, client)
-    except Exception:
-        # 与 get_followers 正常返回结构（{"total", "sample"}）保持同型，防下游踩类型坑
-        user_data["followers"] = {"total": 0, "sample": []}
+    user_data["followings"] = _or_empty("关注", lambda: get_followings(uid, client), [])
+    # 与 get_followers 正常返回结构（{"total", "sample"}）保持同型，防下游踩类型坑
+    user_data["followers"] = _or_empty(
+        "粉丝", lambda: get_followers(uid, client), {"total": 0, "sample": []})
 
     log(f"  [Collect] UID:{uid} 维度3(社交关系)完成，分析关注偏好/行为模式...")
 

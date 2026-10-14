@@ -41,6 +41,11 @@ class ComboPool:
         return self.run(lambda c: c.get_raw(url, params=params, **kw), desc=url[-40:])
 
     @property
+    def accounts(self):
+        """[(账号名, client), ...]：供收尾逻辑（登录态回写）枚举全部账号"""
+        return list(self._accounts)
+
+    @property
     def current(self):
         with self._lock:
             return self._accounts[self._idx]
@@ -54,6 +59,15 @@ class ComboPool:
     def run(self, fn, desc=""):
         # 重试预算属于本次请求，其他线程的成功不能重置它。
         risk_marks, rounds = set(), 0
+        proxy_retries = 0
+        # 单请求的代理切节点上限：沿用已有重试次数，不另造一套散落数字。
+        proxy_limit = getattr(config, "PROXY_REQUEST_RETRIES", None)
+        if proxy_limit is None:
+            proxy_limit = getattr(config, "MAX_RETRY", 3)
+        try:
+            proxy_limit = max(1, int(proxy_limit))
+        except (TypeError, ValueError):
+            proxy_limit = 3
         while True:
             with self._lock:
                 idx = self._idx
@@ -62,6 +76,9 @@ class ComboPool:
             try:
                 result = route.execute(client, fn, risk_cooldown(len(self._accounts) == 1))
             except RetryProxyError:
+                proxy_retries += 1
+                if proxy_retries > proxy_limit:
+                    raise
                 continue
             except RiskControlError as e:
                 with self._lock:
