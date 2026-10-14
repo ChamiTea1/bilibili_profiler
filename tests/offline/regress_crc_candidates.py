@@ -210,13 +210,16 @@ def legacy_cache():
     assert count == 1 and "问题原文" in html and storage.load_danmaku_problems(BV) == {}
 
 
-@case("常规报告纯破解页在低置信度后，无画像仍展示全部候选")
+@case("常规报告移除低置信度页，无画像仍展示已核验纯破解候选")
 def normal_route():
     setup_video()
+    for uid in (A, B):
+        storage.save_uid_verify_cache(uid, "exists", {"uid": uid, "name": "离线候选", "face": "", "sign": ""})
     with patch.object(web, "_get_client", side_effect=AssertionError("报告不登录")):
         response = web.app.test_client().get(f"/video/{BV}")
     html = response.text
-    assert response.status_code == 200 and html.index('data-tab="lowconf"') < html.index('data-tab="crc"')
+    assert response.status_code == 200 and 'data-tab="lowconf"' not in html and 'data-tab="crc"' in html
+    assert 'id="tab-lowconf"' not in html and '低置信度:' not in html
     assert str(A) in html and str(B) in html and "问题原文" in html and 'id="tab-crc"' in html
 
 

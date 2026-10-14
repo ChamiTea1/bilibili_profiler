@@ -15,7 +15,9 @@ function switchTab(name) {
 // 从 URL hash 还原标签页（仅接受存在的标签名）
 function restoreTabFromHash() {
     const m = location.hash.match(/tab=(\w+)/);
-    if (m && document.querySelector('.tab-btn[data-tab="' + m[1] + '"]')) switchTab(m[1]);
+    // 旧低置信度链接归入用户画像，避免收藏链接停在已移除的标签页。
+    const name = m && m[1] === 'lowconf' ? 'users' : m && m[1];
+    if (name && document.querySelector('.tab-btn[data-tab="' + name + '"]')) switchTab(name);
 }
 
 // 概览图表（默认宽高比自适应，不写死高度）

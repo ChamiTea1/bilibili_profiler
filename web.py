@@ -70,7 +70,7 @@ from storage import (load_target_analysis, list_target_analyses,
                      load_uid_candidates, load_uid_verify_times)
 from target_report import render_target_report, render_target_list_page, page_number, render_space_assessment
 from candidate_space import candidate_uids, cached_assessments
-from crc_candidates import visible_candidate_uids, is_pure_crc, build_crc_groups, render_crc_groups, render_crc_group
+from crc_candidates import is_pure_crc, build_crc_groups, render_crc_groups, render_crc_group
 from main import run_analysis
 from uid_resolver import (resolve_sender, METHOD_CRC32_CRACK, build_evidence_maps,
                           resolution_is_current, resolution_record, VerificationBudget)
@@ -2420,66 +2420,6 @@ def target_list_page():
     return render_target_list_page(list_target_analyses(limit=getattr(_config, "TARGET_REPORT_LIST_LIMIT", 50)))
 
 
-def _low_conf_tab_html(bvid: str) -> tuple[str, int]:
-    """「低置信度」标签页：解析出 UID 但置信度为「低」的发送者（多为 CRC32 碰撞疑似误识别）。
-
-    自动流水线对低置信度用户不做深度采集/画像（main.py 阶段5 只收高/中置信度），
-    这里集中列出其 UID 与具体弹幕内容供人工复核；确认无误的可到「弹幕浏览器」
-    勾选对应 mid_hash 手动强制分析（无视置信度）。返回 (HTML, 人数)。"""
-    with closing(get_db()) as conn:
-        rows = conn.execute(
-            "SELECT mid_hash, uid, method, danmaku_count, contents_json, spam_level, resolution_json "
-            "FROM senders WHERE bvid = ? AND (confidence = '低' OR method IN ('候选歧义', '待验证')) "
-            "ORDER BY danmaku_count DESC", (bvid,)).fetchall()
-    if not rows:
-        return ('<p class="empty-note">无低置信度候选或待复核条目</p>', 0)
-    mask = _mask_on()
-    items = []
-    for r in rows:
-        uid = r["uid"]
-        uid_disp = _mask_uid(uid) if mask else str(uid)
-        record = json.loads(r["resolution_json"] or "{}")   # 先解析，链接判定要用它
-        # 只有能确认账号存在的 UID 才给跳转——报告里不得出现点进去 404 的账号
-        if uid is None:
-            uid_html = '<span>尚未确定 UID</span>'
-        elif uid_linkable({"uid": uid, "resolve_method": r["method"], "_resolution": record}):
-            uid_html = f'<a href="https://space.bilibili.com/{uid}" target="_blank" rel="noopener">UID:{esc(uid_disp)}</a>'
-        else:
-            uid_html = f'<span title="存在性未确认或核验已过期，不提供跳转">UID:{esc(uid_disp)}</span>'
-        candidate_html = "、".join(esc(_mask_uid(u) if mask else str(u)) for u in visible_candidate_uids({"mid_hash": r["mid_hash"], "resolution": record}))
-        reason_html = f'<div class="chart-hint">{esc(record.get("reason", ""))}'
-        if candidate_html:
-            reason_html += f' · 候选（未确认身份）：{candidate_html}'
-        reason_html += '</div>'
-        try:
-            contents = json.loads(r["contents_json"] or "[]")
-        except Exception:
-            contents = []
-        cnt = Counter(c for c in contents if c)
-        dm_html = "".join(
-            f'<li>{esc(c)}' + (f' <span class="tl-time">×{n}</span>' if n > 1 else "") + "</li>"
-            for c, n in cnt.most_common(15))
-        if len(cnt) > 15:
-            dm_html += f'<li class="ov-none">……另有 {len(cnt) - 15} 条不同内容</li>'
-        spam = r["spam_level"] or ""
-        spam_badge = f'<span class="spam-badge spam-{esc(spam)}">刷屏:{esc(spam)}</span>' if spam and spam != "低" else ""
-        items.append(f'''<div class="af-item">
-            <div class="af-line">
-                {uid_html}
-                <span class="hot-badge">{r["danmaku_count"]} 条弹幕</span>
-                <span class="method-badge" title="UID 解析方式">{esc(r["method"] or "")}</span>
-                <span class="risk-badge" title="低置信度解析存在 CRC32 撞库误识别风险">可能误识别</span>
-                {spam_badge}
-                <span class="uid">mid_hash:{esc(r["mid_hash"])}</span>
-            </div>
-            {reason_html}
-            <ul class="ov-list">{dm_html or '<li class="ov-none">弹幕内容未留存</li>'}</ul>
-        </div>''')
-    head = (f'<div class="chart-hint" style="margin:4px 0 10px">以下 {len(rows)} 条为低置信度候选或待复核记录。'
-            f'候选不代表身份确认；存在歧义或未完成验证的发送者保留匿名，不自动采集或屏蔽。</div>')
-    return head + "".join(items), len(rows)
-
-
 def _crc_candidate_data(bvid: str, target_record: dict | None = None,
                         include_resolved: bool = False) -> tuple[dict, list[dict]]:
     """按匿名 hash 读取问题证据和全部候选，GET 不调用破解、B站或 LLM。"""
@@ -2529,7 +2469,7 @@ def _crc_candidate_tab_html(bvid: str, target_record: dict | None = None) -> tup
 @app.route("/video/<bvid>")
 @_db_guard
 def video_page(bvid: str):
-    """报告页：常规八个标签页及低置信度后的纯破解候选页。
+    """报告页：常规八个标签页及纯破解候选页。
 
     整页 HTML 按 bvid 内存缓存（_PAGE_CACHE）：避免每次刷新重跑 _load_profiles/
     _attach_other_videos 逐用户查询；job（手动分析/重新生成）完成或删除时主动失效，
@@ -2583,7 +2523,6 @@ def video_page(bvid: str):
     rq = _resolve_quality(bvid)                          # 概览页解析质量区块
     repeat_block = _repeat_events_block(bvid)            # 概览页群体复读事件区块（含全池分布自检）
     dm_attrs = _danmaku_attr_stats(bvid)                 # 弹幕属性分布（mode/color）
-    lowconf_tab, lowconf_count = _low_conf_tab_html(bvid)  # 低置信度页（疑似误识别用户复核）
     crc_tab, crc_count = _crc_candidate_tab_html(bvid)
 
     # CSV/JSON 导出下载链接：默认只显示最新一组，历史导出收进 <details> 折叠块（spec 6）
@@ -2783,7 +2722,7 @@ def video_page(bvid: str):
             评论: {video_info.get('stat', {}).get('reply', 0):,} ·
             分析用户数: {stats['total']} · 大会员: {stats['vip_count']} ·
             刷屏用户: {stats['spam_levels'].get('高', 0) + stats['spam_levels'].get('中', 0)} ·
-            AI画像: {ai_count} · 低置信度: {lowconf_count}{coverage_line}
+            AI画像: {ai_count}{coverage_line}
         </div>
     </div>
 
@@ -2795,7 +2734,6 @@ def video_page(bvid: str):
         <button class="tab-btn" data-tab="attack" onclick="switchTab('attack')">争执焦点</button>
         <button class="tab-btn" data-tab="cmtwar" onclick="switchTab('cmtwar')">问题评论榜</button>
         <button class="tab-btn" data-tab="hot" onclick="switchTab('hot')">高回复评论</button>
-        <button class="tab-btn" data-tab="lowconf" onclick="switchTab('lowconf')">低置信度</button>
         <button class="tab-btn" data-tab="crc" onclick="switchTab('crc')">纯破解候选（{crc_count}）</button>
     </div>
 
@@ -2884,7 +2822,6 @@ def video_page(bvid: str):
 
     <div id="tab-hot" class="tab-pane">{hot_tab}</div>
 
-    <div id="tab-lowconf" class="tab-pane">{lowconf_tab}</div>
     <div id="tab-crc" class="tab-pane">{crc_tab}</div>
 
     <div id="wc-popup" class="wc-popup"><canvas id="wc-popup-canvas" width="276" height="216"></canvas></div>
@@ -3368,7 +3305,11 @@ def api_longimage(bvid: str):
     attack = _attack_focus(bvid, fp_cmt)
     problem_comments, _marked, comment_total = _problem_comment_board(bvid, fp_cmt)
     repeat_events, _dist = _repeat_events_data(bvid)
-    low_conf = _low_conf_tab_html(bvid)[1]
+    # 长图仍保留解析质量统计，不再依赖已移除标签页的 HTML 渲染。
+    with closing(get_db()) as conn:
+        low_conf = conn.execute(
+            "SELECT COUNT(*) FROM senders WHERE bvid=? AND "
+            "(confidence='低' OR method IN ('候选歧义', '待验证'))", (bvid,)).fetchone()[0]
     payload = build_payload(bvid, video_info, profiles, stats, chart, cringe_entries,
                             attack, problem_comments, repeat_events, low_conf,
                             mask=_mask_on(), mask_name=_mask_name,
