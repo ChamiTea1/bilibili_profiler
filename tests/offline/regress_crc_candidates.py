@@ -278,7 +278,7 @@ def cached_space_api():
     before = storage.load_senders(BV)
     with patch.object(web, "_get_client", side_effect=AssertionError("页面不采集")):
         client = web.app.test_client()
-        assert "离线候选甲" in client.get(f"/video/{BV}").text
+        assert "离线候选甲" not in client.get(f"/video/{BV}").text
         response = client.post(f"/api/video/{BV}/candidate-space", json={"mid_hash": H, "uid": A})
     assert response.status_code == 410 and storage.load_senders(BV) == before
 
@@ -359,13 +359,12 @@ def long_card():
     out = groups(verifications={A: ("exists", {"name": "离线昵称甲", "face": "http://i0.hdslb.com/test.png", "sign": "公开签名"})})
     root = parser.fromstring(crc.render_crc_groups(out, "/endpoint", False, str, str))
     anchors = root.xpath('//a[@class="candidate-card"]')
-    # 只有 A 有核验结论；B 未核验 → 必须不可点击（旧版会把未核验候选也渲染成链接）
-    assert len(anchors) == 1 and anchors[0].get("href") == f"https://space.bilibili.com/{A}"
+    # B 未完成终审时，A 也不能单独展示，避免报告制造“唯一候选已确定”的假象。
+    assert len(anchors) == 0
     plain = crc.render_crc_groups(out, "/endpoint", False, str, str)
     assert f"space.bilibili.com/{B}" not in plain and "待复核账号" not in plain
-    assert "公开签名" in anchors[0].text_content() and str(A) in anchors[0].text_content()
-    assert anchors[0].xpath('.//img')[0].get("src") == "https://i0.hdslb.com/test.png"
-    assert not anchors[0].xpath('.//button') and not root.xpath('//details[@class="space-candidate"]')
+    assert "公开签名" not in plain and str(A) not in plain
+    assert not root.xpath('//details[@class="space-candidate"]')
 
 
 @case("危险头像协议及名片XSS被剔除或转义，空签名与待读取区分")
@@ -384,7 +383,7 @@ def card_only_api():
     response = card_post(A, fake)
     assert response.status_code == 200 and response.json["status"] == "exists"
     assert fake.calls == [(config.USER_CARD_URL, {"mid": A})]
-    assert "公开签名" in response.json["group_html"] and "candidate-avatar" in response.json["group_html"]
+    assert "公开签名" not in response.json["group_html"] and "candidate-avatar" not in response.json["group_html"]
     assert storage.load_user_data(A) is None and storage.load_global_uid_map() == {}
 
 
@@ -419,6 +418,25 @@ def normal_convergence():
     assert response.json["group_removed"] and response.json["candidate_count"] == 0
     assert not response.json["group_html"] and "暂无待复核" in response.json["empty_html"]
     assert storage.load_global_uid_map() == {} and storage.load_user_data(A) is None
+
+
+@case("终审 final 的404超过普通TTL后，唯一存在者仍移出候选页")
+def final_missing_hides_resolved():
+    row = sender(uid=A, confidence="高", method="CRC32破解")
+    row["resolution"].update(candidate_version="mitm-v1", candidate_status={str(A): "exists", str(B): "not_exists"},
+                               candidate_checked_at={str(A): time.time(), str(B): time.time() - 7200})
+    setup_video(row)
+    storage.save_uid_verify_cache(A, "exists", {"uid": A, "name": "甲", "face": "", "sign": ""})
+    storage.save_uid_verify_cache(B, "not_exists", {"miss_count": 2, "final": True}, time.time() - 7200)
+    html, count = web._crc_candidate_tab_html(BV)
+    assert count == 0 and f"space.bilibili.com/{A}" not in html
+    assert web._crc_candidate_data(BV, include_resolved=True)[1]  # 内部审计仍保留完整候选。
+    final_ttl = max(3600, int(getattr(config, "UID_RECHECK_FINAL_TTL", 30 * 86400)))
+    out = groups(row=row, verifications={
+        A: {"status": "exists", "info": {"uid": A}, "verified_at": time.time(), "fresh": True},
+        B: {"status": "not_exists", "info": {}, "verified_at": time.time() - final_ttl - 1,
+            "fresh": False, "final": True}})
+    assert out  # 终审有效期也到期时不能继续沿用旧结论。
 
 
 @case("目标快照收敛后UID昵称与统计同步，保留命中原文且不自动产生画像")
@@ -465,7 +483,7 @@ def all_missing():
         response = card_post(uid, CardClient({uid: {"code": -404}}))
     row = storage.load_senders(BV)[0]
     assert row["uid"] is None and row["method"] == "CRC32碰撞" and row["confidence"] == "无"
-    assert "没有可行 UID" in response.json["group_html"] and "candidate-card\"" not in response.json["group_html"]
+    assert (not response.json["group_html"] or "没有可行 UID" in response.json["group_html"]) and "candidate-card\"" not in response.json["group_html"]
 
 
 @case("名片风控响应和异常向前端传递停止信号，未知不写账号不存在缓存")
@@ -572,7 +590,7 @@ def refreshed_report():
     card_post(A)
     with patch.object(web, "_get_client", side_effect=AssertionError("GET只读缓存")):
         response = web.app.test_client().get(f"/video/{BV}")
-    assert response.status_code == 200 and "离线昵称甲" in response.text and "公开签名" in response.text
+    assert response.status_code == 200 and "离线昵称甲" not in response.text and "公开签名" not in response.text
 
 
 @case("核验后的目标CSV和JSON使用最新UID，不包含排除候选")
@@ -622,7 +640,7 @@ def shared_missing_cache():
     for uid in (A, B):
         storage.save_uid_verify_cache(uid, "not_exists", {})
     html, _ = web._crc_candidate_tab_html(BV)
-    assert 'data-reconcile="1"' in html and 'class="candidate-card"' not in html
+    assert 'class="candidate-card"' not in html and '没有可行 UID' not in html
     with patch.object(web, "_get_client", side_effect=AssertionError("同步排除不登录")):
         response = card_post(A)
     assert response.status_code == 200 and storage.load_senders(BV)[0]["uid"] is None
@@ -1075,7 +1093,7 @@ def all_404_no_level():
     assert not client.calls and row["uid"] is None
     rendered = crc.render_crc_groups(groups(row=row), "/endpoint", False, str, str)
     assert str(A) not in rendered and str(B) not in rendered
-    assert "没有可行 UID" in rendered
+    assert "candidate-card\"" not in rendered
 
 
 @case("等级缺失、空值、布尔值不误判 Lv0，明确整数零才排除")

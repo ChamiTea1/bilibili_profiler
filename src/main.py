@@ -1064,13 +1064,31 @@ def run_analysis(bvid: str, force: bool = False, max_users: int | None = None, l
                         info.get("spam_level", "低"), info.get("spam_score", 0.0),
                         resolution=info.get("resolution"))
 
-        _stats = recheck_ambiguous_candidates(resolved, client, on_progress=_save_recheck)
-        if _stats["targets"]:
-            print(f"[Phase 4+] 歧义候选终审复核: 目标 {_stats['targets']} 人，复核 {_stats['checked']} 次，"
-                  f"调整 {_stats['flipped']}，终审排除 {_stats['finalized']}，待下轮 {_stats['pending']}"
-                  + ("（风控暂停，冷却后下次运行继续）" if _stats["stopped"] else ""))
+        # 终审未收敛前不得进入阶段5或生成报告。否则报告会出现“只剩一个可见候选”
+        # 的假象，用户无法在报告页完成剩余 404/Lv0/网络核验。
+        recheck_round = 0
+        while True:
+            recheck_round += 1
+            _stats = recheck_ambiguous_candidates(resolved, client, on_progress=_save_recheck)
+            if _stats["targets"]:
+                print(f"[Phase 4+] 歧义候选终审复核: 第 {recheck_round} 轮，目标 {_stats['targets']} 人，"
+                      f"复核 {_stats['checked']} 次，调整 {_stats['flipped']}，终审排除 {_stats['finalized']}，"
+                      f"剩余未收敛 {_stats['pending']}")
+            if not _stats["pending"]:
+                break
+            # recheck_pending 的跨进程冷却用于普通重跑；同一次命令行分析必须继续完成，
+            # 因此清掉本轮等待标记，按较短轮间隔直接重新发起终审。Ctrl+C 可安全中断。
+            for item in resolved.values():
+                pending = (item.get("resolution") or {}).get("recheck_pending")
+                if isinstance(pending, dict):
+                    pending.clear()
+            interval = max(1, int(getattr(config, "UID_RECHECK_INTERVAL", 90)))
+            print(f"[Phase 4+] 仍有 {_stats['pending']} 个候选未完成终审，{interval} 秒后继续；"
+                  "终审完成前不采集用户、不生成最终报告")
+            time.sleep(interval)
     except Exception as e:
-        print(f"[Phase 4+] UID终审复核异常（忽略，不影响后续采集）: {e}")
+        print(f"[Phase 4+] UID终审复核异常，停止本次后续采集以避免生成未收敛报告: {e}")
+        raise
 
     # 阶段5: 用户采集（组合池透明接管风控轮换）
     user_data_map = timer.run("阶段5 用户采集", phase_collect_users, resolved, pool,

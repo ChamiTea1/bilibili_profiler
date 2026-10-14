@@ -102,7 +102,7 @@ storage.save_uid_verify_cache(B, "exists", {"uid": B, "name": "乙", "sign": "s"
 verdicts3 = storage.load_uid_verify_verdicts([A, B], 7 * 86400, 3600)
 _, html3 = render(verdicts3, sender())
 check("含过期证据时不得判「唯一存在候选 · 高」", "唯一存在候选" not in html3)
-check("新鲜存在的候选才可点击", links(html3) == {str(B)}, "(链接 %s)" % sorted(links(html3)))
+check("同组仍有过期排除未完成时不单独展示新鲜候选", not links(html3), "(链接 %s)" % sorted(links(html3)))
 
 print("=== 4. 终审循环：调整→等待→收敛；双 404 判 final ===")
 storage.save_uid_verify_cache(A, "not_exists", {}, time.time())

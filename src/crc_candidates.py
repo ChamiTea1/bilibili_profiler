@@ -161,19 +161,42 @@ def build_crc_groups(senders: list[dict], danmaku: list[dict], problems: dict,
             # 硬约束：只有"新鲜核验为存在"的账号才允许出现跳转链接——过期的账号存在结论
             # 也可能早已注销，点进去就是 404，因此未收敛时不进入报告。
             clickable = status == "exists" and fresh
-            candidates.append({"uid": uid, "status": status, "fresh": fresh, "final": final,
+            candidates.append({"uid": uid, "status": status, "fresh": fresh, "final": final, "at": at,
                                "clickable": clickable,
                                "name": info.get("name", ""),
                                "face": info.get("face", ""), "sign": info.get("sign", ""),
                                "card_ready": status in ("not_exists", "not_eligible") or (status == "exists" and "sign" in info and "face" in info),
                                "note": note})
+        # 全部候选都已稳定排除（404/Lv0）时没有可展示的身份，直接移出候选页。
+        final_ttl = max(3600, int(getattr(config, "UID_RECHECK_FINAL_TTL", 30 * 86400)))
+        now = time.time()
+        unresolved = any(
+            c["status"] == "unknown"
+            or (c["status"] == "exists" and not c.get("fresh"))
+            or (c["status"] == "not_eligible" and not c.get("fresh"))
+            or (c["status"] == "not_exists" and not c.get("fresh")
+                and not (c.get("final") and 0 <= now - c.get("at", now) < final_ttl))
+            for c in candidates)
+        if not any(c["status"] == "exists" for c in candidates) and not unresolved:
+            continue
+
         # 判定只用"新鲜且已知"的证据；展示一律采用最新结论（三态见 render_crc_group）。
         # 过期证据不得用于"唯一存在→升高 UID"，否则等于用陈旧信息给账号定性。
         exists = [c["uid"] for c in candidates if c["status"] == "exists" and c["fresh"]]
         known = all(c["status"] != "unknown" for c in candidates)
         fresh_all = all(c["fresh"] for c in candidates)
         complete = sender.get("_candidate_complete", resolution.get("candidate_version") == "mitm-v1")
-        resolved = (complete and known and fresh_all and len(exists) == 1 and sender.get("uid") == exists[0]
+        final_ttl = max(3600, int(getattr(config, "UID_RECHECK_FINAL_TTL", 30 * 86400)))
+        # 普通 404 缓存只有 1 小时，但终审已累计确认并标记 final 的不存在结论
+        # 在终审有效期内仍然是稳定排除证据，不能因此把唯一存在者重新放回候选页。
+        stable_excluded = all(
+            (c["status"] == "not_eligible" and c.get("fresh"))
+            or (c["status"] == "not_exists" and
+                (c.get("fresh") or (c.get("final") and
+                 0 <= now - c.get("at", now) < final_ttl)))
+            or (c["status"] == "exists" and c.get("fresh"))
+            for c in candidates)
+        resolved = (complete and known and stable_excluded and len(exists) == 1 and sender.get("uid") == exists[0]
                     and sender.get("confidence") == "高" and sender.get("method") == "CRC32破解")
         if resolved and not include_resolved:
             continue
@@ -237,8 +260,22 @@ def render_crc_group(group: dict, endpoint: str, mask: bool, mask_name, mask_uid
     not_exists / not_eligible → 不展示账号资料。"""
     h = group["mid_hash"]
     exists = [c for c in group["candidates"] if c["clickable"]]
-    pending = [c for c in group["candidates"]
-               if not c["clickable"] and c["status"] not in ("not_exists", "not_eligible")]
+    final_ttl = max(3600, int(getattr(config, "UID_RECHECK_FINAL_TTL", 30 * 86400)))
+    now = time.time()
+
+    def stable(c):
+        if c.get("status") == "exists":
+            return bool(c.get("fresh"))
+        if c.get("status") == "not_eligible":
+            return bool(c.get("fresh"))
+        if c.get("status") == "not_exists":
+            return bool(c.get("fresh")) or bool(c.get("final")) and 0 <= now - c.get("at", now) < final_ttl
+        return False
+
+    pending = [c for c in group["candidates"] if not stable(c)]
+    # 同组仍有候选未完成终审时，不能只展示当前已确认存在的一个，避免造成“唯一候选已确定”的假象。
+    if pending:
+        exists = []
     excluded = [c for c in group["candidates"] if c["status"] in ("not_exists", "not_eligible")]
     unique = (len(exists) == 1 and not pending and group.get("candidate_complete", False)
               and all(c.get("fresh") for c in group["candidates"]))

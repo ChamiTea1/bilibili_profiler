@@ -293,8 +293,10 @@ def _():
             pass
 
     def launch():
+        ports = itertools.count(18080)
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(pc, "_RUNTIME_DIR", tmp), \
+                patch.object(pc, "_free_port", side_effect=lambda: next(ports)), \
                 patch.object(pc, "ensure_binary", return_value=os.path.join(tmp, "mihomo")), \
                 patch.object(pc.subprocess, "Popen", FakePopen), \
                 patch.object(pc.atexit, "register"), \

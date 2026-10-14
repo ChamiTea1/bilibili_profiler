@@ -434,17 +434,20 @@ def targeted_budget():
     assert cli.calls[-1][1]['pn'] == 3
 
 
-@case('歧义和待验证条目展示全部候选并遵守遮蔽开关')
+@case('移除低置信度标签后，低置信度用户长条保留原文且遵守遮蔽开关')
 def pending_ui():
+    from lxml import html as parser
     verdict = (None, '无', ur.METHOD_AMBIGUOUS, {}, True, [A, B])
     storage.save_sender('BV复核', H, None, '无', ur.METHOD_AMBIGUOUS, 2, ['测试'], '低', 0,
                         resolution=ur.resolution_record(H, verdict, {H: {A, B}}))
+    storage.save_sender('BV复核', '跨视频明文', A, '低', '评论区验证', 1, ['低置信度原文'], '低', 0)
     with web.app.test_request_context('/'):
-        html, count = web._low_conf_tab_html('BV复核')
-        assert count == 1 and str(A) in html and str(B) in html and '尚未确定 UID' in html
+        html = web._light_user_cards('BV复核', [], False, set())
+        assert str(A) in parser.fromstring(html).text_content() and '低置信度原文' in html
+        assert str(B) not in html and '待复核账号' not in html
     with web.app.test_request_context('/', headers={'Cookie': 'mask=1'}):
-        html, count = web._low_conf_tab_html('BV复核')
-        assert str(A) not in html and str(B) not in html
+        html = web._light_user_cards('BV复核', [], True, set())
+        assert str(A) not in parser.fromstring(html).text_content()
     assert web._build_blocklist('BV复核', {'dm', 'spam'}, 100)['entries'] == []
 
 

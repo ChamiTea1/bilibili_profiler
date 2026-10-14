@@ -311,7 +311,7 @@ B站接口有风控，请求间隔是硬约束（基础 0.8–1.6 秒，高风�
 ### 7. 工程现状
 
 - 端到端验证依赖真实网络与有效 Cookie（`quick_test.py` 冒烟 / `run.py` 全流程）。
-- 现有离线检查手段：**`python tests/run_all.py`**（622 项离线回归，无需外网与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查。代理改动可额外运行 `python tests/offline/regress_proxy_pool.py --mihomo`，用已有核心和本机临时 HTTPS 服务验证真实路由，不访问外网。
+- 现有离线检查手段：**`python tests/run_all.py`**（623 项离线回归，无需外网与 Cookie）+ `--lint` 附带 `pyflakes` 静态检查。代理改动可额外运行 `python tests/offline/regress_proxy_pool.py --mihomo`，用已有核心和本机临时 HTTPS 服务验证真实路由，不访问外网。
 
 ## 免责声明
 
