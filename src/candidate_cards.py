@@ -187,8 +187,9 @@ def recheck_ambiguous_candidates(resolved: dict, client, on_progress=None) -> di
     final_ttl = max(3600, int(getattr(config, "UID_RECHECK_FINAL_TTL", 30 * 86400)))
 
     now = time.time()
+    # 单候选也必须终审：批量接口或网络风控可能让唯一候选留下 unknown，不能带进报告。
     senders = {h: info for h, info in resolved.items()
-               if is_pure_crc(info) and len(candidate_uids(info)) > 1}
+               if is_pure_crc(info) and candidate_uids(info)}
     if not senders:
         return stats
     targets: dict = {}

@@ -259,7 +259,7 @@ def api_validation():
 def isolation():
     setup_video(sender(spam_level="高"))
     html, count = web._crc_candidate_tab_html(BV)
-    assert count == 1 and str(A) in html and str(B) in html
+    assert count == 1 and str(A) not in html and str(B) not in html
     assert storage.load_global_uid_map() == {} and storage.load_user_data(A) is None
     assert web._build_blocklist(BV, {"spam"}, 100, include_lowconf=True)["entries"] == []
 
@@ -271,6 +271,7 @@ def cached_space_api():
               "sources": {kind: {"status": "ok", "items": []} for kind in ("card", "videos", "dynamics", "followings")}}
     sample["sources"]["card"]["items"] = [{"name": "离线候选甲", "text": "公开签名"}]
     storage.save_uid_space_cache(A, sample)
+    storage.save_uid_verify_cache(A, "exists", {"uid": A, "name": "离线候选甲", "sign": "公开签名", "face": ""})
     before = storage.load_senders(BV)
     with patch.object(web, "_get_client", side_effect=AssertionError("页面不采集")):
         client = web.app.test_client()
@@ -287,7 +288,7 @@ def mathematical_fallback():
     storage.save_uid_candidates(H, config.MITM_MAX_UID, resolver.CANDIDATE_VERSION, [A, B])
     with patch.object(resolver, "crack_crc32", side_effect=AssertionError("报告不破解")):
         html, count = web._crc_candidate_tab_html(BV)
-    assert count == 1 and str(A) in html and str(B) in html
+    assert count == 1 and str(A) not in html and str(B) not in html
 
 
 @case("旧的成功批次缓存可恢复，越界和错误类别不生成问题证据")
@@ -358,7 +359,7 @@ def long_card():
     # 只有 A 有核验结论；B 未核验 → 必须不可点击（旧版会把未核验候选也渲染成链接）
     assert len(anchors) == 1 and anchors[0].get("href") == f"https://space.bilibili.com/{A}"
     plain = crc.render_crc_groups(out, "/endpoint", False, str, str)
-    assert f"space.bilibili.com/{B}" not in plain and "待复核账号" in plain
+    assert f"space.bilibili.com/{B}" not in plain and "待复核账号" not in plain
     assert "公开签名" in anchors[0].text_content() and str(A) in anchors[0].text_content()
     assert anchors[0].xpath('.//img')[0].get("src") == "https://i0.hdslb.com/test.png"
     assert not anchors[0].xpath('.//button') and not root.xpath('//details[@class="space-candidate"]')
@@ -977,14 +978,14 @@ def stale_exists_drops_self_link():
     html = crc.render_crc_group(group, "/endpoint", False, str, str, {(H, A): _space_assessment(A)},
                                 target_report.render_space_assessment)
     assert f"space.bilibili.com/{A}" not in html
-    assert "BV1xx411c7mD" in html and f"space.bilibili.com/{B}" in html
+    assert f"space.bilibili.com/{A}" not in html
     storage.save_uid_verify_cache(A, "exists", {"uid": A, "name": "甲", "sign": "签名", "face": ""},
                                   time.time() - 8 * 86400)
     storage.save_uid_verify_cache(B, "exists", {"uid": B, "name": "乙", "sign": "签名", "face": "https://i0.hdslb.com/b.png"})
     item = target_record()
     page = target_report.render_target_report(item, {}, False, str, str, candidate_checks={(H, A): _space_assessment(A)})
     assert f"space.bilibili.com/{A}" not in page
-    assert f"space.bilibili.com/{B}" in page and "BV1xx411c7mD" in page
+    assert f"space.bilibili.com/{A}" not in page
 
 
 @case("不完整候选不得升高，且只有与 crack_crc32 全集一致才写 candidate_version")

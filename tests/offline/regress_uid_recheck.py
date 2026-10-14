@@ -93,8 +93,8 @@ check("报告不保留已排除候选的 UID 或名片",
 print("=== 2. 未核验（未知）的候选也不得可点击 ===")
 groups2, html2 = render({}, sender())
 check("未知候选无跳转链接", str(A) not in links(html2) and str(B) not in links(html2))
-check("未知候选进入「待复核」区块且文案明确",
-      "待复核账号" in html2 and "不提供跳转" in html2 and "待复核" in html2)
+check("未知候选不进入报告复核区块且不提供跳转",
+      "待复核账号" not in html2 and "不提供跳转" not in html2)
 
 print("=== 3. 唯一存在晋升只认新鲜证据 ===")
 # A=过期不存在、B=新鲜存在：A 的证据过期，不能据此声称"唯一存在·高"

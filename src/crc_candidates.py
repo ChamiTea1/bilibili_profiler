@@ -159,7 +159,7 @@ def build_crc_groups(senders: list[dict], danmaku: list[dict], problems: dict,
             elif status == "exists" and not fresh:
                 note = (note or "已核验存在") + "（结论已过期，待复核）"
             # 硬约束：只有"新鲜核验为存在"的账号才允许出现跳转链接——过期的账号存在结论
-            # 也可能早已注销，点进去就是 404，因此一律降级为待复核（纯文本）。
+            # 也可能早已注销，点进去就是 404，因此未收敛时不进入报告。
             clickable = status == "exists" and fresh
             candidates.append({"uid": uid, "status": status, "fresh": fresh, "final": final,
                                "clickable": clickable,
@@ -233,7 +233,7 @@ def render_crc_group(group: dict, endpoint: str, mask: bool, mask_name, mask_uid
                      assessments: dict | None = None, assessment_renderer=None) -> str:
     """匿名证据在上；三态分流——只有已核验存在的候选才可点击。
 
-    exists → 可点击名片；unknown / 结论过期 → 「待复核」纯文本（不给链接，避免点进去 404）；
+    exists → 可点击名片；unknown / 结论过期 → 命令行未收敛时不展示候选（避免把复核工作留给报告）；
     not_exists / not_eligible → 不展示账号资料。"""
     h = group["mid_hash"]
     exists = [c for c in group["candidates"] if c["clickable"]]
@@ -249,17 +249,6 @@ def render_crc_group(group: dict, endpoint: str, mask: bool, mask_name, mask_uid
         result = assessment_renderer(assessment, mask, mask_name, mask_uid) if assessment and assessment_renderer else ""
         candidates.append(render_candidate_card({**c, "unique_verified": unique}, h, endpoint, mask, mask_name, mask_uid, result))
 
-    # 待复核：保留公开资料名片（便于人工核验），但**不给跳转**——未知或过期的 UID
-    # 点进去可能就是 404。指向该候选本人的空间链接也不要留在辅助资料里。
-    pending_cards = []
-    for c in pending:
-        uid = c["uid"]
-        assessment = (assessments or {}).get((h, uid))
-        result = assessment_renderer(assessment, mask, mask_name, mask_uid) if assessment and assessment_renderer else ""
-        result = strip_self_space_links(result, uid)
-        pending_cards.append(render_candidate_card({**c, "unique_verified": False, "clickable": False},
-                                                  h, endpoint, mask, mask_name, mask_uid, result))
-
     problems = "".join(f'''<li><span class="method-badge">{esc(it['category'])}</span> {esc(it['content'])}
             <span class="chart-hint">×{it['count']} · {esc(it.get('reason', ''))}</span></li>''' for it in group["problems"])
     matches = "".join(f'<li>{esc(c)}</li>' for c in group["matches"])
@@ -270,15 +259,15 @@ def render_crc_group(group: dict, endpoint: str, mask: bool, mask_name, mask_uid
         evidence += f'<details><summary>{esc(group["spam_level"])}风险刷屏 · 内容样本</summary><ul class="ov-list">{samples}</ul></details>'
     conclusion = ("搜索范围内唯一存在候选 · 高（存在性与权限排除）" if unique
                   else "搜索范围内没有可行 UID" if excluded and not candidates and not pending
-                  else f"候选身份未确认（{len(pending)} 个待复核）" if pending
+                  else "命令行核验未完成，候选暂不展示" if pending
                   else "候选身份未确认")
     return f'''<section class="crc-sender" data-hash="{esc(h)}" data-endpoint="{esc(endpoint)}"
-        data-uid="{(exists + pending)[0]['uid'] if exists or pending else ''}" data-reconcile="{'1' if group.get('reconcile_needed') else '0'}"
+        data-uid="{exists[0]['uid'] if exists else ''}" data-reconcile="{'1' if group.get('reconcile_needed') else '0'}"
         data-card-ready="{'0' if group.get('reconcile_needed') else '1'}"><div class="crc-heading"><b>匿名发送者 <code>{esc(h)}</code></b>
         <span class="hot-badge">{group['danmaku_count']} 条已采弹幕</span><span class="method-badge">{esc(group['method'])}</span>
         <span class="risk-badge">{esc(conclusion)}</span><span class="crc-status-note candidate-card-note" role="status"></span></div><p class="chart-hint">{esc(group['reason'])}</p>
         {evidence}<div class="crc-candidate-list">{''.join(candidates)}</div>
-        {'<details open><summary>待复核账号（未确认存在，不提供跳转）</summary><div class="crc-candidate-list">' + ''.join(pending_cards) + '</div></details>' if pending_cards else ''}
+        {''}
         </section>'''
 
 
@@ -287,10 +276,10 @@ def render_crc_groups(groups: list[dict], endpoint: str, mask: bool, mask_name, 
                       target_mode: bool = False) -> str:
     if not groups:
         return '''<div class="crc-candidates" data-count="0"><p class="empty-note">暂无待复核的纯 CRC32 候选记录。
-            已完成存在性排除的高置信度发送者保留在正常解析结果中。</p></div>'''
+            未完成的核验已在命令行阶段隐藏；请重跑命令行分析后再生成报告。</p></div>'''
     scope = ("本页列出本次目标筛选中的纯破解候选；命中筛选不等于问题判定。"
              if target_mode else "本页集中列出有问题弹幕或高中风险刷屏、且解析时没有明文来源佐证的记录。")
-    head = f'''<p class="chart-hint">{scope} 共 <span data-crc-total>{len(groups)}</span> 个待复核匿名发送者。只展示同一 hash 尚未排除的候选。</p>
+    head = f'''<p class="chart-hint">{scope} 共 <span data-crc-total>{len(groups)}</span> 个匿名发送者。候选核验在命令行阶段完成，未完成的候选不会在报告中展示。</p>
         <p class="chart-hint">点击长条名片直达空间；名片和空间辅助资料由命令行阶段采集，此页只展示已保存数据。
         名片接口明确返回 -404 或账号明确为 Lv0 时排除；其余候选全部排除后，唯一可行者标为高置信度并移出本页。</p>
         <p class="chart-hint">原文属于匿名发送者，不能据此断言下方每个候选账号都发过这些弹幕。

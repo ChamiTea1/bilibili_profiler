@@ -88,8 +88,20 @@ from report import (REPORT_CSS, esc, js_json, generate_user_card, generate_summa
                     up_wordcloud_data, PROBLEM_CATEGORY_COLORS, _category_chips,
                     mask_reply_prefix)
 from long_image import build_payload, render_long_image
+from report_service import source_revision
+
+# 在导入时冻结，接口不得重新计算，否则旧进程会冒充加载了磁盘的新代码。
+_LOADED_SOURCE_REVISION = source_revision()
 
 app = Flask(__name__)
+
+
+@app.get("/api/report-service")
+def report_service_info():
+    with JOBS_LOCK:
+        active = sum(not job.get("finished") for job in JOBS.values())
+    return jsonify(source_revision=_LOADED_SOURCE_REVISION, active_jobs=active)
+
 PAGE_SIZE = 100  # 弹幕 API 默认/回退每页条数（可选 50/100/200，spec 3）
 def _resolve_port(cli_port: int | None = None, env: dict | None = None) -> int:
     """解析监听端口：`--port` > `PROFILER_PORT` 环境变量 > 8001。
@@ -2555,7 +2567,9 @@ def video_page(bvid: str):
     stats = generate_summary_stats(profiles)
     chart = generate_chart_data(profiles)
     cards_html = "".join(generate_user_card(p, mask=mask, mask_name=_mask_name) for p in profiles)
-    cards_html += _light_user_cards(bvid, profiles, mask, fp)
+    light_cards_html = _light_user_cards(bvid, profiles, mask, fp)
+    light_count = light_cards_html.count('class="user-card light-user-card"')
+    cards_html += light_cards_html
     cards_html = cards_html or '<p class="empty-note">暂无已解析用户数据</p>'
     hot_tab = _hot_comments_html(bvid, row["aid"], fp_cmt)   # 高回复评论页（潜在争执热点）
     attack_tab = _attack_focus_tab_html(bvid, fp_cmt)        # 争执焦点页（谁攻击谁+连线）
@@ -2837,6 +2851,8 @@ def video_page(bvid: str):
     </div>
 
     <div id="tab-users" class="tab-pane">
+        <p class="chart-hint">本页共 {len(profiles) + light_count} 位已解析用户：完整画像 {len(profiles)} 人、发言长条卡片 {light_count} 人。
+        默认仅深度采集 100 人，其他用户继续展示；以下筛选、搜索和分页覆盖全部用户。</p>
         <div class="filter-bar">
             <button class="filter-btn active" data-filter="all" onclick="userFilter('all', this)">全部</button>
             <button class="filter-btn" data-filter="high-level" onclick="userFilter('high-level', this)">Lv.5+</button>

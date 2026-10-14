@@ -16,6 +16,7 @@ import urllib.request
 import webbrowser
 
 from config import WEB_AUTOSTART, DATA_DIR
+from report_service import source_revision
 
 # 本机探测必须绕开环境代理：代理客户端常把 http_proxy 写进 shell，而 Python 的
 # no_proxy 不支持 127.* 这类通配（只做后缀匹配），否则本地探测会被送进代理、
@@ -99,8 +100,10 @@ def maybe_launch_web(bvid: str, target_id: str | None = None):
 
     try:
         state = _server_state(port, bvid, target_id)
+        if state == "ready" and not _service_is_current(port):
+            state = "outdated"
         if state == "outdated":
-            print(f"  [Web] {port} 端口运行的是旧版报告服务，尚未加载目标报告路由；目标存档已保存，无需重新分析")
+            print(f"  [Web] {port} 端口运行的是旧版报告服务，尚未加载当前报告代码；数据已保存，无需重新分析")
             print(f"  请依次运行 python web.py --stop --port {port} 和 python web.py --port {port}，再访问: {url}")
             return
         if state == "missing":
@@ -148,3 +151,9 @@ def maybe_launch_web(bvid: str, target_id: str | None = None):
     except Exception as e:
         # 自动启动是锦上添花：任何异常都不影响分析结果与退出码
         print(f"  [Web] 自动启动失败（{e}），请手动运行 python web.py 后访问: {url}")
+
+
+def _service_is_current(port: int) -> bool:
+    """接口存在但代码未更新的旧服务也须提示重启，不直接打开旧报告。"""
+    status, data = _probe_json(f"http://127.0.0.1:{port}/api/report-service")
+    return status == 200 and isinstance(data, dict) and data.get("source_revision") == source_revision()

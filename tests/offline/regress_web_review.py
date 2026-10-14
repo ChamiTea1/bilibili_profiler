@@ -347,6 +347,16 @@ check("明文账号卡片可直达空间，未知CRC不给空间链接", 'href="
 check("长条遮蔽昵称UID及回复前缀", "轻量用户甲" not in hidden and NICK not in hidden and "UID:778899" not in hidden)
 check("已有完整画像不重复展示长条", "第二条" not in covered and "待核验" in covered)
 
+# 深采名额不截断长条名单；超过100人的名单完整进入前端分页集合。
+large = [{"uid": 800000 + i, "mid_hash": "h" + str(i), "method": "问题评论", "danmaku_count": 0,
+          "contents": [], "resolution": {}, "confidence": "高"} for i in range(350)]
+with patch.object(web, "load_senders", return_value=large), patch.object(web, "load_comments", return_value=[]):
+    remaining = web._light_user_cards("BVlarge", [{"uid": 800000 + i} for i in range(100)], False, set())
+check("原名单350人，100份画像以外250名长条全部保留", remaining.count('class="user-card light-user-card"') == 250 and 'id="uid-800349"' in remaining)
+with web.app.test_client() as client:
+    info = client.get("/api/report-service").get_json()
+check("报告服务返回导入时冻结的指纹和任务数", info["source_revision"] == web._LOADED_SOURCE_REVISION and isinstance(info["active_jobs"], int))
+
 print("")
 print("==== Web 报告审查: %d 项通过, %d 项失败 ====" % (ok, fail))
 sys.exit(1 if fail else 0)

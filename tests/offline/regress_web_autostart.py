@@ -45,7 +45,7 @@ def context(**overrides):
         settings = {"WEB_AUTOSTART": True, "DATA_DIR": folder, **overrides}
         with patch.dict(os.environ, {"PROFILER_PORT": "9000"}), patch.multiple(launch, **settings), \
              patch.object(launch.subprocess, "Popen") as popen, patch.object(launch.webbrowser, "open", return_value=True) as browser, \
-             patch.object(launch.time, "sleep"), contextlib.redirect_stdout(output):
+             patch.object(launch.time, "sleep"), patch.object(launch, "_service_is_current", return_value=True), contextlib.redirect_stdout(output):
             yield output, popen, browser, folder
 
 
@@ -179,6 +179,25 @@ def invalid_port():
         popen.assert_not_called()
         browser.assert_not_called()
         assert "PROFILER_PORT" in output.getvalue()
+
+
+@case("常规接口可用但源码指纹旧时提示重启，不打开旧报告")
+def stale_source():
+    with context() as (output, popen, browser, _), patch.object(launch, "_server_state", return_value="ready"), patch.object(launch, "_service_is_current", return_value=False):
+        launch.maybe_launch_web("BVTEST")
+    browser.assert_not_called()
+    popen.assert_not_called()
+    assert "旧版报告服务" in output.getvalue() and "无需重新分析" in output.getvalue()
+
+
+@case("源码指纹接口缺失或不匹配不能视为新版，匹配才可复用")
+def source_match():
+    revision = launch.source_revision()
+    for response in [(404, None), (200, {"source_revision": "old"}), (200, {"rows": []})]:
+        with patch.object(launch, "_probe_json", return_value=response):
+            assert not launch._service_is_current(9000)
+    with patch.object(launch, "_probe_json", return_value=(200, {"source_revision": revision})):
+        assert launch._service_is_current(9000)
 
 
 print(f"==== Web自动打开: {passed} 项通过, {failed} 项失败 ====")

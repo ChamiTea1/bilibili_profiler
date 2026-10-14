@@ -90,7 +90,7 @@ src/
 项目**没有单元测试框架**（无 pytest/unittest 目录）。改动后按"从便宜到贵"三层验证：
 
 ```bash
-# 1) 离线回归（618 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
+# 1) 离线回归（622 项，秒级，不联网/不用 Cookie/不消耗 LLM 额度，使用隔离临时库）
 python tests/run_all.py            # 主回归 + 评论路径 + 弹幕/评论判定聚合 + 多分P 口径（密度轴/历史采集/样本标注）
 python tests/run_all.py --lint     # 附带 pyflakes（需 pip install pyflakes）
 python tests/offline/regress_proxy_pool.py --mihomo  # 可选 5 项真实核心本机测试（已有 mihomo/openssl，不下载、不访问外网）
@@ -120,9 +120,9 @@ python quick_test.py [BV号] [--top N]
 - 评论作者本人明文 UID 可高置信直引；按用户指定的实用分级，匿名弹幕的本视频唯一明文关联标为高（交叉验证），须正向 CRC32 匹配且无已知 UID 冲突，保留碰撞提示。仅跨视频关联为低置信度；纯 MITM 完整候选集中唯一存在、其他全部明确不存在且验证未过期者按实用分级标高（存在性排除），保留范围外碰撞提示，不能据此写入明文证据库。高（交叉验证）不表示数学上绝无碰撞。弹幕条数不是身份消歧证据。多候选为「候选歧义」，仍有未知为「待验证」，不自动采集或 UID 屏蔽。
 - `senders.resolution_json` 保存规则版本、证据指纹、时间、候选、来源和原因。版本或证据变化立即复核，结论默认一天有效；失效旧 UID 保留作审计，不继续用于归属。手动分析复用画像前同样复核。
 - 数学候选缓存按算法版本和搜索上限隔离。名片存在结果缓存 7 天，只有明确 `-404` 才判不存在并缓存 1 小时；网络、风控、空名片、批量缺席均不可直接排除。单点补验每轮 50 次预算，预算不足保留未知，风控整轮停止。
-- 纯破解候选以可点击长条名片展示头像/昵称/签名/UID；候选名片和空间辅助首页样本均在命令行阶段采集并冻结到 resolution 快照，报告仅读保存的数据，不自动补采、无采集按钮；旧采集 POST 返回 410。明确 -404 可排除，核对完整数学候选集后，全部其他候选明确缺失且唯一存在时才回写高（存在性排除）UID；未知保留，风控暂停。不进入明文库；打开报告不自动采完整画像，高分级在后续分析按高置信度入选，未知和歧义不用于 UID 屏蔽。每个核验时刻独立保留，旧空间样本不能覆盖新结论。目标快照按锁内最新记录更新，CSV/JSON 下载实时读取最新快照。已升高记录移出候选页但保留审计；相关回归：`tests/offline/regress_crc_candidates.py`（80 项）。
+- 纯破解候选以可点击长条名片展示头像/昵称/签名/UID；候选名片和空间辅助首页样本均在命令行阶段采集并冻结到 resolution 快照，报告仅读保存的数据，不自动补采、无采集按钮；旧采集 POST 返回 410。明确 -404 可排除，核对完整数学候选集后，全部其他候选明确缺失且唯一存在时才回写高（存在性排除）UID；未知在命令行阶段继续核验，风控未收敛时不展示候选。不进入明文库；打开报告不自动采完整画像，高分级在后续分析按高置信度入选，未知和歧义不用于 UID 屏蔽。每个核验时刻独立保留，旧空间样本不能覆盖新结论。目标快照按锁内最新记录更新，CSV/JSON 下载实时读取最新快照。已升高记录移出候选页但保留审计；相关回归：`tests/offline/regress_crc_candidates.py`（80 项）。
 - UID 收割刷新依据本视频已见评论 ID，不依据全局新 UID 数；UID、已见 ID、游标按页原子提交。面向未关联兴趣 hash 的高回复楼中楼补采默认总计 10 页/最多 5 楼，同楼连续 3 页无新目标命中换楼，逐楼断点续采。配置集中在 `config.example.py` 的 `UID_*` 项，通过 `getattr` 兼容未更新的本地配置。
-- **报告展示三态（硬约束：不得出现点进去 404 的账号）**：只有"**新鲜核验为存在**"的候选才渲染可点击名片（`crc_candidates.render_candidate_card` 内部再兜一道：非 exists 输出 div 而非 a）；`not_exists` 和 `not_eligible`（明确 Lv0）不在报告中展示；`unknown` 或结论已过期进「待复核」（保留公开资料名片但不给跳转）。账号不存在结论不再因 1 小时 TTL 被判成"未知"而复活成候选——展示读 `storage.load_uid_verify_verdicts`（返回全部结论 + verified_at/fresh/final），判定仍用 `load_uid_verify_cache`（只收有效结论），两者分工不得混用。
+- **报告展示三态（硬约束：不得出现点进去 404 的账号）**：只有"**新鲜核验为存在**"的候选才渲染可点击名片（`crc_candidates.render_candidate_card` 内部再兜一道：非 exists 输出 div 而非 a）；`not_exists` 和 `not_eligible`（明确 Lv0）不在报告中展示；`unknown` 或结论已过期由命令行阶段继续核验；未收敛的候选整组不进入报告。账号不存在结论不再因 1 小时 TTL 被判成"未知"而复活成候选——展示读 `storage.load_uid_verify_verdicts`（返回全部结论 + verified_at/fresh/final），判定仍用 `load_uid_verify_cache`（只收有效结论），两者分工不得混用。
 - **画像卡/问题弹幕榜/低置信度页的 UID 链接同受约束**：`report.uid_linkable(profile)` 统一判定——明文来源（评论区验证/问题评论/评论收割/互动弹幕等，由 B站接口直接给出）照常可跳转；纯 CRC 来源（CRC32破解/CRC32碰撞/候选歧义/待验证/未知/空）必须 `candidate_status[uid]=="exists"` 且在 `UID_VERIFY_EXISTS_TTL` 内，否则只显示头像/名称不给链接（`web._load_profiles` 注入 `_resolution` 供其判定）。
 - **阶段4候选终审复核（`candidate_cards.recheck_ambiguous_candidates`）**：只处理"纯 CRC 破解 + 候选 ≥2 + 无明文证据"的组，在用户采集和画像之前复核曾判 404 或未定论的候选。出现"上一份结论为 not_exists、本轮为 exists"的**调整**即视为上次结论不可信（疑似风控伪装），按 `UID_RECHECK_INTERVAL` 等待后连同"本轮未查成/还差确认次数"的一起再查，直到一轮内没有任何调整；明确 -404 累计确认达 `UID_RECHECK_CONFIRMATIONS`（默认 2）次才写 `final`（彻底判定不存在）。必须有终止条件：`UID_RECHECK_MAX_ROUNDS` + `UID_RECHECK_BUDGET` + 风控熔断；未收敛写 `resolution.recheck_pending`（含 `next_check_at`），`UID_RECHECK_COOLDOWN` 冷却后下次运行继续；带自洽 UID 的新鲜存在名片可以推翻旧 `final` 账号不存在，空的存在结论不会覆盖它。目标分析同样在用户采集前执行。
 - 改动此路径请运行 `tests/offline/regress_uid_evidence.py`（50 项）与 `tests/offline/regress_uid_recheck.py`（27 项），再跑完整离线回归。禁止用真实 Cookie 或 LLM 做离线测试。
